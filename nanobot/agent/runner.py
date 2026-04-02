@@ -55,12 +55,34 @@ class AgentRunner:
     def __init__(self, provider: LLMProvider):
         self.provider = provider
 
+    @staticmethod
+    def _user_facing_error_message(
+        raw_error: str | None,
+        *,
+        retry_count: int,
+        fallback: str,
+    ) -> str:
+        text = (raw_error or "").lower()
+        is_timeout = "timeout" in text or "timed out" in text
+        is_transient = bool(text) and LLMProvider._is_transient_error(raw_error)
+
+        if retry_count > 0 and is_timeout:
+            return (
+                f"模型响应超时，已自动重试 {retry_count} 次仍失败。"
+                "请稍后重试，或切换模型。"
+            )
+        if retry_count > 0 and is_transient:
+            return f"模型服务临时异常，已自动重试 {retry_count} 次仍失败。请稍后重试。"
+        if is_timeout:
+            return "模型响应超时。请稍后重试，或切换模型。"
+        return fallback
+
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
         final_content: str | None = None
         tools_used: list[str] = []
-        usage: dict[str, int] = {}
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
         error: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
@@ -68,10 +90,28 @@ class AgentRunner:
         for iteration in range(spec.max_iterations):
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
+            async def _retry_callback(
+                *,
+                attempt: int,
+                max_retries: int,
+                delay: float,
+                error: str | None,
+            ) -> None:
+                context.retry_count = attempt
+                context.last_retry_error = error
+                await hook.on_retry(
+                    context,
+                    attempt=attempt,
+                    max_retries=max_retries,
+                    delay=delay,
+                    error=error,
+                )
+
             kwargs: dict[str, Any] = {
                 "messages": messages,
                 "tools": spec.tools.get_definitions(),
                 "model": spec.model,
+                "on_retry": _retry_callback,
             }
             if spec.temperature is not None:
                 kwargs["temperature"] = spec.temperature
@@ -92,15 +132,13 @@ class AgentRunner:
                 response = await self.provider.chat_with_retry(**kwargs)
 
             raw_usage = response.usage or {}
+            usage = {
+                "prompt_tokens": int(raw_usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(raw_usage.get("completion_tokens", 0) or 0),
+            }
             context.response = response
-            context.usage = raw_usage
+            context.usage = usage
             context.tool_calls = list(response.tool_calls)
-            # Accumulate standard fields into result usage.
-            usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + int(raw_usage.get("prompt_tokens", 0) or 0)
-            usage["completion_tokens"] = usage.get("completion_tokens", 0) + int(raw_usage.get("completion_tokens", 0) or 0)
-            cached = raw_usage.get("cached_tokens")
-            if cached:
-                usage["cached_tokens"] = usage.get("cached_tokens", 0) + int(cached)
 
             if response.has_tool_calls:
                 if hook.wants_streaming():
@@ -142,9 +180,17 @@ class AgentRunner:
 
             clean = hook.finalize_content(context, response.content)
             if response.finish_reason == "error":
-                final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
+                final_content = (
+                    clean or _DEFAULT_ERROR_MESSAGE
+                    if spec.error_message is None
+                    else self._user_facing_error_message(
+                        clean,
+                        retry_count=context.retry_count,
+                        fallback=spec.error_message,
+                    )
+                )
+                error = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
                 stop_reason = "error"
-                error = final_content
                 context.final_content = final_content
                 context.error = error
                 context.stop_reason = stop_reason

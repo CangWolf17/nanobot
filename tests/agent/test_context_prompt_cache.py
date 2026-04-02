@@ -47,8 +47,19 @@ def test_system_prompt_stays_stable_when_clock_changes(tmp_path, monkeypatch) ->
     assert prompt1 == prompt2
 
 
+def test_system_prompt_includes_dynamic_work_mode_block_when_requested(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt(workspace_work_mode="plan")
+
+    assert "## Work Mode" in prompt
+    assert "Current workspace work mode: plan" in prompt
+    assert "Do not make code or implementation changes" in prompt
+
+
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
-    """Runtime metadata should be merged with the user message."""
+    """Runtime metadata should be merged with the user message and only expose current time by default."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
@@ -62,12 +73,36 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert messages[0]["role"] == "system"
     assert "## Current Session" not in messages[0]["content"]
 
-    # Runtime context is now merged with user message into a single message
     assert messages[-1]["role"] == "user"
     user_content = messages[-1]["content"]
     assert isinstance(user_content, str)
     assert ContextBuilder._RUNTIME_CONTEXT_TAG in user_content
     assert "Current Time:" in user_content
-    assert "Channel: cli" in user_content
-    assert "Chat ID: direct" in user_content
+    assert "Channel: cli" not in user_content
+    assert "Chat ID: direct" not in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_system_prompt_includes_dev_discipline_block_when_active_session_exists(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    session_root = workspace / "sessions" / "ses_0001"
+    session_root.mkdir(parents=True)
+    (workspace / "sessions" / "control.json").write_text(
+        '{"active_session_id":"ses_0001"}', encoding="utf-8"
+    )
+    (workspace / "sessions" / "index.json").write_text(
+        '{"sessions":{"ses_0001":{"session_root":"' + str(session_root) + '"}}}',
+        encoding="utf-8",
+    )
+    (session_root / "dev_state.json").write_text(
+        '{"strict_dev_mode":"enforce","task_kind":"feature","phase":"red_required","work_mode":"build","gates":{"plan":{"required":true,"satisfied":true},"debug_root_cause":{"required":false,"satisfied":false},"failing_test":{"required":true,"satisfied":false},"verification":{"required":true,"satisfied":false}}}',
+        encoding="utf-8",
+    )
+
+    builder = ContextBuilder(workspace)
+    prompt = builder.build_system_prompt()
+
+    assert "## Dev Discipline" in prompt
+    assert "task_kind: feature" in prompt
+    assert "phase: red_required" in prompt
+    assert "- failing_test: pending" in prompt

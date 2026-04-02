@@ -5,6 +5,7 @@ When memory consolidation receives dict values instead of strings from the LLM
 tool call response, it should serialize them to JSON instead of raising TypeError.
 """
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -135,20 +136,18 @@ class TestMemoryConsolidationTypeHandling:
         assert "User discussed testing." in store.history_file.read_text()
 
     @pytest.mark.asyncio
-    async def test_no_tool_call_returns_false(self, tmp_path: Path) -> None:
-        """When LLM doesn't use the save_memory tool, return False."""
+    async def test_cancelled_error_propagates_from_store_consolidate(self, tmp_path: Path) -> None:
+        """Store-level consolidate must re-raise cancellation so outer timeout logic can handle it."""
         store = MemoryStore(tmp_path)
         provider = AsyncMock()
-        provider.chat = AsyncMock(
-            return_value=LLMResponse(content="I summarized the conversation.", tool_calls=[])
-        )
-        provider.chat_with_retry = provider.chat
+        provider.chat_with_retry = AsyncMock(side_effect=asyncio.CancelledError())
         messages = _make_messages(message_count=60)
 
-        result = await store.consolidate(messages, provider, "test-model")
+        with pytest.raises(asyncio.CancelledError):
+            await store.consolidate(messages, provider, "test-model")
 
-        assert result is False
         assert not store.history_file.exists()
+
 
     @pytest.mark.asyncio
     async def test_skips_when_message_chunk_is_empty(self, tmp_path: Path) -> None:

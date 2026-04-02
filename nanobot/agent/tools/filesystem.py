@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.policy.dev_discipline import guard_file_mutation
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 
 
@@ -183,6 +184,9 @@ class WriteFileTool(_FsTool):
             if content is None:
                 raise ValueError("Unknown content")
             fp = self._resolve(path)
+            guard_error = guard_file_mutation(self._workspace, fp, operation="write_file")
+            if guard_error:
+                return guard_error
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {fp}"
@@ -269,6 +273,10 @@ class EditFileTool(_FsTool):
             fp = self._resolve(path)
             if not fp.exists():
                 return f"Error: File not found: {path}"
+
+            guard_error = guard_file_mutation(self._workspace, fp, operation="edit_file")
+            if guard_error:
+                return guard_error
 
             raw = fp.read_bytes()
             uses_crlf = b"\r\n" in raw

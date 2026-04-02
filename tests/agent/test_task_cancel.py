@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -118,43 +117,6 @@ class TestDispatch:
         assert out.content == "hi"
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_preserves_message_metadata(self):
-        from nanobot.bus.events import InboundMessage
-
-        loop, bus = _make_loop()
-        msg = InboundMessage(
-            channel="matrix",
-            sender_id="u1",
-            chat_id="!room:matrix.org",
-            content="hello",
-            metadata={
-                "_wants_stream": True,
-                "thread_root_event_id": "$root1",
-                "thread_reply_to_event_id": "$reply1",
-            },
-        )
-
-        async def fake_process(_msg, *, on_stream=None, on_stream_end=None, **kwargs):
-            assert on_stream is not None
-            assert on_stream_end is not None
-            await on_stream("hi")
-            await on_stream_end(resuming=False)
-            return None
-
-        loop._process_message = fake_process
-
-        await loop._dispatch(msg)
-        first = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-        second = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-
-        assert first.metadata["thread_root_event_id"] == "$root1"
-        assert first.metadata["thread_reply_to_event_id"] == "$reply1"
-        assert first.metadata["_stream_delta"] is True
-        assert second.metadata["thread_root_event_id"] == "$root1"
-        assert second.metadata["thread_reply_to_event_id"] == "$reply1"
-        assert second.metadata["_stream_end"] is True
-
-    @pytest.mark.asyncio
     async def test_processing_lock_serializes(self):
         from nanobot.bus.events import InboundMessage, OutboundMessage
 
@@ -261,39 +223,6 @@ class TestSubagentCancellation:
         assert assistant_messages[0]["thinking_blocks"] == [{"type": "thinking", "thinking": "step"}]
 
     @pytest.mark.asyncio
-    async def test_subagent_exec_tool_not_registered_when_disabled(self, tmp_path):
-        from nanobot.agent.subagent import SubagentManager
-        from nanobot.bus.queue import MessageBus
-        from nanobot.config.schema import ExecToolConfig
-
-        bus = MessageBus()
-        provider = MagicMock()
-        provider.get_default_model.return_value = "test-model"
-        mgr = SubagentManager(
-            provider=provider,
-            workspace=tmp_path,
-            bus=bus,
-            exec_config=ExecToolConfig(enable=False),
-        )
-        mgr._announce_result = AsyncMock()
-
-        async def fake_run(spec):
-            assert spec.tools.get("exec") is None
-            return SimpleNamespace(
-                stop_reason="done",
-                final_content="done",
-                error=None,
-                tool_events=[],
-            )
-
-        mgr.runner.run = AsyncMock(side_effect=fake_run)
-
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
-
-        mgr.runner.run.assert_awaited_once()
-        mgr._announce_result.assert_awaited_once()
-
-    @pytest.mark.asyncio
     async def test_subagent_announces_error_when_tool_execution_fails(self, monkeypatch, tmp_path):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
@@ -328,6 +257,53 @@ class TestSubagentCancellation:
         assert "Failure:" in args[3]
         assert "- list_dir: boom" in args[3]
         assert args[5] == "error"
+
+    @pytest.mark.asyncio
+    async def test_spawn_context_propagates_session_key_and_subagent_inherits_strict_mode(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.tools.spawn import SpawnTool
+        from nanobot.agent.runner import AgentRunResult
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+
+        sessions = tmp_path / "sessions"
+        session_root = sessions / "ses_0001"
+        session_root.mkdir(parents=True)
+        (sessions / "control.json").write_text('{"active_session_id":"ses_0001"}', encoding="utf-8")
+        (sessions / "index.json").write_text(
+            '{"sessions":{"ses_0001":{"session_root":"' + str(session_root) + '"}}}',
+            encoding="utf-8",
+        )
+        (session_root / "dev_state.json").write_text(
+            '{"strict_dev_mode":"enforce","task_kind":"feature","phase":"red_required","work_mode":"build","gates":{"plan":{"required":true,"satisfied":true},"failing_test":{"required":true,"satisfied":false},"verification":{"required":true,"satisfied":false}}}',
+            encoding="utf-8",
+        )
+
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done",
+            messages=[],
+            tools_used=[],
+            usage={},
+        ))
+        mgr._announce_result = AsyncMock()
+
+        spawn_tool = SpawnTool(manager=mgr)
+        spawn_tool.set_context("telegram", "chat-1")
+        result = await spawn_tool.execute(task="do task", label="bg")
+
+        assert "started" in result.lower()
+        running = list(mgr._running_tasks.values())
+        assert len(running) == 1
+        await running[0]
+
+        spec = mgr.runner.run.await_args.args[0]
+        assert spec.concurrent_tools is False
+        assert "## Dev Discipline" in spec.initial_messages[0]["content"]
+        assert mgr._session_tasks == {}
 
     @pytest.mark.asyncio
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):

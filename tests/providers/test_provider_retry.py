@@ -46,6 +46,31 @@ async def test_chat_with_retry_retries_transient_error_then_succeeds(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_chat_with_retry_reports_retry_callback(monkeypatch) -> None:
+    provider = ScriptedProvider([
+        LLMResponse(content="429 rate limit", finish_reason="error"),
+        LLMResponse(content="ok"),
+    ])
+    retries: list[tuple[int, int, int, str | None]] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        return None
+
+    async def _on_retry(*, attempt: int, max_retries: int, delay: int, error: str | None) -> None:
+        retries.append((attempt, max_retries, delay, error))
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_retry=_on_retry,
+    )
+
+    assert response.content == "ok"
+    assert retries == [(1, 3, 1, "429 rate limit")]
+
+
+@pytest.mark.asyncio
 async def test_chat_with_retry_does_not_retry_non_transient_error(monkeypatch) -> None:
     provider = ScriptedProvider([
         LLMResponse(content="401 unauthorized", finish_reason="error"),
@@ -192,6 +217,52 @@ async def test_image_fallback_returns_error_on_second_failure() -> None:
     assert provider.calls == 2
     assert response.content == "still failing"
     assert response.finish_reason == "error"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_with_retry_buffers_failed_attempt_deltas(monkeypatch) -> None:
+    from nanobot.providers.base import LLMProvider
+
+    class ScriptedStreamingProvider(LLMProvider):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def chat(self, *args, **kwargs) -> LLMResponse:
+            raise NotImplementedError
+
+        async def chat_stream(self, *args, on_content_delta=None, **kwargs) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                if on_content_delta:
+                    await on_content_delta("partial leaked text ")
+                return LLMResponse(content="Error calling LLM: Request timed out.", finish_reason="error")
+            if on_content_delta:
+                await on_content_delta("Hello")
+            return LLMResponse(content="Hello", finish_reason="stop")
+
+        def get_default_model(self) -> str:
+            return "test-model"
+
+    provider = ScriptedStreamingProvider()
+    deltas: list[str] = []
+
+    async def _capture_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    async def _fake_sleep(delay: int) -> None:
+        return None
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=_capture_delta,
+    )
+
+    assert provider.calls == 2
+    assert response.content == "Hello"
+    assert deltas == ["Hello"]
 
 
 @pytest.mark.asyncio

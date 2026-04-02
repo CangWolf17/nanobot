@@ -6,6 +6,7 @@ from nanobot.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
     ReadFileTool,
+    WriteFileTool,
     _find_match,
 )
 
@@ -137,6 +138,36 @@ class TestFindMatch:
         match, count = _find_match("hello", "")
         # Empty string is always "in" any string via exact match
         assert match == ""
+
+
+# ---------------------------------------------------------------------------
+# WriteFileTool strict dev mode
+# ---------------------------------------------------------------------------
+
+class TestWriteFileTool:
+
+    @pytest.mark.asyncio
+    async def test_write_blocked_for_code_in_plan_mode(self, tmp_path):
+        session_root = tmp_path / "sessions" / "ses_0001"
+        session_root.mkdir(parents=True)
+        (tmp_path / "sessions" / "control.json").write_text(
+            '{"active_session_id":"ses_0001"}', encoding="utf-8"
+        )
+        (tmp_path / "sessions" / "index.json").write_text(
+            '{"sessions":{"ses_0001":{"session_root":"' + str(session_root) + '"}}}',
+            encoding="utf-8",
+        )
+        (session_root / "dev_state.json").write_text(
+            '{"strict_dev_mode":"enforce","task_kind":"feature","phase":"planning","work_mode":"plan","gates":{"plan":{"required":true,"satisfied":true},"failing_test":{"required":true,"satisfied":false},"verification":{"required":true,"satisfied":false}}}',
+            encoding="utf-8",
+        )
+        tool = WriteFileTool(workspace=tmp_path)
+
+        result = await tool.execute(path="src/main.py", content="print(\'x\')\n")
+
+        assert "Error" in result
+        assert "strict dev mode" in result
+        assert "work_mode=plan" in result
 
 
 # ---------------------------------------------------------------------------

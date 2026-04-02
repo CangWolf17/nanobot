@@ -1,5 +1,6 @@
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncio
 import pytest
 
 from nanobot.agent.loop import AgentLoop
@@ -163,10 +164,10 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
 
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
 
-    async def track_consolidate(messages):
+    async def track_preflight(session):
         order.append("consolidate")
         return True
-    loop.memory_consolidator.consolidate_messages = track_consolidate  # type: ignore[method-assign]
+    loop._run_pre_reply_consolidation = track_preflight  # type: ignore[method-assign]
 
     async def track_llm(*args, **kwargs):
         order.append("llm")
@@ -184,7 +185,7 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
     monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 500)
 
     call_count = [0]
-    def mock_estimate(_session):
+    def mock_estimate(_session, *, max_history_messages=0):
         call_count[0] += 1
         return (1000 if call_count[0] <= 1 else 80, "test")
     loop.memory_consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
@@ -194,3 +195,120 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
     assert "consolidate" in order
     assert "llm" in order
     assert order.index("consolidate") < order.index("llm")
+
+
+@pytest.mark.asyncio
+async def test_pre_reply_consolidation_timeout_fail_open_still_replies(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
+    loop.memory_config.pre_reply_timeout_seconds = 0.01
+
+    async def slow_consolidation(_session):
+        await asyncio.sleep(0.05)
+    loop.memory_consolidator.maybe_consolidate_by_tokens = slow_consolidation  # type: ignore[method-assign]
+
+    result = await loop.process_direct("hello", session_key="cli:test")
+
+    assert result is not None
+    assert result.content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_pre_reply_consolidation_timeout_records_failure_count(tmp_path, monkeypatch) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
+    loop.memory_config.pre_reply_timeout_seconds = 0.01
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+    ]
+    loop.sessions.save(session)
+
+    async def hanging_archive(_messages):
+        await asyncio.sleep(1)
+        return True
+
+    loop.memory_consolidator.consolidate_messages = hanging_archive  # type: ignore[method-assign]
+    loop.memory_consolidator.estimate_session_prompt_tokens = lambda _session, *, max_history_messages=0: (1000, "test")  # type: ignore[method-assign]
+    loop.memory_consolidator._SAFETY_BUFFER = 0
+    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 500)
+
+    result = await loop.process_direct("hello", session_key="cli:test")
+
+    assert result is not None
+    assert result.content == "ok"
+    assert loop.memory_consolidator.store._consecutive_failures == 1
+    assert session.last_consolidated == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_timeout_cancellation_degrades_to_raw_archive_and_advances_offset(tmp_path, monkeypatch) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+        {"role": "assistant", "content": "a2", "timestamp": "2026-01-01T00:00:03"},
+        {"role": "user", "content": "u3", "timestamp": "2026-01-01T00:00:04"},
+    ]
+    loop.sessions.save(session)
+
+    async def hanging_archive(_messages):
+        await asyncio.sleep(10)
+        return True
+
+    loop.memory_consolidator.consolidate_messages = hanging_archive  # type: ignore[method-assign]
+    loop.memory_consolidator.estimate_session_prompt_tokens = lambda _session, *, max_history_messages=0: (1000, "test")  # type: ignore[method-assign]
+    loop.memory_consolidator._SAFETY_BUFFER = 0
+    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 500)
+
+    for _ in range(loop.memory_consolidator.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
+        try:
+            await asyncio.wait_for(loop.memory_consolidator.maybe_consolidate_by_tokens(session), timeout=0.01)
+        except asyncio.TimeoutError:
+            pytest.fail("timeout should be absorbed into consolidation failure accounting")
+
+    assert loop.memory_consolidator.store._consecutive_failures == 0
+    assert session.last_consolidated == 2
+    assert loop.memory_consolidator.store.history_file.exists()
+    history = loop.memory_consolidator.store.history_file.read_text()
+    assert "[RAW] 2 messages" in history
+    assert "u1" in history and "a1" in history
+
+
+@pytest.mark.asyncio
+async def test_failed_preflight_over_budget_uses_recent_history_fallback(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
+    loop.memory_config.recent_history_fallback_messages = 2
+
+    async def fail_preflight(_session):
+        return False
+    loop._run_pre_reply_consolidation = fail_preflight  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+        {"role": "assistant", "content": "a2", "timestamp": "2026-01-01T00:00:03"},
+        {"role": "user", "content": "u3", "timestamp": "2026-01-01T00:00:04"},
+    ]
+    loop.sessions.save(session)
+
+    seen = {}
+
+    async def fake_run_agent_loop(messages, **kwargs):
+        seen["messages"] = messages
+        return "ok", None, messages + [{"role": "assistant", "content": "ok"}]
+
+    loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+    loop.memory_consolidator.is_over_budget = lambda _session, max_history_messages=0: (True, 999, "test")  # type: ignore[method-assign]
+
+    result = await loop.process_direct("hello", session_key="cli:test")
+
+    assert result is not None
+    history = seen["messages"][1:-1]
+    assert [m["content"] for m in history] == ["u3"]

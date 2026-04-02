@@ -273,6 +273,7 @@ class LLMProvider(ABC):
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_retry: Callable[..., Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Call chat_stream() with retry on transient provider failures."""
         if max_tokens is self._SENTINEL:
@@ -282,24 +283,45 @@ class LLMProvider(ABC):
         if reasoning_effort is self._SENTINEL:
             reasoning_effort = self.generation.reasoning_effort
 
-        kw: dict[str, Any] = dict(
+        base_kw: dict[str, Any] = dict(
             messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
-            on_content_delta=on_content_delta,
         )
 
+        async def _call_stream(messages_override: list[dict[str, Any]] | None = None) -> tuple[LLMResponse, list[str]]:
+            buffered_deltas: list[str] = []
+
+            async def _buffer_delta(delta: str) -> None:
+                buffered_deltas.append(delta)
+
+            response = await self._safe_chat_stream(
+                **{
+                    **base_kw,
+                    "messages": messages_override or messages,
+                    "on_content_delta": _buffer_delta,
+                }
+            )
+            return response, buffered_deltas
+
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
-            response = await self._safe_chat_stream(**kw)
+            response, buffered_deltas = await _call_stream()
 
             if response.finish_reason != "error":
+                if on_content_delta:
+                    for delta in buffered_deltas:
+                        await on_content_delta(delta)
                 return response
 
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat_stream(**{**kw, "messages": stripped})
+                    response, buffered_deltas = await _call_stream(stripped)
+                    if response.finish_reason != "error" and on_content_delta:
+                        for delta in buffered_deltas:
+                            await on_content_delta(delta)
+                    return response
                 return response
 
             logger.warning(
@@ -307,9 +329,20 @@ class LLMProvider(ABC):
                 attempt, len(self._CHAT_RETRY_DELAYS), delay,
                 (response.content or "")[:120].lower(),
             )
+            if on_retry:
+                await on_retry(
+                    attempt=attempt,
+                    max_retries=len(self._CHAT_RETRY_DELAYS),
+                    delay=delay,
+                    error=response.content,
+                )
             await asyncio.sleep(delay)
 
-        return await self._safe_chat_stream(**kw)
+        response, buffered_deltas = await _call_stream()
+        if response.finish_reason != "error" and on_content_delta:
+            for delta in buffered_deltas:
+                await on_content_delta(delta)
+        return response
 
     async def chat_with_retry(
         self,
@@ -320,6 +353,7 @@ class LLMProvider(ABC):
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
+        on_retry: Callable[..., Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures.
 
@@ -358,6 +392,13 @@ class LLMProvider(ABC):
                 attempt, len(self._CHAT_RETRY_DELAYS), delay,
                 (response.content or "")[:120].lower(),
             )
+            if on_retry:
+                await on_retry(
+                    attempt=attempt,
+                    max_retries=len(self._CHAT_RETRY_DELAYS),
+                    delay=delay,
+                    error=response.content,
+                )
             await asyncio.sleep(delay)
 
         return await self._safe_chat(**kw)

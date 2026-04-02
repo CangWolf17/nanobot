@@ -236,10 +236,14 @@ class MemoryConsolidator:
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
+        archive_provider: LLMProvider | None = None,
+        archive_model: str | None = None,
     ):
         self.store = MemoryStore(workspace)
         self.provider = provider
         self.model = model
+        self.archive_provider = archive_provider or provider
+        self.archive_model = archive_model or model
         self.sessions = sessions
         self.context_window_tokens = context_window_tokens
         self.max_completion_tokens = max_completion_tokens
@@ -253,7 +257,56 @@ class MemoryConsolidator:
 
     async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
         """Archive a selected message chunk into persistent memory."""
-        return await self.store.consolidate(messages, self.provider, self.model)
+        return await self.store.consolidate(messages, self.archive_provider, self.archive_model)
+
+    async def handle_timeout(self, session: Session, *, phase: str) -> None:
+        """Record an outer timeout and degrade to raw archive after repeated hangs."""
+        if not session.messages or self.context_window_tokens <= 0:
+            return
+
+        lock = self.get_lock(session.key)
+        async with lock:
+            estimated, source = self.estimate_session_prompt_tokens(session)
+            if estimated <= 0 or estimated < self.prompt_budget():
+                return
+
+            boundary = self.pick_consolidation_boundary(
+                session,
+                max(1, estimated - self.target_prompt_tokens()),
+            )
+            if boundary is None:
+                return
+
+            end_idx = boundary[0]
+            chunk = session.messages[session.last_consolidated:end_idx]
+            if not chunk:
+                return
+
+            archived = self.store._fail_or_raw_archive(chunk)
+            if archived:
+                session.last_consolidated = end_idx
+                self.sessions.save(session)
+                logger.warning(
+                    "Memory consolidation timeout degraded {}: phase={}, estimated={}/{} via {}, chunk={} msgs",
+                    session.key,
+                    phase,
+                    estimated,
+                    self.context_window_tokens,
+                    source,
+                    len(chunk),
+                )
+                return
+
+            logger.warning(
+                "Memory consolidation timeout recorded {}: phase={}, estimated={}/{} via {}, chunk={} msgs, consecutive_failures={}",
+                session.key,
+                phase,
+                estimated,
+                self.context_window_tokens,
+                source,
+                len(chunk),
+                self.store._consecutive_failures,
+            )
 
     def pick_consolidation_boundary(
         self,
@@ -277,9 +330,14 @@ class MemoryConsolidator:
 
         return last_boundary
 
-    def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
+    def estimate_session_prompt_tokens(
+        self,
+        session: Session,
+        *,
+        max_history_messages: int = 0,
+    ) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
-        history = session.get_history(max_messages=0)
+        history = session.get_history(max_messages=max_history_messages)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
         probe_messages = self._build_messages(
             history=history,
@@ -294,6 +352,21 @@ class MemoryConsolidator:
             self._get_tool_definitions(),
         )
 
+    def prompt_budget(self) -> int:
+        """Prompt token budget for the main conversation path."""
+        return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+
+    def target_prompt_tokens(self) -> int:
+        """Target prompt size after consolidation."""
+        return self.prompt_budget() // 2
+
+    def is_over_budget(self, session: Session, *, max_history_messages: int = 0) -> tuple[bool, int, str]:
+        """Return whether the main conversation prompt is over the safe budget."""
+        estimated, source = self.estimate_session_prompt_tokens(
+            session, max_history_messages=max_history_messages
+        )
+        return estimated >= self.prompt_budget(), estimated, source
+
     async def archive_messages(self, messages: list[dict[str, object]]) -> bool:
         """Archive messages with guaranteed persistence (retries until raw-dump fallback)."""
         if not messages:
@@ -303,22 +376,26 @@ class MemoryConsolidator:
                 return True
         return True
 
-    async def maybe_consolidate_by_tokens(self, session: Session) -> None:
+    async def maybe_consolidate_by_tokens(self, session: Session) -> bool:
         """Loop: archive old messages until prompt fits within safe budget.
+
+        Returns True when consolidation completed cleanly (or was unnecessary),
+        and False when the pass aborted/failed and caller should treat it as a
+        best-effort miss.
 
         The budget reserves space for completion tokens and a safety buffer
         so the LLM request never exceeds the context window.
         """
         if not session.messages or self.context_window_tokens <= 0:
-            return
+            return True
 
         lock = self.get_lock(session.key)
         async with lock:
-            budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
-            target = budget // 2
+            budget = self.prompt_budget()
+            target = self.target_prompt_tokens()
             estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
-                return
+                return True
             if estimated < budget:
                 logger.debug(
                     "Token consolidation idle {}: {}/{} via {}",
@@ -327,40 +404,87 @@ class MemoryConsolidator:
                     self.context_window_tokens,
                     source,
                 )
-                return
+                return True
 
-            for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
-                if estimated <= target:
-                    return
+            active_chunk: list[dict[str, object]] | None = None
+            active_end_idx: int | None = None
+            active_round: int | None = None
+            active_estimated = estimated
+            active_source = source
 
-                boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
-                if boundary is None:
-                    logger.debug(
-                        "Token consolidation: no safe boundary for {} (round {})",
-                        session.key,
+            try:
+                for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
+                    if estimated <= target:
+                        return True
+
+                    boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
+                    if boundary is None:
+                        logger.debug(
+                            "Token consolidation: no safe boundary for {} (round {})",
+                            session.key,
+                            round_num,
+                        )
+                        return True
+
+                    end_idx = boundary[0]
+                    chunk = session.messages[session.last_consolidated:end_idx]
+                    if not chunk:
+                        return True
+
+                    active_chunk = chunk
+                    active_end_idx = end_idx
+                    active_round = round_num
+                    active_estimated = estimated
+                    active_source = source
+
+                    logger.info(
+                        "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs, archive_model={}",
                         round_num,
+                        session.key,
+                        estimated,
+                        self.context_window_tokens,
+                        source,
+                        len(chunk),
+                        self.archive_model,
                     )
-                    return
+                    if not await self.consolidate_messages(chunk):
+                        return False
+                    session.last_consolidated = end_idx
+                    self.sessions.save(session)
 
-                end_idx = boundary[0]
-                chunk = session.messages[session.last_consolidated:end_idx]
-                if not chunk:
-                    return
+                    active_chunk = None
+                    active_end_idx = None
+                    active_round = None
 
-                logger.info(
-                    "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs",
-                    round_num,
-                    session.key,
-                    estimated,
-                    self.context_window_tokens,
-                    source,
-                    len(chunk),
-                )
-                if not await self.consolidate_messages(chunk):
-                    return
-                session.last_consolidated = end_idx
-                self.sessions.save(session)
-
-                estimated, source = self.estimate_session_prompt_tokens(session)
-                if estimated <= 0:
-                    return
+                    estimated, source = self.estimate_session_prompt_tokens(session)
+                    if estimated <= 0:
+                        return True
+                return True
+            except asyncio.CancelledError:
+                if active_chunk and active_end_idx is not None:
+                    archived = self.store._fail_or_raw_archive(active_chunk)
+                    if archived:
+                        session.last_consolidated = active_end_idx
+                        self.sessions.save(session)
+                        logger.warning(
+                            "Memory consolidation cancelled/degraded {}: round={}, estimated={}/{} via {}, chunk={} msgs",
+                            session.key,
+                            active_round,
+                            active_estimated,
+                            self.context_window_tokens,
+                            active_source,
+                            len(active_chunk),
+                        )
+                    else:
+                        logger.warning(
+                            "Memory consolidation cancelled/recorded {}: round={}, estimated={}/{} via {}, chunk={} msgs, consecutive_failures={}",
+                            session.key,
+                            active_round,
+                            active_estimated,
+                            self.context_window_tokens,
+                            active_source,
+                            len(active_chunk),
+                            self.store._consecutive_failures,
+                        )
+                    return False
+                raise

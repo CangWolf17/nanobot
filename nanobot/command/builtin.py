@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
+from nanobot.command.workspace_bridge import cmd_workspace_bridge
 from nanobot.utils.helpers import build_status_content
 
 
@@ -56,8 +59,10 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=build_status_content(
-            version=__version__, model=loop.model,
-            start_time=loop._start_time, last_usage=loop._last_usage,
+            version=__version__,
+            model=loop.model,
+            start_time=loop._start_time,
+            last_usage=loop._last_usage,
             context_window_tokens=loop.context_window_tokens,
             session_msg_count=len(session.get_history(max_messages=0)),
             context_tokens_estimate=ctx_est,
@@ -70,30 +75,43 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     """Start a fresh session."""
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
-    snapshot = session.messages[session.last_consolidated:]
+    snapshot = session.messages[session.last_consolidated :]
     session.clear()
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
     if snapshot:
         loop._schedule_background(loop.memory_consolidator.archive_messages(snapshot))
     return OutboundMessage(
-        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
         content="New session started.",
     )
 
 
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
-    """Return available slash commands."""
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content=build_help_text(),
-        metadata={"render_as": "text"},
-    )
+    """Return available slash commands, preferring workspace help when available."""
+    router_path = Path.home() / ".nanobot" / "workspace" / "scripts" / "router.py"
+    if router_path.exists():
+        try:
+            result = subprocess.run(
+                [str(router_path)],
+                input="/help",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=5,
+            )
+            stdout = (result.stdout or "").strip()
+            if stdout and not stdout.startswith("[AGENT]"):
+                return OutboundMessage(
+                    channel=ctx.msg.channel,
+                    chat_id=ctx.msg.chat_id,
+                    content=stdout,
+                    metadata={"render_as": "text"},
+                )
+        except Exception:
+            pass
 
-
-def build_help_text() -> str:
-    """Build canonical help text shared across channels."""
     lines = [
         "🐈 nanobot commands:",
         "/new — Start a new conversation",
@@ -102,7 +120,12 @@ def build_help_text() -> str:
         "/status — Show bot status",
         "/help — Show available commands",
     ]
-    return "\n".join(lines)
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content="\n".join(lines),
+        metadata={"render_as": "text"},
+    )
 
 
 def register_builtin_commands(router: CommandRouter) -> None:
@@ -113,3 +136,4 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
     router.exact("/help", cmd_help)
+    router.intercept(cmd_workspace_bridge)

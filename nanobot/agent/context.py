@@ -9,6 +9,7 @@ from typing import Any
 from nanobot.utils.helpers import current_time_str
 
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.policy.dev_discipline import format_dev_discipline_block
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, detect_image_mime
 
@@ -25,7 +26,11 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        workspace_work_mode: str | None = None,
+    ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
@@ -51,6 +56,14 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
 {skills_summary}""")
+
+        dev_block = format_dev_discipline_block(self.workspace)
+        if dev_block:
+            parts.append(dev_block)
+
+        work_mode = self._build_work_mode_block(workspace_work_mode)
+        if work_mode:
+            parts.append(work_mode)
 
         return "\n\n---\n\n".join(parts)
 
@@ -101,13 +114,44 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST call the 'message' tool with the 'media' parameter. Do NOT use read_file to "send" a file — reading a file only shows its content to you, it does NOT deliver the file to the user. Example: message(content="Here is the file", media=["/path/to/file.png"])"""
 
     @staticmethod
+    def _build_work_mode_block(workspace_work_mode: str | None) -> str:
+        """Build a dynamic system block describing current workspace work mode."""
+        if workspace_work_mode not in {"plan", "build"}:
+            return ""
+
+        lines = [
+            "## Work Mode",
+            f"Current workspace work mode: {workspace_work_mode}",
+        ]
+        if workspace_work_mode == "plan":
+            lines.extend(
+                [
+                    "- Treat this turn as planning mode.",
+                    "- You may discuss, analyze, and update planning/documentation artifacts.",
+                    "- Do not make code or implementation changes in this mode.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "- Treat this turn as build mode.",
+                    "- Implementation and file changes are allowed when otherwise appropriate.",
+                    "- Keep execution aligned with the current plan/task context.",
+                ]
+            )
+        return "\n".join(lines)
+
+    @staticmethod
     def _build_runtime_context(
         channel: str | None, chat_id: str | None, timezone: str | None = None,
     ) -> str:
-        """Build untrusted runtime metadata block for injection before the user message."""
+        """Build untrusted runtime metadata block for injection before the user message.
+
+        Keep this block minimal: current time is useful context, but raw routing
+        metadata like channel/chat_id should not be exposed to the model by default.
+        """
+        _ = channel, chat_id
         lines = [f"Current Time: {current_time_str(timezone)}"]
-        if channel and chat_id:
-            lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:
@@ -131,6 +175,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         channel: str | None = None,
         chat_id: str | None = None,
         current_role: str = "user",
+        workspace_work_mode: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
@@ -144,7 +189,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": self.build_system_prompt(skill_names, workspace_work_mode=workspace_work_mode)},
             *history,
             {"role": current_role, "content": merged},
         ]
