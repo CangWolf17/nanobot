@@ -318,18 +318,35 @@ class OpenAICompatProvider(LLMProvider):
 
         usage_map = cls._maybe_mapping(usage_obj)
         if usage_map is not None:
-            return {
+            usage: dict[str, int] = {
                 "prompt_tokens": int(usage_map.get("prompt_tokens") or 0),
                 "completion_tokens": int(usage_map.get("completion_tokens") or 0),
                 "total_tokens": int(usage_map.get("total_tokens") or 0),
             }
+            prompt_details = cls._maybe_mapping(usage_map.get("prompt_tokens_details")) or {}
+            cached_tokens = (
+                prompt_details.get("cached_tokens")
+                or usage_map.get("prompt_cache_hit_tokens")
+                or usage_map.get("cached_tokens")
+                or 0
+            )
+            if cached_tokens:
+                usage["cached_tokens"] = int(cached_tokens)
+            return usage
 
         if usage_obj:
-            return {
-                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(usage_obj, "total_tokens", 0) or 0,
+            usage = {
+                "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
             }
+            prompt_details = getattr(usage_obj, "prompt_tokens_details", None)
+            cached_tokens = (
+                getattr(prompt_details, "cached_tokens", 0) if prompt_details is not None else 0
+            ) or getattr(usage_obj, "prompt_cache_hit_tokens", 0) or getattr(usage_obj, "cached_tokens", 0) or 0
+            if cached_tokens:
+                usage["cached_tokens"] = int(cached_tokens)
+            return usage
         return {}
 
     def _parse(self, response: Any) -> LLMResponse:

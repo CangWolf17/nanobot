@@ -208,10 +208,10 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     # GitHub Copilot: OAuth-based
     ProviderSpec(
         name="github_copilot",
-        keywords=("github_copilot", "copilot"),
+        keywords=("github-copilot", "github_copilot", "copilot"),
         env_key="",
         display_name="Github Copilot",
-        backend="openai_compat",
+        backend="github_copilot",
         default_api_base="https://api.githubcopilot.com",
         is_oauth=True,
     ),

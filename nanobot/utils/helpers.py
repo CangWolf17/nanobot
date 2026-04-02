@@ -255,6 +255,11 @@ def build_status_content(
     )
     last_in = last_usage.get("prompt_tokens", 0)
     last_out = last_usage.get("completion_tokens", 0)
+    cached_tokens = int(last_usage.get("cached_tokens", 0) or 0)
+    tokens_line = f"\U0001f4ca Tokens: {last_in} in / {last_out} out"
+    if last_in > 0 and cached_tokens > 0:
+        cache_pct = int((cached_tokens / last_in) * 100)
+        tokens_line += f" ({cache_pct}% cached)"
     ctx_total = max(context_window_tokens, 0)
     ctx_pct = int((context_tokens_estimate / ctx_total) * 100) if ctx_total > 0 else 0
     ctx_used_str = f"{context_tokens_estimate // 1000}k" if context_tokens_estimate >= 1000 else str(context_tokens_estimate)
@@ -262,7 +267,7 @@ def build_status_content(
     return "\n".join([
         f"\U0001f408 nanobot v{version}",
         f"\U0001f9e0 Model: {model}",
-        f"\U0001f4ca Tokens: {last_in} in / {last_out} out",
+        tokens_line,
         f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
         f"\U0001f4ac Session: {session_msg_count} messages",
         f"\u23f1 Uptime: {uptime}",

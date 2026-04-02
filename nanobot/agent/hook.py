@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from loguru import logger
+
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
@@ -59,4 +61,81 @@ class AgentHook:
         pass
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
+        return content
+
+
+class CompositeHook(AgentHook):
+    """Fan-out hook that delegates to an ordered list of hooks.
+
+    Async methods isolate per-hook failures so one custom hook cannot break the
+    whole agent run. ``finalize_content`` remains a simple pipeline.
+    """
+
+    __slots__ = ("_hooks",)
+
+    def __init__(self, hooks: list[AgentHook]) -> None:
+        self._hooks = list(hooks)
+
+    def wants_streaming(self) -> bool:
+        return any(h.wants_streaming() for h in self._hooks)
+
+    async def before_iteration(self, context: AgentHookContext) -> None:
+        for hook in self._hooks:
+            try:
+                await hook.before_iteration(context)
+            except Exception:
+                logger.exception("AgentHook.before_iteration error in {}", type(hook).__name__)
+
+    async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+        for hook in self._hooks:
+            try:
+                await hook.on_stream(context, delta)
+            except Exception:
+                logger.exception("AgentHook.on_stream error in {}", type(hook).__name__)
+
+    async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+        for hook in self._hooks:
+            try:
+                await hook.on_stream_end(context, resuming=resuming)
+            except Exception:
+                logger.exception("AgentHook.on_stream_end error in {}", type(hook).__name__)
+
+    async def on_retry(
+        self,
+        context: AgentHookContext,
+        *,
+        attempt: int,
+        max_retries: int,
+        delay: float,
+        error: str | None,
+    ) -> None:
+        for hook in self._hooks:
+            try:
+                await hook.on_retry(
+                    context,
+                    attempt=attempt,
+                    max_retries=max_retries,
+                    delay=delay,
+                    error=error,
+                )
+            except Exception:
+                logger.exception("AgentHook.on_retry error in {}", type(hook).__name__)
+
+    async def before_execute_tools(self, context: AgentHookContext) -> None:
+        for hook in self._hooks:
+            try:
+                await hook.before_execute_tools(context)
+            except Exception:
+                logger.exception("AgentHook.before_execute_tools error in {}", type(hook).__name__)
+
+    async def after_iteration(self, context: AgentHookContext) -> None:
+        for hook in self._hooks:
+            try:
+                await hook.after_iteration(context)
+            except Exception:
+                logger.exception("AgentHook.after_iteration error in {}", type(hook).__name__)
+
+    def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
+        for hook in self._hooks:
+            content = hook.finalize_content(context, content)
         return content

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.policy.dev_discipline import should_disable_concurrent_tools
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
@@ -42,6 +42,67 @@ if TYPE_CHECKING:
         WebSearchConfig,
     )
     from nanobot.cron.service import CronService
+
+
+class _LoopHookChain(AgentHook):
+    """Run the core loop hook first, then best-effort extra hooks."""
+
+    __slots__ = ("_primary", "_extras")
+
+    def __init__(self, primary: AgentHook, extra_hooks: list[AgentHook]) -> None:
+        self._primary = primary
+        self._extras = CompositeHook(extra_hooks)
+
+    def wants_streaming(self) -> bool:
+        return self._primary.wants_streaming() or self._extras.wants_streaming()
+
+    async def before_iteration(self, context: AgentHookContext) -> None:
+        await self._primary.before_iteration(context)
+        await self._extras.before_iteration(context)
+
+    async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+        await self._primary.on_stream(context, delta)
+        await self._extras.on_stream(context, delta)
+
+    async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+        await self._primary.on_stream_end(context, resuming=resuming)
+        await self._extras.on_stream_end(context, resuming=resuming)
+
+    async def on_retry(
+        self,
+        context: AgentHookContext,
+        *,
+        attempt: int,
+        max_retries: int,
+        delay: float,
+        error: str | None,
+    ) -> None:
+        await self._primary.on_retry(
+            context,
+            attempt=attempt,
+            max_retries=max_retries,
+            delay=delay,
+            error=error,
+        )
+        await self._extras.on_retry(
+            context,
+            attempt=attempt,
+            max_retries=max_retries,
+            delay=delay,
+            error=error,
+        )
+
+    async def before_execute_tools(self, context: AgentHookContext) -> None:
+        await self._primary.before_execute_tools(context)
+        await self._extras.before_execute_tools(context)
+
+    async def after_iteration(self, context: AgentHookContext) -> None:
+        await self._primary.after_iteration(context)
+        await self._extras.after_iteration(context)
+
+    def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
+        content = self._primary.finalize_content(context, content)
+        return self._extras.finalize_content(context, content)
 
 
 class AgentLoop:
@@ -78,6 +139,7 @@ class AgentLoop:
         memory_config: MemoryConsolidationConfig | None = None,
         archive_provider: LLMProvider | None = None,
         archive_model: str | None = None,
+        hooks: list[AgentHook] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, MemoryConsolidationConfig, WebSearchConfig
 
@@ -98,6 +160,7 @@ class AgentLoop:
         self.archive_model = archive_model or self.memory_config.model or (model or provider.get_default_model())
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
+        self._extra_hooks: list[AgentHook] = hooks or []
 
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
@@ -307,13 +370,17 @@ class AgentLoop:
             ) -> str | None:
                 return loop_self._strip_think(content)
 
+        loop_hook: AgentHook = _LoopHook()
+        if self._extra_hooks:
+            loop_hook = _LoopHookChain(loop_hook, self._extra_hooks)
+
         result = await self.runner.run(
             AgentRunSpec(
                 initial_messages=initial_messages,
                 tools=self.tools,
                 model=self.model,
                 max_iterations=self.max_iterations,
-                hook=_LoopHook(),
+                hook=loop_hook,
                 error_message="Sorry, I encountered an error calling the AI model.",
                 concurrent_tools=not should_disable_concurrent_tools(self.workspace),
             )
