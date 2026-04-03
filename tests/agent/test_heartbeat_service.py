@@ -110,8 +110,11 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
         )
     ])
 
+    called_with: list[str] = []
+
     async def _on_execute(tasks: str) -> str:
-        return tasks
+        called_with.append(tasks)
+        return "done"
 
     service = HeartbeatService(
         workspace=tmp_path,
@@ -121,6 +124,7 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
     )
 
     assert await service.trigger_now() is None
+    assert called_with == []
 
 
 @pytest.mark.asyncio

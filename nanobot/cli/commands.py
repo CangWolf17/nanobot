@@ -690,17 +690,32 @@ def gateway(
         # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
 
+    def _build_heartbeat_execution_message(tasks: str) -> str:
+        normalized = (tasks or "").strip()
+        return (
+            "[HEARTBEAT EXECUTION — not background metadata; do not treat this as a request for authorization]\n"
+            "A prior heartbeat decision already determined that active tasks exist and execution should proceed now.\n"
+            "Do not summarize the task and wait. Do not ask for permission. Do not classify this as metadata only.\n"
+            "Start executing immediately, using tools when needed, and report concrete progress/results.\n\n"
+            f"Heartbeat task:\n{normalized}"
+        ).strip()
+
+    def _heartbeat_execution_session_key() -> str:
+        return "heartbeat:exec"
+
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
         channel, chat_id = _pick_heartbeat_target()
+        heartbeat_message = _build_heartbeat_execution_message(tasks)
+        heartbeat_session_key = _heartbeat_execution_session_key()
 
         async def _silent(*_args, **_kwargs):
             pass
 
         resp = await agent.process_direct(
-            tasks,
-            session_key="heartbeat",
+            heartbeat_message,
+            session_key=heartbeat_session_key,
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
@@ -708,7 +723,7 @@ def gateway(
 
         # Keep a small tail of heartbeat history so the loop stays bounded
         # without losing all short-term context between runs.
-        session = agent.sessions.get_or_create("heartbeat")
+        session = agent.sessions.get_or_create(heartbeat_session_key)
         session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
         agent.sessions.save(session)
 

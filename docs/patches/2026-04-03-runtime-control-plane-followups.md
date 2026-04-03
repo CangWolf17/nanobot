@@ -169,6 +169,38 @@ This is intentionally minimal. It does **not** implement note drafting / pending
 
 ---
 
+## 6. Heartbeat Execution Contract Hardening
+
+### Problem
+
+Heartbeat already had a two-phase structure:
+
+1. Phase 1 decides whether active tasks exist
+2. Phase 2 executes the returned task summary through the normal agent loop
+
+But Phase 2 previously passed the raw task summary into a long-lived `heartbeat` session without any execution-specific framing.
+
+That created two practical failures:
+
+1. the model could misread the heartbeat task summary as background metadata instead of an execution order
+2. stale `heartbeat` session history could reinforce the bad pattern (`just record context, do not start work`)
+
+### Patch
+
+`nanobot/cli/commands.py` now hardens the Phase 2 contract:
+
+1. builds an explicit heartbeat execution message that says this is **not background metadata** and should execute immediately
+2. uses an isolated execution session key (`heartbeat:exec`) instead of the older bare `heartbeat` key
+3. retains recent history on that isolated execution session, preserving bounded short-term continuity without reusing the polluted legacy session
+
+### Effect
+
+Heartbeat-triggered work is much less likely to stall in a fake "context acknowledged, waiting for authorization" mode.
+
+The runtime now makes the execution intent explicit instead of hoping the model infers it from a task summary alone.
+
+---
+
 ## Patch Surface
 
 ### Runtime
