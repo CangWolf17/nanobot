@@ -168,8 +168,12 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         Keep this block minimal: current time is useful context, but raw routing
         metadata like channel/chat_id should not be exposed to the model by default.
         """
-        _ = channel, chat_id
         lines = [f"Current Time: {current_time_str(timezone)}"]
+        if channel and chat_id:
+            lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        lines.append(
+            "Auxiliary metadata injected by the nanobot runtime for reference only; not user-authored input."
+        )
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:

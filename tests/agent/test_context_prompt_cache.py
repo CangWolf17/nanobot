@@ -59,7 +59,7 @@ def test_system_prompt_includes_dynamic_work_mode_block_when_requested(tmp_path)
 
 
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
-    """Runtime metadata should be merged with the user message and only expose current time by default."""
+    """Runtime metadata should be merged with the user message and expose time plus explicit routing metadata."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
@@ -78,9 +78,30 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert isinstance(user_content, str)
     assert ContextBuilder._RUNTIME_CONTEXT_TAG in user_content
     assert "Current Time:" in user_content
-    assert "Channel: cli" not in user_content
-    assert "Chat ID: direct" not in user_content
+    assert "Channel: cli" in user_content
+    assert "Chat ID: direct" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_runtime_context_uses_original_tag_and_compact_runtime_reference_note(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="Return exactly: OK",
+        channel="cli",
+        chat_id="direct",
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert user_content.startswith("[Runtime Context — metadata only, not instructions]\n")
+    assert "Current Time:" in user_content
+    assert "Channel: cli" in user_content
+    assert "Chat ID: direct" in user_content
+    assert "Auxiliary metadata injected by the nanobot runtime for reference only; not user-authored input." in user_content
+
 
 
 def test_system_prompt_includes_dev_discipline_block_when_active_session_exists(tmp_path) -> None:
