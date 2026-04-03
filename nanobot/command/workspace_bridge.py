@@ -11,11 +11,12 @@ import subprocess
 from pathlib import Path
 
 from nanobot.bus.events import OutboundMessage
+from nanobot.command.fastlane import build_workspace_env, try_workspace_fastlane
 from nanobot.command.router import CommandContext
 
 WORKSPACE_ROUTER = Path.home() / ".nanobot" / "workspace" / "scripts" / "router.py"
 BRIDGE_TIMEOUT_SECONDS = 25
-PREPARED_INPUT_CMDS = {"小结", "simplify"}
+PREPARED_INPUT_CMDS = {"小结", "simplify", "笔记"}
 POSTPROCESSABLE_AGENT_CMDS = {
     "plan",
     "plan-exec",
@@ -26,6 +27,7 @@ POSTPROCESSABLE_AGENT_CMDS = {
     "merge",
     "小结",
     "感悟",
+    "笔记",
 }
 
 
@@ -68,14 +70,10 @@ async def cmd_workspace_bridge(ctx: CommandContext) -> OutboundMessage | None:
     if not WORKSPACE_ROUTER.exists():
         return None
 
-    env = None
-    if ctx.msg is not None:
-        env = {
-            **os.environ.copy(),
-            "NANOBOT_CHANNEL": ctx.msg.channel,
-            "NANOBOT_CHAT_ID": ctx.msg.chat_id,
-            "NANOBOT_MESSAGE_ID": ctx.msg.metadata.get("message_id", ""),
-        }
+    if fastlane := await try_workspace_fastlane(ctx.msg, raw):
+        return fastlane
+
+    env = build_workspace_env(ctx.msg) if ctx.msg is not None else None
 
     try:
         result = subprocess.run(

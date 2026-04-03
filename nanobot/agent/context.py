@@ -9,7 +9,11 @@ from typing import Any
 from nanobot.utils.helpers import current_time_str
 
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.policy.dev_discipline import format_dev_discipline_block
+from nanobot.agent.policy.dev_discipline import (
+    format_dev_discipline_block,
+    format_runtime_protocol_block,
+    load_runtime_protocol,
+)
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, detect_image_mime
 
@@ -30,6 +34,7 @@ class ContextBuilder:
         self,
         skill_names: list[str] | None = None,
         workspace_work_mode: str | None = None,
+        compact_state: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
@@ -41,6 +46,9 @@ class ContextBuilder:
         memory = self.memory.get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
+
+        if compact_state and compact_state.strip():
+            parts.append(f"# Session Compact State\n\n{compact_state.strip()}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -60,6 +68,14 @@ Skills with available="false" need dependencies installed first - you can try in
         dev_block = format_dev_discipline_block(self.workspace)
         if dev_block:
             parts.append(dev_block)
+
+        protocol = load_runtime_protocol(self.workspace)
+        protocol_block = format_runtime_protocol_block(
+            protocol,
+            skill_hints=self.skills.get_protocol_skill_hints(protocol),
+        )
+        if protocol_block:
+            parts.append(protocol_block)
 
         work_mode = self._build_work_mode_block(workspace_work_mode)
         if work_mode:
@@ -143,7 +159,9 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
 
     @staticmethod
     def _build_runtime_context(
-        channel: str | None, chat_id: str | None, timezone: str | None = None,
+        channel: str | None,
+        chat_id: str | None,
+        timezone: str | None = None,
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message.
 
@@ -176,6 +194,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         chat_id: str | None = None,
         current_role: str = "user",
         workspace_work_mode: str | None = None,
+        compact_state: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
@@ -189,7 +208,14 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names, workspace_work_mode=workspace_work_mode)},
+            {
+                "role": "system",
+                "content": self.build_system_prompt(
+                    skill_names,
+                    workspace_work_mode=workspace_work_mode,
+                    compact_state=compact_state,
+                ),
+            },
             *history,
             {"role": current_role, "content": merged},
         ]
@@ -210,36 +236,46 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             if not mime or not mime.startswith("image/"):
                 continue
             b64 = base64.b64encode(raw).decode()
-            images.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-                "_meta": {"path": str(p)},
-            })
+            images.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    "_meta": {"path": str(p)},
+                }
+            )
 
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
 
     def add_tool_result(
-        self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: Any,
+        self,
+        messages: list[dict[str, Any]],
+        tool_call_id: str,
+        tool_name: str,
+        result: Any,
     ) -> list[dict[str, Any]]:
         """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
+        messages.append(
+            {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result}
+        )
         return messages
 
     def add_assistant_message(
-        self, messages: list[dict[str, Any]],
+        self,
+        messages: list[dict[str, Any]],
         content: str | None,
         tool_calls: list[dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
         thinking_blocks: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
         """Add an assistant message to the message list."""
-        messages.append(build_assistant_message(
-            content,
-            tool_calls=tool_calls,
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        ))
+        messages.append(
+            build_assistant_message(
+                content,
+                tool_calls=tool_calls,
+                reasoning_content=reasoning_content,
+                thinking_blocks=thinking_blocks,
+            )
+        )
         return messages

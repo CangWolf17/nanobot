@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent.compact_state import CompactStateManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import MemoryConsolidator
@@ -30,6 +31,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.command.fastlane import try_workspace_fastlane
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
@@ -157,7 +159,9 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self.memory_config = memory_config or MemoryConsolidationConfig()
         self.archive_provider = archive_provider or provider
-        self.archive_model = archive_model or self.memory_config.model or (model or provider.get_default_model())
+        self.archive_model = (
+            archive_model or self.memory_config.model or (model or provider.get_default_model())
+        )
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
@@ -198,13 +202,35 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
+            get_compact_state=self._get_session_compact_state,
             max_completion_tokens=provider.generation.max_tokens,
             archive_provider=self.archive_provider,
             archive_model=self.archive_model,
         )
+        compact_model = self.memory_config.compact_state_model or self.archive_model
+        self.compact_state = CompactStateManager(
+            provider=self.archive_provider,
+            model=compact_model,
+            max_chars=max(0, int(self.memory_config.compact_state_max_chars)),
+        )
         self._register_default_tools()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+
+    async def _maybe_consolidate_and_sync_compact_state(self, session: Session) -> bool:
+        completed = await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        if not completed or not self.memory_config.compact_state_enabled:
+            return completed
+        synced = await self.compact_state.sync_session(session)
+        if synced:
+            self.sessions.save(session)
+        return synced
+
+    def _get_session_compact_state(self, session: Session) -> str | None:
+        if not self.memory_config.compact_state_enabled:
+            return None
+        compact_state = self.compact_state.get_state(session)
+        return compact_state.strip() or None
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -346,9 +372,7 @@ class AgentLoop:
                 error: str | None,
             ) -> None:
                 if on_progress:
-                    await on_progress(
-                        loop_self._format_retry_progress(error, attempt, max_retries)
-                    )
+                    await on_progress(loop_self._format_retry_progress(error, attempt, max_retries))
 
             async def before_execute_tools(self, context: AgentHookContext) -> None:
                 if on_progress:
@@ -389,7 +413,9 @@ class AgentLoop:
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
-            logger.error("LLM returned error: {}", ((result.error or result.final_content) or "")[:200])
+            logger.error(
+                "LLM returned error: {}", ((result.error or result.final_content) or "")[:200]
+            )
         return result.final_content, result.tools_used, result.messages
 
     async def run(self) -> None:
@@ -419,6 +445,9 @@ class AgentLoop:
                 result = await self.commands.dispatch_priority(ctx)
                 if result:
                     await self.bus.publish_outbound(result)
+                continue
+            if fastlane := await try_workspace_fastlane(msg, raw):
+                await self.bus.publish_outbound(fastlane)
                 continue
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -534,16 +563,20 @@ class AgentLoop:
                 self.archive_model,
             )
             completed = await asyncio.wait_for(
-                self.memory_consolidator.maybe_consolidate_by_tokens(session),
+                self._maybe_consolidate_and_sync_compact_state(session),
                 timeout=timeout,
             )
             return completed
         except asyncio.TimeoutError:
-            logger.warning("Pre-reply consolidation timed out for {} after {}s", session.key, timeout)
+            logger.warning(
+                "Pre-reply consolidation timed out for {} after {}s", session.key, timeout
+            )
             try:
                 await self.memory_consolidator.handle_timeout(session, phase="pre-reply")
             except Exception:
-                logger.exception("Failed to record pre-reply consolidation timeout for {}", session.key)
+                logger.exception(
+                    "Failed to record pre-reply consolidation timeout for {}", session.key
+                )
             return False
         except Exception:
             logger.exception("Pre-reply consolidation failed for {}", session.key)
@@ -556,17 +589,23 @@ class AgentLoop:
         timeout = max(0.1, float(self.memory_config.background_timeout_seconds))
         try:
             completed = await asyncio.wait_for(
-                self.memory_consolidator.maybe_consolidate_by_tokens(session),
+                self._maybe_consolidate_and_sync_compact_state(session),
                 timeout=timeout,
             )
             if not completed:
-                logger.warning("Background consolidation did not complete cleanly for {}", session.key)
+                logger.warning(
+                    "Background consolidation did not complete cleanly for {}", session.key
+                )
         except asyncio.TimeoutError:
-            logger.warning("Background consolidation timed out for {} after {}s", session.key, timeout)
+            logger.warning(
+                "Background consolidation timed out for {} after {}s", session.key, timeout
+            )
             try:
                 await self.memory_consolidator.handle_timeout(session, phase="background")
             except Exception:
-                logger.exception("Failed to record background consolidation timeout for {}", session.key)
+                logger.exception(
+                    "Failed to record background consolidation timeout for {}", session.key
+                )
         except Exception:
             logger.exception("Background consolidation failed for {}", session.key)
 
@@ -632,6 +671,7 @@ class AgentLoop:
                 chat_id=chat_id,
                 current_role=current_role,
                 workspace_work_mode=(msg.metadata or {}).get("workspace_work_mode"),
+                compact_state=self._get_session_compact_state(session),
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages,
@@ -685,6 +725,7 @@ class AgentLoop:
                 "simplify": "正在生成简化方案…",
                 "小结": "正在生成小结…",
                 "感悟": "正在整理感悟…",
+                "笔记": "正在整理笔记草稿…",
                 "sync": "正在同步与消化内容…",
                 "merge": "正在准备合并流程…",
             }
@@ -710,6 +751,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             workspace_work_mode=(msg.metadata or {}).get("workspace_work_mode"),
+            compact_state=self._get_session_compact_state(session),
         )
         persisted_current_content = None
         if current_message != msg.content:
@@ -720,12 +762,12 @@ class AgentLoop:
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 workspace_work_mode=(msg.metadata or {}).get("workspace_work_mode"),
+                compact_state=self._get_session_compact_state(session),
             )
             if persisted_messages:
                 persisted_current_content = persisted_messages[-1].get("content")
- 
-        final_content, _, all_msgs = await self._run_agent_loop(
 
+        final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -736,7 +778,11 @@ class AgentLoop:
         )
 
         if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+            final_content = AgentRunner._user_facing_error_message(
+                "empty model response",
+                retry_count=0,
+                fallback="模型返回了空响应。请稍后重试，或切换模型。",
+            )
 
         if persisted_current_content is not None:
             current_turn_user_idx = 1 + len(history)
@@ -749,9 +795,8 @@ class AgentLoop:
                     **all_msgs[current_turn_user_idx],
                     "content": persisted_current_content,
                 }
- 
-        final_content = self._postprocess_workspace_agent_output(msg, final_content)
 
+        final_content = self._postprocess_workspace_agent_output(msg, final_content)
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)

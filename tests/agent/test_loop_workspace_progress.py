@@ -70,6 +70,28 @@ def test_workspace_agent_simplify_emits_progress_before_agent_run(tmp_path: Path
     asyncio.run(run())
 
 
+def test_workspace_agent_notes_emits_progress_before_agent_run(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="telegram",
+            sender_id="user1",
+            chat_id="chat1",
+            content="/笔记 新建 runtime follow-ups",
+            metadata={"workspace_agent_cmd": "笔记"},
+        )
+
+        result = await loop._process_message(msg)
+        progress = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+        assert progress.content == "正在整理笔记草稿…"
+        assert progress.metadata["_progress"] is True
+        assert result is not None
+        assert result.content == "done"
+
+    asyncio.run(run())
+
+
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(

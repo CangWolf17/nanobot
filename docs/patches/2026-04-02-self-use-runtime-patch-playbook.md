@@ -16,10 +16,11 @@ This document is for the self-use fork only. It is not an upstream PR plan.
 The live service uses a set of local runtime changes that are intentionally outside the current upstream baseline. The main patch themes are:
 
 1. provider retry / timeout UX hardening
-2. context compression / memory consolidation routing and fail-open behavior
-3. workspace bridge integration for slash-command routing and postprocess hooks
-4. local runtime compatibility fixes across selected providers / channels / tools
-5. focused tests that lock down the above self-use behavior
+2. context compression split into archive memory plus session compact state
+3. lightweight runtime protocol state for work mode / gates / skill hints
+4. workspace bridge integration for slash-command routing, fastlane, and postprocess hooks
+5. local runtime compatibility fixes across selected providers / channels / tools
+6. focused tests that lock down the above self-use behavior
 
 The purpose of this fork is to keep those self-use patches on top of a clean upstream base, so future updates can be rebased or re-transplanted without relying on `/home/admin/nanobot-main-live` as a long-term git source of truth.
 
@@ -101,6 +102,10 @@ Focus review on these buckets:
 5. `nanobot/config/*`
 6. corresponding `tests/*`
 7. `docs/patches/*`
+
+Current active follow-up design note:
+
+1. `docs/patches/2026-04-03-runtime-control-plane-followups.md`
 
 ### 5. Validate In A Parallel Runtime
 

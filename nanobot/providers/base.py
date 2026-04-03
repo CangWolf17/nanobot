@@ -10,9 +10,13 @@ from typing import Any
 from loguru import logger
 
 
+EMPTY_MODEL_RESPONSE_ERROR = "empty model response"
+
+
 @dataclass
 class ToolCallRequest:
     """A tool call request from the LLM."""
+
     id: str
     name: str
     arguments: dict[str, Any]
@@ -35,20 +39,23 @@ class ToolCallRequest:
         if self.provider_specific_fields:
             tool_call["provider_specific_fields"] = self.provider_specific_fields
         if self.function_provider_specific_fields:
-            tool_call["function"]["provider_specific_fields"] = self.function_provider_specific_fields
+            tool_call["function"]["provider_specific_fields"] = (
+                self.function_provider_specific_fields
+            )
         return tool_call
 
 
 @dataclass
 class LLMResponse:
     """Response from an LLM provider."""
+
     content: str | None
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
-    
+
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
@@ -73,7 +80,7 @@ class GenerationSettings:
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
-    
+
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
@@ -110,7 +117,11 @@ class LLMProvider(ABC):
 
             if isinstance(content, str) and not content:
                 clean = dict(msg)
-                clean["content"] = None if (msg.get("role") == "assistant" and msg.get("tool_calls")) else "(empty)"
+                clean["content"] = (
+                    None
+                    if (msg.get("role") == "assistant" and msg.get("tool_calls"))
+                    else "(empty)"
+                )
                 result.append(clean)
                 continue
 
@@ -177,7 +188,7 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """
         Send a chat completion request.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
@@ -185,7 +196,7 @@ class LLMProvider(ABC):
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
             tool_choice: Tool selection strategy ("auto", "required", or specific tool dict).
-        
+
         Returns:
             LLMResponse with content and/or tool calls.
         """
@@ -195,6 +206,27 @@ class LLMProvider(ABC):
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
+
+    @staticmethod
+    def _classify_response_error(response: LLMResponse) -> str | None:
+        if response.finish_reason == "error":
+            return response.content or "Error calling LLM"
+        if response.has_tool_calls:
+            return None
+        if isinstance(response.content, str) and response.content.strip():
+            return None
+        return EMPTY_MODEL_RESPONSE_ERROR
+
+    @staticmethod
+    def _as_error_response(response: LLMResponse, error: str) -> LLMResponse:
+        return LLMResponse(
+            content=error,
+            tool_calls=list(response.tool_calls),
+            finish_reason="error",
+            usage=dict(response.usage),
+            reasoning_content=response.reasoning_content,
+            thinking_blocks=response.thinking_blocks,
+        )
 
     @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
@@ -246,9 +278,13 @@ class LLMProvider(ABC):
         streaming should override this method.
         """
         response = await self.chat(
-            messages=messages, tools=tools, model=model,
-            max_tokens=max_tokens, temperature=temperature,
-            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            tool_choice=tool_choice,
         )
         if on_content_delta and response.content:
             await on_content_delta(response.content)
@@ -284,12 +320,18 @@ class LLMProvider(ABC):
             reasoning_effort = self.generation.reasoning_effort
 
         base_kw: dict[str, Any] = dict(
-            messages=messages, tools=tools, model=model,
-            max_tokens=max_tokens, temperature=temperature,
-            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            tool_choice=tool_choice,
         )
 
-        async def _call_stream(messages_override: list[dict[str, Any]] | None = None) -> tuple[LLMResponse, list[str]]:
+        async def _call_stream(
+            messages_override: list[dict[str, Any]] | None = None,
+        ) -> tuple[LLMResponse, list[str]]:
             buffered_deltas: list[str] = []
 
             async def _buffer_delta(delta: str) -> None:
@@ -306,43 +348,54 @@ class LLMProvider(ABC):
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response, buffered_deltas = await _call_stream()
+            error = self._classify_response_error(response)
 
-            if response.finish_reason != "error":
+            if error is None:
                 if on_content_delta:
                     for delta in buffered_deltas:
                         await on_content_delta(delta)
                 return response
 
-            if not self._is_transient_error(response.content):
+            if error != EMPTY_MODEL_RESPONSE_ERROR and not self._is_transient_error(error):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
+                    logger.warning(
+                        "Non-transient LLM error with image content, retrying without images"
+                    )
                     response, buffered_deltas = await _call_stream(stripped)
-                    if response.finish_reason != "error" and on_content_delta:
+                    stripped_error = self._classify_response_error(response)
+                    if stripped_error is None and on_content_delta:
                         for delta in buffered_deltas:
                             await on_content_delta(delta)
-                    return response
-                return response
+                    return (
+                        response
+                        if stripped_error is None
+                        else self._as_error_response(response, stripped_error)
+                    )
+                return self._as_error_response(response, error)
 
             logger.warning(
                 "LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt, len(self._CHAT_RETRY_DELAYS), delay,
-                (response.content or "")[:120].lower(),
+                attempt,
+                len(self._CHAT_RETRY_DELAYS),
+                delay,
+                error[:120].lower(),
             )
             if on_retry:
                 await on_retry(
                     attempt=attempt,
                     max_retries=len(self._CHAT_RETRY_DELAYS),
                     delay=delay,
-                    error=response.content,
+                    error=error,
                 )
             await asyncio.sleep(delay)
 
         response, buffered_deltas = await _call_stream()
-        if response.finish_reason != "error" and on_content_delta:
+        error = self._classify_response_error(response)
+        if error is None and on_content_delta:
             for delta in buffered_deltas:
                 await on_content_delta(delta)
-        return response
+        return response if error is None else self._as_error_response(response, error)
 
     async def chat_with_retry(
         self,
@@ -369,39 +422,56 @@ class LLMProvider(ABC):
             reasoning_effort = self.generation.reasoning_effort
 
         kw: dict[str, Any] = dict(
-            messages=messages, tools=tools, model=model,
-            max_tokens=max_tokens, temperature=temperature,
-            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            tool_choice=tool_choice,
         )
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response = await self._safe_chat(**kw)
+            error = self._classify_response_error(response)
 
-            if response.finish_reason != "error":
+            if error is None:
                 return response
 
-            if not self._is_transient_error(response.content):
+            if error != EMPTY_MODEL_RESPONSE_ERROR and not self._is_transient_error(error):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat(**{**kw, "messages": stripped})
-                return response
+                    logger.warning(
+                        "Non-transient LLM error with image content, retrying without images"
+                    )
+                    stripped_response = await self._safe_chat(**{**kw, "messages": stripped})
+                    stripped_error = self._classify_response_error(stripped_response)
+                    return (
+                        stripped_response
+                        if stripped_error is None
+                        else self._as_error_response(stripped_response, stripped_error)
+                    )
+                return self._as_error_response(response, error)
 
             logger.warning(
                 "LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt, len(self._CHAT_RETRY_DELAYS), delay,
-                (response.content or "")[:120].lower(),
+                attempt,
+                len(self._CHAT_RETRY_DELAYS),
+                delay,
+                error[:120].lower(),
             )
             if on_retry:
                 await on_retry(
                     attempt=attempt,
                     max_retries=len(self._CHAT_RETRY_DELAYS),
                     delay=delay,
-                    error=response.content,
+                    error=error,
                 )
             await asyncio.sleep(delay)
 
-        return await self._safe_chat(**kw)
+        response = await self._safe_chat(**kw)
+        error = self._classify_response_error(response)
+        return response if error is None else self._as_error_response(response, error)
 
     @abstractmethod
     def get_default_model(self) -> str:

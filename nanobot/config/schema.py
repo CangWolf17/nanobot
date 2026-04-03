@@ -146,6 +146,9 @@ class MemoryConsolidationConfig(Base):
     """Memory consolidation runtime controls."""
 
     enabled: bool = True
+    compact_state_enabled: bool = True
+    compact_state_model: str = ""
+    compact_state_max_chars: int = 4000
     pre_reply_timeout_seconds: float = 8.0
     background_timeout_seconds: float = 20.0
     recent_history_fallback_messages: int = 80

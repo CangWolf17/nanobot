@@ -8,7 +8,7 @@ from typing import Any
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.providers.base import LLMProvider, ToolCallRequest
+from nanobot.providers.base import EMPTY_MODEL_RESPONSE_ERROR, LLMProvider, ToolCallRequest
 from nanobot.utils.helpers import build_assistant_message
 
 _DEFAULT_MAX_ITERATIONS_MESSAGE = (
@@ -67,10 +67,13 @@ class AgentRunner:
         is_transient = bool(text) and LLMProvider._is_transient_error(raw_error)
 
         if retry_count > 0 and is_timeout:
-            return (
-                f"模型响应超时，已自动重试 {retry_count} 次仍失败。"
-                "请稍后重试，或切换模型。"
-            )
+            return f"模型响应超时，已自动重试 {retry_count} 次仍失败。请稍后重试，或切换模型。"
+        if raw_error == EMPTY_MODEL_RESPONSE_ERROR:
+            if retry_count > 0:
+                return (
+                    f"模型返回了空响应，已自动重试 {retry_count} 次仍失败。请稍后重试，或切换模型。"
+                )
+            return "模型返回了空响应。请稍后重试，或切换模型。"
         if retry_count > 0 and is_transient:
             return f"模型服务临时异常，已自动重试 {retry_count} 次仍失败。请稍后重试。"
         if is_timeout:
@@ -90,6 +93,7 @@ class AgentRunner:
         for iteration in range(spec.max_iterations):
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
+
             async def _retry_callback(
                 *,
                 attempt: int,
@@ -121,6 +125,7 @@ class AgentRunner:
                 kwargs["reasoning_effort"] = spec.reasoning_effort
 
             if hook.wants_streaming():
+
                 async def _stream(delta: str) -> None:
                     await hook.on_stream(context, delta)
 
@@ -144,17 +149,21 @@ class AgentRunner:
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
 
-                messages.append(build_assistant_message(
-                    response.content or "",
-                    tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
-                    reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                ))
+                messages.append(
+                    build_assistant_message(
+                        response.content or "",
+                        tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
+                    )
+                )
                 tools_used.extend(tc.name for tc in response.tool_calls)
 
                 await hook.before_execute_tools(context)
 
-                results, new_events, fatal_error = await self._execute_tools(spec, response.tool_calls)
+                results, new_events, fatal_error = await self._execute_tools(
+                    spec, response.tool_calls
+                )
                 tool_events.extend(new_events)
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
@@ -166,12 +175,14 @@ class AgentRunner:
                     await hook.after_iteration(context)
                     break
                 for tool_call, result in zip(response.tool_calls, results):
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.name,
-                        "content": result,
-                    })
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.name,
+                            "content": result,
+                        }
+                    )
                 await hook.after_iteration(context)
                 continue
 
@@ -197,11 +208,13 @@ class AgentRunner:
                 await hook.after_iteration(context)
                 break
 
-            messages.append(build_assistant_message(
-                clean,
-                reasoning_content=response.reasoning_content,
-                thinking_blocks=response.thinking_blocks,
-            ))
+            messages.append(
+                build_assistant_message(
+                    clean,
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                )
+            )
             final_content = clean
             context.final_content = final_content
             context.stop_reason = stop_reason
@@ -228,15 +241,11 @@ class AgentRunner:
         tool_calls: list[ToolCallRequest],
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         if spec.concurrent_tools:
-            tool_results = await asyncio.gather(*(
-                self._run_tool(spec, tool_call)
-                for tool_call in tool_calls
-            ))
+            tool_results = await asyncio.gather(
+                *(self._run_tool(spec, tool_call) for tool_call in tool_calls)
+            )
         else:
-            tool_results = [
-                await self._run_tool(spec, tool_call)
-                for tool_call in tool_calls
-            ]
+            tool_results = [await self._run_tool(spec, tool_call) for tool_call in tool_calls]
 
         results: list[Any] = []
         events: list[dict[str, str]] = []
@@ -273,8 +282,14 @@ class AgentRunner:
             detail = "(empty)"
         elif len(detail) > 120:
             detail = detail[:120] + "..."
-        return result, {
-            "name": tool_call.name,
-            "status": "error" if isinstance(result, str) and result.startswith("Error") else "ok",
-            "detail": detail,
-        }, None
+        return (
+            result,
+            {
+                "name": tool_call.name,
+                "status": "error"
+                if isinstance(result, str) and result.startswith("Error")
+                else "ok",
+                "detail": detail,
+            },
+            None,
+        )

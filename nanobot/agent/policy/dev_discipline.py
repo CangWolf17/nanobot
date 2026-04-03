@@ -7,15 +7,21 @@ import re
 from pathlib import Path
 from typing import Any
 
-WRITE_REDIRECT_RE = re.compile(r"(?:^|[;&|]\s*)(?:echo|printf|cat|python|python3|node|ruby|perl|awk|sed)\b.*(?:>>?|\|\s*tee\b)", re.IGNORECASE)
+WRITE_REDIRECT_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:echo|printf|cat|python|python3|node|ruby|perl|awk|sed)\b.*(?:>>?|\|\s*tee\b)",
+    re.IGNORECASE,
+)
 GENERIC_REDIRECT_RE = re.compile(r"(^|[^0-9])>>?\s*[^&\s]", re.IGNORECASE)
 MUTATING_SHELL_PATTERNS = [
     re.compile(r'\bsed\s+-i(?:[\s\'"]|$)', re.IGNORECASE),
     re.compile(r'\bperl\s+-p[iI](?:[\s\'"]|$)', re.IGNORECASE),
-    re.compile(r'\bpython(?:3)?\s+-c\s+[\"\'].*\bopen\s*\([^\)]*,\s*[\"\'][wa+]', re.IGNORECASE),
-    re.compile(r'\bnode\s+-e\s+[\"\'].*\bwriteFile(?:Sync)?\s*\(', re.IGNORECASE),
-    re.compile(r'\bpython(?:3)?\s+-\s*<<', re.IGNORECASE),
-    re.compile(r'\b(?:python|python3|node|ruby|perl|bash|sh|zsh)\b.*<<[\s\"\']*[A-Za-z_][A-Za-z0-9_\-]*', re.IGNORECASE),
+    re.compile(r"\bpython(?:3)?\s+-c\s+[\"\'].*\bopen\s*\([^\)]*,\s*[\"\'][wa+]", re.IGNORECASE),
+    re.compile(r"\bnode\s+-e\s+[\"\'].*\bwriteFile(?:Sync)?\s*\(", re.IGNORECASE),
+    re.compile(r"\bpython(?:3)?\s+-\s*<<", re.IGNORECASE),
+    re.compile(
+        r"\b(?:python|python3|node|ruby|perl|bash|sh|zsh)\b.*<<[\s\"\']*[A-Za-z_][A-Za-z0-9_\-]*",
+        re.IGNORECASE,
+    ),
     re.compile(r"\btee\b", re.IGNORECASE),
     re.compile(r"\btouch\b", re.IGNORECASE),
     re.compile(r"\bmkdir\b", re.IGNORECASE),
@@ -44,7 +50,9 @@ READONLY_COMMAND_PATTERNS = [
     re.compile(r"^\s*echo\b(?!.*(?:>>?|\|\s*tee\b))", re.IGNORECASE),
 ]
 BUILD_COMMAND_PATTERNS = [
-    re.compile(r"\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|lint|typecheck|format)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|lint|typecheck|format)\b", re.IGNORECASE
+    ),
     re.compile(r"\b(?:ruff|black|mypy|pyright|eslint|prettier|tsc)\b", re.IGNORECASE),
     re.compile(r"\b(?:cargo\s+build|go\s+build|python\s+-m\s+build)\b", re.IGNORECASE),
     re.compile(r"^\s*make(?:\s+[A-Za-z0-9_\-.:/]+)?\s*$", re.IGNORECASE),
@@ -62,14 +70,40 @@ RISKY_TASK_TARGET_RE = re.compile(
 JS_RUNNERS = {"npm", "pnpm", "yarn"}
 DOC_SUFFIXES = {".md", ".rst", ".txt", ".adoc"}
 CODE_SUFFIXES = {
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
-    ".go", ".rs", ".java", ".kt", ".kts", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
-    ".rb", ".php", ".scala", ".sh", ".bash", ".zsh",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".kts",
+    ".swift",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".rb",
+    ".php",
+    ".scala",
+    ".sh",
+    ".bash",
+    ".zsh",
 }
 SPECIAL_CODE_FILENAMES = {"makefile", "dockerfile", "justfile"}
 TEST_DIR_PARTS = {"tests", "__tests__", "spec", "specs"}
 DOC_DIR_PARTS = {"docs", "memory", "handoffs"}
 CODE_DIR_HINTS = {"src", "lib", "app", "nanobot", "scripts"}
+PROTOCOL_SCHEMA_VERSION = 1
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -114,6 +148,62 @@ def _gate_summary(gate: dict[str, Any] | None) -> str:
     if not gate.get("required"):
         return "not-required"
     return "satisfied" if gate.get("satisfied") else "pending"
+
+
+def build_runtime_protocol(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not state:
+        return None
+    gates = state.get("gates") or {}
+    return {
+        "version": int(
+            (state.get("runtime_protocol") or {}).get("version") or PROTOCOL_SCHEMA_VERSION
+        ),
+        "strict_dev_mode": str(state.get("strict_dev_mode") or "enforce"),
+        "task_kind": str(state.get("task_kind") or "idle"),
+        "phase": str(state.get("phase") or "idle"),
+        "work_mode": str(state.get("work_mode") or "plan"),
+        "current_step": str(state.get("current_step") or ""),
+        "gates": {
+            name: _gate_summary(gates.get(name))
+            for name in ("plan", "debug_root_cause", "failing_test", "verification")
+        },
+    }
+
+
+def load_runtime_protocol(workspace: Path) -> dict[str, Any] | None:
+    state = load_active_dev_state(workspace)
+    return build_runtime_protocol(state)
+
+
+def format_runtime_protocol_block(
+    protocol: dict[str, Any] | None,
+    *,
+    skill_hints: list[str] | None = None,
+) -> str:
+    if not protocol:
+        return ""
+    gates = protocol.get("gates") or {}
+    lines = [
+        "## Runtime Protocol",
+        f"version: {protocol.get('version', PROTOCOL_SCHEMA_VERSION)}",
+        f"strict_dev_mode: {protocol.get('strict_dev_mode', 'enforce')}",
+        f"task_kind: {protocol.get('task_kind', 'idle')}",
+        f"phase: {protocol.get('phase', 'idle')}",
+        f"work_mode: {protocol.get('work_mode', 'plan')}",
+    ]
+    current_step = str(protocol.get("current_step") or "")
+    if current_step:
+        lines.append(f"current_step: {current_step}")
+    lines.append(
+        "gates: "
+        + ", ".join(
+            f"{name}={gates.get(name, 'not-required')}"
+            for name in ("plan", "debug_root_cause", "failing_test", "verification")
+        )
+    )
+    if skill_hints:
+        lines.append(f"required_skills: {', '.join(skill_hints)}")
+    return "\n".join(lines)
 
 
 def is_strict_dev_mode_enforced(workspace: Path) -> bool:
@@ -181,21 +271,29 @@ def classify_path(path: Path) -> str:
         return "test"
     if suffix in DOC_SUFFIXES or any(part in DOC_DIR_PARTS for part in parts):
         return "docs"
-    if name in SPECIAL_CODE_FILENAMES or suffix in CODE_SUFFIXES or any(part in CODE_DIR_HINTS for part in parts):
+    if (
+        name in SPECIAL_CODE_FILENAMES
+        or suffix in CODE_SUFFIXES
+        or any(part in CODE_DIR_HINTS for part in parts)
+    ):
         return "code"
     return "other"
 
 
-def guard_file_mutation(workspace: Path | None, path: Path, *, operation: str = "write") -> str | None:
+def guard_file_mutation(
+    workspace: Path | None, path: Path, *, operation: str = "write"
+) -> str | None:
     if workspace is None:
         return None
     state = load_active_dev_state(workspace)
     if not state or not is_strict_dev_mode_enforced(workspace):
         return None
 
+    protocol = build_runtime_protocol(state)
+
     category = classify_path(path)
-    phase = str(state.get("phase") or "planning")
-    work_mode = str(state.get("work_mode") or "plan")
+    phase = str((protocol or {}).get("phase") or state.get("phase") or "planning")
+    work_mode = str((protocol or {}).get("work_mode") or state.get("work_mode") or "plan")
 
     if work_mode == "plan" and category in {"code", "test"}:
         return (
@@ -350,8 +448,10 @@ def guard_exec_command(workspace: Path | None, command: str, cwd: str | None = N
     if not state or not is_strict_dev_mode_enforced(workspace):
         return None
 
-    phase = str(state.get("phase") or "planning")
-    work_mode = str(state.get("work_mode") or "plan")
+    protocol = build_runtime_protocol(state)
+
+    phase = str((protocol or {}).get("phase") or state.get("phase") or "planning")
+    work_mode = str((protocol or {}).get("work_mode") or state.get("work_mode") or "plan")
     category = classify_command(command)
 
     if category == "inspect":
@@ -385,13 +485,9 @@ def guard_exec_command(workspace: Path | None, command: str, cwd: str | None = N
         if js_runner_error:
             return js_runner_error
         if work_mode != "build":
-            return (
-                f"Error: exec blocked by strict dev mode. Build/lint commands require work_mode=build; current work_mode={work_mode}."
-            )
+            return f"Error: exec blocked by strict dev mode. Build/lint commands require work_mode=build; current work_mode={work_mode}."
         if phase not in {"build_allowed", "verify_required"}:
-            return (
-                f"Error: exec blocked by strict dev mode. Build/lint commands require build/verify phase; current phase={phase}."
-            )
+            return f"Error: exec blocked by strict dev mode. Build/lint commands require build/verify phase; current phase={phase}."
         return None
 
     if phase in {"planning", "debug_required", "docs_only"}:

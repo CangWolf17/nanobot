@@ -58,6 +58,7 @@ def _normalize_save_memory_args(args: Any) -> dict[str, Any] | None:
         return args[0] if args and isinstance(args[0], dict) else None
     return args if isinstance(args, dict) else None
 
+
 _TOOL_CHOICE_ERROR_MARKERS = (
     "tool_choice",
     "toolchoice",
@@ -105,7 +106,9 @@ class MemoryStore:
         for message in messages:
             if not message.get("content"):
                 continue
-            tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            tools = (
+                f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            )
             lines.append(
                 f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
             )
@@ -131,7 +134,10 @@ class MemoryStore:
 {self._format_messages(messages)}"""
 
         chat_messages = [
-            {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+            {
+                "role": "system",
+                "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
+            },
             {"role": "user", "content": prompt},
         ]
 
@@ -144,9 +150,7 @@ class MemoryStore:
                 tool_choice=forced,
             )
 
-            if response.finish_reason == "error" and _is_tool_choice_unsupported(
-                response.content
-            ):
+            if response.finish_reason == "error" and _is_tool_choice_unsupported(response.content):
                 logger.warning("Forced tool_choice unsupported, retrying with auto")
                 response = await provider.chat_with_retry(
                     messages=chat_messages,
@@ -178,7 +182,9 @@ class MemoryStore:
             update = args["memory_update"]
 
             if entry is None or update is None:
-                logger.warning("Memory consolidation: save_memory payload contains null required fields")
+                logger.warning(
+                    "Memory consolidation: save_memory payload contains null required fields"
+                )
                 return self._fail_or_raw_archive(messages)
 
             entry = _ensure_text(entry).strip()
@@ -211,12 +217,9 @@ class MemoryStore:
         """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.append_history(
-            f"[{ts}] [RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
+            f"[{ts}] [RAW] {len(messages)} messages\n{self._format_messages(messages)}"
         )
-        logger.warning(
-            "Memory consolidation degraded: raw-archived {} messages", len(messages)
-        )
+        logger.warning("Memory consolidation degraded: raw-archived {} messages", len(messages))
 
 
 class MemoryConsolidator:
@@ -235,6 +238,7 @@ class MemoryConsolidator:
         context_window_tokens: int,
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
+        get_compact_state: Callable[[Session], str | None] | None = None,
         max_completion_tokens: int = 4096,
         archive_provider: LLMProvider | None = None,
         archive_model: str | None = None,
@@ -249,6 +253,7 @@ class MemoryConsolidator:
         self.max_completion_tokens = max_completion_tokens
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        self._get_compact_state = get_compact_state
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
@@ -278,7 +283,7 @@ class MemoryConsolidator:
                 return
 
             end_idx = boundary[0]
-            chunk = session.messages[session.last_consolidated:end_idx]
+            chunk = session.messages[session.last_consolidated : end_idx]
             if not chunk:
                 return
 
@@ -338,12 +343,17 @@ class MemoryConsolidator:
     ) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
         history = session.get_history(max_messages=max_history_messages)
-        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        channel, chat_id = session.key.split(":", 1) if ":" in session.key else (None, None)
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
             channel=channel,
             chat_id=chat_id,
+            compact_state=(
+                self._get_compact_state(session)
+                if self._get_compact_state is not None
+                else session.metadata.get("compact_state")
+            ),
         )
         return estimate_prompt_tokens_chain(
             self.provider,
@@ -360,7 +370,9 @@ class MemoryConsolidator:
         """Target prompt size after consolidation."""
         return self.prompt_budget() // 2
 
-    def is_over_budget(self, session: Session, *, max_history_messages: int = 0) -> tuple[bool, int, str]:
+    def is_over_budget(
+        self, session: Session, *, max_history_messages: int = 0
+    ) -> tuple[bool, int, str]:
         """Return whether the main conversation prompt is over the safe budget."""
         estimated, source = self.estimate_session_prompt_tokens(
             session, max_history_messages=max_history_messages
@@ -427,7 +439,7 @@ class MemoryConsolidator:
                         return True
 
                     end_idx = boundary[0]
-                    chunk = session.messages[session.last_consolidated:end_idx]
+                    chunk = session.messages[session.last_consolidated : end_idx]
                     if not chunk:
                         return True
 

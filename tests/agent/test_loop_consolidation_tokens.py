@@ -31,6 +31,62 @@ def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -
     return loop
 
 
+def test_prompt_estimate_includes_session_compact_state(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    seen: dict[str, str | None] = {}
+
+    def _build_messages(*, history, current_message, channel=None, chat_id=None, compact_state=None, **kwargs):
+        seen["compact_state"] = compact_state
+        return [{"role": "system", "content": compact_state or ""}]
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.metadata["compact_state"] = "## Current Task\nResume state"
+    loop.memory_consolidator._build_messages = _build_messages  # type: ignore[method-assign]
+
+    loop.memory_consolidator.estimate_session_prompt_tokens(session)
+
+    assert seen["compact_state"] == "## Current Task\nResume state"
+
+
+def test_prompt_estimate_omits_session_compact_state_when_disabled(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    seen: dict[str, str | None] = {}
+
+    def _build_messages(*, history, current_message, channel=None, chat_id=None, compact_state=None, **kwargs):
+        seen["compact_state"] = compact_state
+        return [{"role": "system", "content": compact_state or ""}]
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.metadata["compact_state"] = "## Current Task\nResume state"
+    loop.memory_config.compact_state_enabled = False
+    loop.memory_consolidator._build_messages = _build_messages  # type: ignore[method-assign]
+
+    loop.memory_consolidator.estimate_session_prompt_tokens(session)
+
+    assert seen["compact_state"] is None
+
+
+@pytest.mark.asyncio
+async def test_process_direct_omits_session_compact_state_when_disabled(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    session = loop.sessions.get_or_create("cli:test")
+    session.metadata["compact_state"] = "## Current Task\nResume state"
+
+    seen: dict[str, str | None] = {}
+    real_build_messages = loop.context.build_messages
+
+    def _build_messages(*args, **kwargs):
+        seen["compact_state"] = kwargs.get("compact_state")
+        return real_build_messages(*args, **kwargs)
+
+    loop.memory_config.compact_state_enabled = False
+    loop.context.build_messages = _build_messages  # type: ignore[method-assign]
+
+    await loop.process_direct("hello", session_key="cli:test")
+
+    assert seen["compact_state"] is None
+
+
 @pytest.mark.asyncio
 async def test_prompt_below_threshold_does_not_consolidate(tmp_path) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)

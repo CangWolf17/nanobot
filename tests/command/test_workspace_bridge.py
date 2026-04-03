@@ -8,6 +8,41 @@ from nanobot.command.router import CommandContext
 from nanobot.command.workspace_bridge import cmd_workspace_bridge
 
 
+def test_workspace_bridge_returns_fastlane_help_without_router_fallback(tmp_path: Path) -> None:
+    route_decision = MagicMock(
+        stdout='{"kind":"help_fastlane","target":"plan","content":"/plan help"}\n',
+        stderr="",
+        returncode=0,
+    )
+    ctx = CommandContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="ou_test",
+            content="/help plan",
+            metadata={},
+        ),
+        session=None,
+        key="feishu:ou_test",
+        raw="/help plan",
+        args="plan",
+        loop=None,
+    )
+
+    with (
+        patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.fastlane.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.workspace_bridge.subprocess.run") as mock_bridge_run,
+        patch("nanobot.command.fastlane.subprocess.run", return_value=route_decision),
+    ):
+        (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
+        result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is not None
+    assert result.content == "/plan help"
+    mock_bridge_run.assert_not_called()
+
+
 def test_workspace_bridge_passes_message_context_into_router_env(tmp_path: Path) -> None:
     completed = MagicMock(stdout="Autopilot: idle\n", stderr="", returncode=0)
     ctx = CommandContext(
@@ -128,8 +163,6 @@ def test_workspace_bridge_marks_plan_exec_as_build_mode(tmp_path: Path) -> None:
     assert ctx.msg.metadata["workspace_work_mode"] == "build"
 
 
-
-
 def test_workspace_bridge_prepares_summary_agent_input(tmp_path: Path) -> None:
     completed = MagicMock(stdout="[AGENT]小结\n", stderr="", returncode=0)
     prepared = MagicMock(stdout="prepared summary input\n", stderr="", returncode=0)
@@ -150,6 +183,7 @@ def test_workspace_bridge_prepares_summary_agent_input(tmp_path: Path) -> None:
 
     with (
         patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.workspace_bridge.try_workspace_fastlane", return_value=None),
         patch(
             "nanobot.command.workspace_bridge.subprocess.run",
             side_effect=[completed, prepared],
@@ -180,6 +214,7 @@ def test_workspace_bridge_prepares_summary_agent_input(tmp_path: Path) -> None:
 
     with (
         patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.workspace_bridge.try_workspace_fastlane", return_value=None),
         patch(
             "nanobot.command.workspace_bridge.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd=["router.py"], timeout=25),
@@ -213,6 +248,7 @@ def test_workspace_bridge_prepares_simplify_agent_input(tmp_path: Path) -> None:
 
     with (
         patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.workspace_bridge.try_workspace_fastlane", return_value=None),
         patch(
             "nanobot.command.workspace_bridge.subprocess.run",
             side_effect=[completed, prepared],
@@ -225,7 +261,6 @@ def test_workspace_bridge_prepares_simplify_agent_input(tmp_path: Path) -> None:
     assert ctx.msg.metadata["workspace_agent_cmd"] == "simplify"
     assert ctx.msg.metadata["workspace_agent_input"] == "prepared simplify input"
     assert mock_run.call_args_list[1].args[0][-2:] == ["--prepare-agent-input", "simplify"]
-
 
     ctx = CommandContext(
         msg=InboundMessage(
@@ -244,6 +279,7 @@ def test_workspace_bridge_prepares_simplify_agent_input(tmp_path: Path) -> None:
 
     with (
         patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.workspace_bridge.try_workspace_fastlane", return_value=None),
         patch(
             "nanobot.command.workspace_bridge.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd=["router.py"], timeout=25),
@@ -255,6 +291,41 @@ def test_workspace_bridge_prepares_simplify_agent_input(tmp_path: Path) -> None:
     assert result is not None
     assert "workspace-router timeout" in result.content
     assert "25s" in result.content
+
+
+def test_workspace_bridge_prepares_notes_agent_input(tmp_path: Path) -> None:
+    completed = MagicMock(stdout="[AGENT]笔记\n", stderr="", returncode=0)
+    prepared = MagicMock(stdout="prepared notes input\n", stderr="", returncode=0)
+    ctx = CommandContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="ou_test",
+            content="/笔记 新建 记录一下 runtime follow-ups",
+            metadata={"message_id": "om_test"},
+        ),
+        session=None,
+        key="feishu:ou_test",
+        raw="/笔记 新建 记录一下 runtime follow-ups",
+        args="新建 记录一下 runtime follow-ups",
+        loop=None,
+    )
+
+    with (
+        patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.workspace_bridge.try_workspace_fastlane", return_value=None),
+        patch(
+            "nanobot.command.workspace_bridge.subprocess.run",
+            side_effect=[completed, prepared],
+        ) as mock_run,
+    ):
+        (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
+        result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is None
+    assert ctx.msg.metadata["workspace_agent_cmd"] == "笔记"
+    assert ctx.msg.metadata["workspace_agent_input"] == "prepared notes input"
+    assert mock_run.call_args_list[1].args[0][-2:] == ["--prepare-agent-input", "笔记"]
 
 
 def test_workspace_bridge_returns_exception_message_instead_of_raising(tmp_path: Path) -> None:
