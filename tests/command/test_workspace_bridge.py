@@ -301,13 +301,13 @@ def test_workspace_bridge_prepares_notes_agent_input(tmp_path: Path) -> None:
             channel="feishu",
             sender_id="user1",
             chat_id="ou_test",
-            content="/笔记 新建 记录一下 runtime follow-ups",
+            content="/笔记 记录一下 runtime follow-ups",
             metadata={"message_id": "om_test"},
         ),
         session=None,
         key="feishu:ou_test",
-        raw="/笔记 新建 记录一下 runtime follow-ups",
-        args="新建 记录一下 runtime follow-ups",
+        raw="/笔记 记录一下 runtime follow-ups",
+        args="记录一下 runtime follow-ups",
         loop=None,
     )
 
@@ -326,6 +326,41 @@ def test_workspace_bridge_prepares_notes_agent_input(tmp_path: Path) -> None:
     assert ctx.msg.metadata["workspace_agent_cmd"] == "笔记"
     assert ctx.msg.metadata["workspace_agent_input"] == "prepared notes input"
     assert mock_run.call_args_list[1].args[0][-2:] == ["--prepare-agent-input", "笔记"]
+
+
+def test_workspace_bridge_prepares_merge_agent_input(tmp_path: Path) -> None:
+    completed = MagicMock(stdout="[AGENT]merge\n", stderr="", returncode=0)
+    prepared = MagicMock(stdout="prepared merge input\n", stderr="", returncode=0)
+    ctx = CommandContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="ou_test",
+            content="/merge",
+            metadata={"message_id": "om_test"},
+        ),
+        session=None,
+        key="feishu:ou_test",
+        raw="/merge",
+        args="",
+        loop=None,
+    )
+
+    with (
+        patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.workspace_bridge.try_workspace_fastlane", return_value=None),
+        patch(
+            "nanobot.command.workspace_bridge.subprocess.run",
+            side_effect=[completed, prepared],
+        ) as mock_run,
+    ):
+        (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
+        result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is None
+    assert ctx.msg.metadata["workspace_agent_cmd"] == "merge"
+    assert ctx.msg.metadata["workspace_agent_input"] == "prepared merge input"
+    assert mock_run.call_args_list[1].args[0][-2:] == ["--prepare-agent-input", "merge"]
 
 
 def test_workspace_bridge_returns_exception_message_instead_of_raising(tmp_path: Path) -> None:

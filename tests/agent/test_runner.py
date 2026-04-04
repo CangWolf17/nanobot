@@ -183,7 +183,7 @@ async def test_runner_uses_timeout_message_for_provider_errors():
 
 
 @pytest.mark.asyncio
-async def test_runner_uses_timeout_message_after_retries():
+async def test_runner_uses_timeout_message_after_retries(monkeypatch):
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
     from nanobot.providers.base import LLMProvider
 
@@ -200,6 +200,12 @@ async def test_runner_uses_timeout_message_after_retries():
             return "test-model"
 
     provider = RetryingProvider()
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
     tools = MagicMock()
     tools.get_definitions.return_value = []
 
@@ -212,9 +218,10 @@ async def test_runner_uses_timeout_message_after_retries():
     ))
 
     assert result.stop_reason == "error"
-    assert result.final_content == "模型响应超时，已自动重试 3 次仍失败。请稍后重试，或切换模型。"
+    assert result.final_content == "模型响应超时，已自动重试 5 次仍失败。请稍后重试，或切换模型。"
     assert result.error == "Error calling LLM: Request timed out."
-    assert provider.calls == 4
+    assert provider.calls == 6
+    assert delays == [1, 2, 4, 8, 10]
 
 
 @pytest.mark.asyncio
@@ -550,13 +557,13 @@ async def test_loop_reports_retry_progress_for_timeout_errors(tmp_path):
         if on_retry:
             await on_retry(
                 attempt=1,
-                max_retries=3,
+                max_retries=5,
                 delay=1,
                 error="Error calling LLM: Request timed out.",
             )
             await on_retry(
                 attempt=2,
-                max_retries=3,
+                max_retries=5,
                 delay=2,
                 error="Error calling LLM: Request timed out.",
             )
@@ -574,8 +581,8 @@ async def test_loop_reports_retry_progress_for_timeout_errors(tmp_path):
     final_content, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
 
     assert progress == [
-        "模型响应超时，正在自动重试（1/3）…",
-        "模型响应超时，正在自动重试（2/3）…",
+        "模型响应超时，正在自动重试（1/5）…",
+        "模型响应超时，正在自动重试（2/5）…",
     ]
     assert final_content == "模型响应超时，已自动重试 2 次仍失败。请稍后重试，或切换模型。"
 

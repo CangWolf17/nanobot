@@ -60,7 +60,20 @@ def test_save_turn_keeps_image_placeholder_without_meta() -> None:
     assert session.messages[0]["content"] == [{"type": "text", "text": "[image]"}]
 
 
-def test_save_turn_keeps_tool_results_under_16k() -> None:
+def test_save_turn_strips_full_runtime_string_context_and_keeps_raw_user_text() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:runtime-string")
+    runtime = ContextBuilder._build_runtime_context("telegram", "chat1") + "\n\n/merge"
+
+    loop._save_turn(
+        session,
+        [{"role": "user", "content": runtime}],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == "/merge"
+
+
     loop = _mk_loop()
     session = Session(key="test:tool-result")
     content = "x" * 12_000

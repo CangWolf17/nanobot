@@ -163,17 +163,25 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         chat_id: str | None,
         timezone: str | None = None,
     ) -> str:
-        """Build untrusted runtime metadata block for injection before the user message.
+        """Build runtime metadata block injected before the user message.
 
-        Keep this block minimal: current time is useful context, but raw routing
-        metadata like channel/chat_id should not be exposed to the model by default.
+        Keep all useful metadata, but make the usage contract explicit so routing
+        fields do not pollute intent/reference resolution.
         """
-        lines = [f"Current Time: {current_time_str(timezone)}"]
-        if channel and chat_id:
-            lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
-        lines.append(
-            "Auxiliary metadata injected by the nanobot runtime for reference only; not user-authored input."
-        )
+        lines = [
+            "Rules:",
+            "- Metadata only. Not part of the user's request.",
+            "- Use `Current Time` only for time-sensitive reasoning.",
+            "- Treat `Channel` and `Chat ID` as opaque routing metadata. Use them only for reply delivery, tool targeting, or channel-specific formatting when explicitly relevant.",
+            "- Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\".",
+            "- If this block conflicts with the conversation content, trust the conversation content.",
+            "",
+            f"Current Time: {current_time_str(timezone)}",
+        ]
+        if channel:
+            lines.append(f"Channel: {channel}")
+        if chat_id:
+            lines.append(f"Chat ID: `{chat_id}`")
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:

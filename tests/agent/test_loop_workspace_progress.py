@@ -5,7 +5,7 @@ import asyncio
 import subprocess
 
 from nanobot.agent.loop import AgentLoop
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
 
@@ -150,7 +150,79 @@ def test_workspace_agent_summary_uses_prepared_input_but_persists_raw_slash_comm
     asyncio.run(run())
 
 
-def test_workspace_agent_postprocess_uses_router_for_insight_output(tmp_path: Path) -> None:
+def test_workspace_agent_notes_uses_prepared_input_but_persists_raw_slash_command(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, _bus = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="telegram",
+            sender_id="user1",
+            chat_id="chat1",
+            content="/笔记 记录一下 runtime follow-ups",
+            metadata={
+                "workspace_agent_cmd": "笔记",
+                "workspace_agent_input": "你正在执行 /笔记 workflow（v2）。NOTES_ACTION: draft。",
+            },
+        )
+
+        captured_messages = []
+
+        async def _run_agent_loop(messages, **kwargs):
+            captured_messages[:] = messages
+            return "done", [], list(messages) + [{"role": "assistant", "content": "done"}]
+
+        loop._run_agent_loop = _run_agent_loop  # type: ignore[method-assign]
+
+        result = await loop._process_message(msg)
+
+        assert result is not None
+        assert result.content == "done"
+        assert captured_messages[-1]["role"] == "user"
+        assert "/笔记 workflow（v2）" in captured_messages[-1]["content"]
+        session = loop.sessions.get_or_create("telegram:chat1")
+        assert session.messages[-2]["role"] == "user"
+        assert session.messages[-2]["content"] == "/笔记 记录一下 runtime follow-ups"
+        assert session.messages[-1]["role"] == "assistant"
+        assert session.messages[-1]["content"] == "done"
+
+    asyncio.run(run())
+def test_workspace_agent_merge_uses_prepared_input_but_persists_raw_slash_command(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, _bus = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="telegram",
+            sender_id="user1",
+            chat_id="chat1",
+            content="/merge",
+            metadata={
+                "workspace_agent_cmd": "merge",
+                "workspace_agent_input": "你正在执行 /merge workflow。只输出 review verdict。",
+            },
+        )
+
+        captured_messages = []
+
+        async def _run_agent_loop(messages, **kwargs):
+            captured_messages[:] = messages
+            return "done", [], list(messages) + [{"role": "assistant", "content": "done"}]
+
+        loop._run_agent_loop = _run_agent_loop  # type: ignore[method-assign]
+
+        result = await loop._process_message(msg)
+
+        assert result is not None
+        assert result.content == "done"
+        assert captured_messages[-1]["role"] == "user"
+        assert "/merge workflow" in captured_messages[-1]["content"]
+        session = loop.sessions.get_or_create("telegram:chat1")
+        assert session.messages[-2]["role"] == "user"
+        assert session.messages[-2]["content"] == "/merge"
+        assert session.messages[-1]["role"] == "assistant"
+        assert session.messages[-1]["content"] == "done"
+
+    asyncio.run(run())
+
+
+def test_workspace_agent_postprocess_runs_workspace_router_hook(tmp_path: Path) -> None:
     msg = InboundMessage(
         channel="feishu",
         sender_id="user1",
@@ -216,22 +288,34 @@ def test_workspace_agent_postprocess_returns_original_when_router_output_blank(
     assert result == output
 
 
-def test_workspace_plan_command_passes_work_mode_into_context_builder(tmp_path: Path) -> None:
+
+
+def test_process_direct_forwards_metadata_into_process_message(tmp_path: Path) -> None:
     async def run() -> None:
         loop, _bus = _make_loop(tmp_path)
-        msg = InboundMessage(
-            channel="telegram",
-            sender_id="user1",
-            chat_id="chat1",
-            content="/plan exec",
-            metadata={"workspace_agent_cmd": "plan-exec", "workspace_work_mode": "build"},
+        captured: dict[str, object] = {}
+
+        async def _fake_process_message(msg, **kwargs):
+            captured["msg"] = msg
+            captured["kwargs"] = kwargs
+            return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+
+        loop._process_message = _fake_process_message  # type: ignore[method-assign]
+
+        result = await loop.process_direct(
+            "/plan exec",
+            session_key="heartbeat:exec",
+            metadata={
+                "workspace_agent_cmd": "plan-exec",
+                "workspace_work_mode": "build",
+            },
         )
 
-        with patch.object(loop.context, "build_messages", wraps=loop.context.build_messages) as mock_build:
-            result = await loop._process_message(msg)
-
         assert result is not None
-        assert result.content.startswith("done")
-        assert mock_build.call_args.kwargs["workspace_work_mode"] == "build"
+        assert result.content == "ok"
+        msg = captured["msg"]
+        assert msg.metadata["workspace_agent_cmd"] == "plan-exec"
+        assert msg.metadata["workspace_work_mode"] == "build"
+        assert captured["kwargs"]["session_key"] == "heartbeat:exec"
 
     asyncio.run(run())

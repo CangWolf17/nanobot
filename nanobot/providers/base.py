@@ -85,7 +85,7 @@ class LLMProvider(ABC):
     while maintaining a consistent interface.
     """
 
-    _CHAT_RETRY_DELAYS = (1, 2, 4)
+    _CHAT_RETRY_DELAYS = (1, 2, 4, 8, 10)
     _TRANSIENT_ERROR_MARKERS = (
         "429",
         "rate limit",

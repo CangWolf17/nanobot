@@ -910,10 +910,11 @@ class AgentLoop:
                 if isinstance(content, str) and content.startswith(
                     ContextBuilder._RUNTIME_CONTEXT_TAG
                 ):
-                    # Strip the runtime-context prefix, keep only the user text.
-                    parts = content.split("\n\n", 1)
-                    if len(parts) > 1 and parts[1].strip():
-                        entry["content"] = parts[1]
+                    # Strip the full runtime-context block and keep only the raw user text.
+                    stripped = content[len(ContextBuilder._RUNTIME_CONTEXT_TAG) :].lstrip("\n")
+                    parts = stripped.split("\n\n", 2)
+                    if len(parts) > 2 and parts[2].strip():
+                        entry["content"] = parts[2]
                     else:
                         continue
                 if isinstance(content, list):
@@ -934,10 +935,17 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            metadata=dict(metadata or {}),
+        )
         return await self._process_message(
             msg,
             session_key=session_key,

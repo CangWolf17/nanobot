@@ -9,6 +9,7 @@ import signal
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 # Force UTF-8 encoding for Windows console
 if sys.platform == "win32":
@@ -557,6 +558,23 @@ def _migrate_cron_store(config: "Config") -> None:
         shutil.move(str(legacy_path), str(new_path))
 
 
+def _describe_runtime_provider(config: Config, model: str | None = None) -> str:
+    """Return a user-facing provider label for runtime status/notifications."""
+    provider_name = config.get_provider_name(model) or "unknown"
+    if provider_name != "custom":
+        return provider_name
+
+    api_base = (config.get_api_base(model) or "").strip()
+    if not api_base:
+        return "custom"
+
+    parsed = urlparse(api_base if "://" in api_base else f"https://{api_base}")
+    hostname = (parsed.hostname or "").strip().lower()
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    return hostname or "custom"
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -589,6 +607,7 @@ def gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
+    provider_label = _describe_runtime_provider(config, config.agents.defaults.model)
     archive_model = config.memory.model.strip() if config.memory.model else ""
     archive_provider = _make_memory_archive_provider(config) or provider
     session_manager = SessionManager(config.workspace_path)
@@ -703,22 +722,70 @@ def gateway(
     def _heartbeat_execution_session_key() -> str:
         return "heartbeat:exec"
 
+    async def _resolve_heartbeat_workspace_metadata(
+        raw_task: str,
+        *,
+        channel: str,
+        chat_id: str,
+    ) -> tuple[dict[str, Any], str | None]:
+        stripped = (raw_task or "").strip()
+        if not stripped.startswith("/"):
+            return {}, None
+
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.router import CommandContext
+        from nanobot.command.workspace_bridge import cmd_workspace_bridge
+
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="heartbeat",
+            chat_id=chat_id,
+            content=stripped,
+            metadata={},
+        )
+        ctx = CommandContext(
+            msg=msg,
+            session=None,
+            key=f"{channel}:{chat_id}",
+            raw=stripped,
+            loop=agent,
+        )
+        bridge_result = await cmd_workspace_bridge(ctx)
+        if bridge_result is not None:
+            return {}, bridge_result.content
+        return dict(msg.metadata or {}), None
+
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
         channel, chat_id = _pick_heartbeat_target()
         heartbeat_message = _build_heartbeat_execution_message(tasks)
         heartbeat_session_key = _heartbeat_execution_session_key()
+        heartbeat_metadata, direct_response = await _resolve_heartbeat_workspace_metadata(
+            tasks,
+            channel=channel,
+            chat_id=chat_id,
+        )
+        if direct_response is not None:
+            return direct_response
+        heartbeat_raw_task = (tasks or "").strip()
+        direct_content = heartbeat_raw_task if heartbeat_metadata else heartbeat_message
+        if heartbeat_metadata:
+            heartbeat_metadata = {
+                **heartbeat_metadata,
+                "workspace_agent_input": heartbeat_message,
+            }
 
         async def _silent(*_args, **_kwargs):
             pass
 
         resp = await agent.process_direct(
-            heartbeat_message,
+            direct_content,
             session_key=heartbeat_session_key,
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
+            metadata=heartbeat_metadata or None,
         )
 
         # Keep a small tail of heartbeat history so the loop stays bounded
@@ -736,6 +803,52 @@ def gateway(
         if channel == "cli":
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
+
+    def _channel_ready_for_startup_notice(channel_obj) -> bool:
+        if channel_obj is None or not getattr(channel_obj, "is_running", False):
+            return False
+        if hasattr(channel_obj, "_bot_username") or hasattr(channel_obj, "_bot_user_id"):
+            if getattr(channel_obj, "_bot_username", None) or getattr(channel_obj, "_bot_user_id", None):
+                return True
+        if hasattr(channel_obj, "_client"):
+            return getattr(channel_obj, "_client", None) is not None
+        if hasattr(channel_obj, "_app"):
+            return getattr(channel_obj, "_app", None) is not None
+        return True
+
+    async def _send_startup_online_notice() -> None:
+        from nanobot.bus.events import OutboundMessage
+
+        startup_cfg = hb_cfg.startup_notify
+        if not startup_cfg.enabled:
+            return
+        channel = (startup_cfg.channel or "").strip()
+        chat_id = (startup_cfg.chat_id or "").strip()
+        if not channel or not chat_id:
+            logger.warning("Startup notify enabled but channel/chat_id missing; skipping online notice")
+            return
+        if channel not in channels.enabled_channels:
+            logger.warning("Startup notify target channel {} is not enabled; skipping online notice", channel)
+            return
+
+        deadline = asyncio.get_running_loop().time() + 15.0
+        while asyncio.get_running_loop().time() < deadline:
+            channel_obj = channels.get_channel(channel)
+            if _channel_ready_for_startup_notice(channel_obj):
+                await bus.publish_outbound(
+                    OutboundMessage(
+                        channel=channel,
+                        chat_id=chat_id,
+                        content=(
+                            f"nanobot 已上线（model: {agent.model}, "
+                            f"provider: {provider_label}, heartbeat: {hb_cfg.interval_s}s）"
+                        ),
+                    )
+                )
+                return
+            await asyncio.sleep(0.2)
+
+        logger.warning("Startup notify target {} did not become ready in time; skipping online notice", channel)
 
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
@@ -761,12 +874,15 @@ def gateway(
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def run():
+        channels_task: asyncio.Task | None = None
         try:
             await cron.start()
             await heartbeat.start()
+            channels_task = asyncio.create_task(channels.start_all())
+            await _send_startup_online_notice()
             await asyncio.gather(
                 agent.run(),
-                channels.start_all(),
+                channels_task,
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")

@@ -47,6 +47,8 @@ async def test_runner_treats_empty_success_as_retryable_failure(monkeypatch) -> 
             LLMResponse(content=None),
             LLMResponse(content=None),
             LLMResponse(content=None),
+            LLMResponse(content=None),
+            LLMResponse(content=None),
         ]
     )
     delays: list[int] = []
@@ -68,10 +70,10 @@ async def test_runner_treats_empty_success_as_retryable_failure(monkeypatch) -> 
 
     assert result.stop_reason == "error"
     assert (
-        result.final_content == "模型返回了空响应，已自动重试 3 次仍失败。请稍后重试，或切换模型。"
+        result.final_content == "模型返回了空响应，已自动重试 5 次仍失败。请稍后重试，或切换模型。"
     )
-    assert provider.calls == 4
-    assert delays == [1, 2, 4]
+    assert provider.calls == 6
+    assert delays == [1, 2, 4, 8, 10]
 
 
 @pytest.mark.asyncio
