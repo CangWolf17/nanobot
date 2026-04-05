@@ -6,17 +6,18 @@ through to the LLM.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command.fastlane import build_workspace_env, try_workspace_fastlane
 from nanobot.command.router import CommandContext
 
 WORKSPACE_ROUTER = Path.home() / ".nanobot" / "workspace" / "scripts" / "router.py"
 BRIDGE_TIMEOUT_SECONDS = 25
-PREPARED_INPUT_CMDS = {"小结", "simplify", "笔记", "merge"}
+PREPARED_INPUT_CMDS = {"小结", "simplify", "笔记", "merge", "harness"}
 POSTPROCESSABLE_AGENT_CMDS = {
     "plan",
     "plan-exec",
@@ -28,7 +29,14 @@ POSTPROCESSABLE_AGENT_CMDS = {
     "小结",
     "感悟",
     "笔记",
+    "harness",
 }
+
+
+def _workspace_root_from_router() -> Path:
+    if WORKSPACE_ROUTER.parent.name == "scripts":
+        return WORKSPACE_ROUTER.parent.parent
+    return WORKSPACE_ROUTER.parent
 
 
 def _extract_agent_marker(content: str) -> str | None:
@@ -63,9 +71,63 @@ def _prepare_agent_input(agent_cmd: str, raw: str, env: dict[str, str] | None) -
     return prepared or None
 
 
+def prepare_active_workflow_continuation(
+    msg: InboundMessage,
+    *,
+    workspace_root: Path | None = None,
+) -> bool:
+    raw = (msg.content or "").strip()
+    if not raw or raw.startswith("/"):
+        return False
+    meta = msg.metadata if isinstance(msg.metadata, dict) else {}
+    if meta.get("workspace_agent_cmd"):
+        return False
+
+    root = workspace_root or _workspace_root_from_router()
+    control_path = root / "harnesses" / "control.json"
+    index_path = root / "harnesses" / "index.json"
+    if not control_path.exists() or not index_path.exists():
+        return False
+    try:
+        control = json.loads(control_path.read_text(encoding="utf-8"))
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    active_id = str(control.get("active_harness_id") or "").strip()
+    harnesses = index.get("harnesses") if isinstance(index, dict) else None
+    if not active_id or not isinstance(harnesses, dict):
+        return False
+    active = harnesses.get(active_id)
+    if not isinstance(active, dict):
+        return False
+    if str(active.get("kind") or "") != "workflow":
+        return False
+    if str(active.get("status") or "") != "awaiting_decision":
+        return False
+    if not bool(active.get("awaiting_user")):
+        return False
+    if bool(active.get("blocked")):
+        return False
+
+    workflow_name = str(active.get("workflow_name") or "").strip()
+    if workflow_name != "merge":
+        return False
+
+    env = build_workspace_env(msg)
+    prepared = _prepare_agent_input("merge", raw, env)
+    if not prepared:
+        return False
+    meta["workspace_agent_cmd"] = "merge"
+    meta["workspace_agent_input"] = prepared
+    msg.metadata = meta
+    return True
+
+
 async def cmd_workspace_bridge(ctx: CommandContext) -> OutboundMessage | None:
     raw = (ctx.raw or "").strip()
     if not raw.startswith("/"):
+        prepare_active_workflow_continuation(ctx.msg)
         return None
     if not WORKSPACE_ROUTER.exists():
         return None
@@ -127,6 +189,8 @@ async def cmd_workspace_bridge(ctx: CommandContext) -> OutboundMessage | None:
                 ctx.msg.metadata["workspace_work_mode"] = (
                     "build" if agent_cmd == "plan-exec" else "plan"
                 )
+            if agent_cmd == "harness" and raw.strip().lower() == "/harness auto":
+                ctx.msg.metadata["workspace_harness_auto"] = True
             prepared = _prepare_agent_input(agent_cmd, raw, env)
             if prepared:
                 ctx.msg.metadata["workspace_agent_input"] = prepared

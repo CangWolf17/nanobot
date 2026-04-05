@@ -29,6 +29,299 @@ def _make_loop(*, exec_config=None):
 
 class TestHandleStop:
     @pytest.mark.asyncio
+    async def test_interrupt_no_active_task(self):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_interrupt
+        from nanobot.command.router import CommandContext
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
+        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+        out = await cmd_interrupt(ctx)
+        assert "No active task" in out.content
+
+    @pytest.mark.asyncio
+    async def test_interrupt_cancels_active_task(self):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_interrupt
+        from nanobot.command.router import CommandContext
+
+        loop, bus = _make_loop()
+        cancelled = asyncio.Event()
+
+        async def slow_task():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = asyncio.create_task(slow_task())
+        await asyncio.sleep(0)
+        loop._active_tasks["test:c1"] = [task]
+
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
+        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+        out = await cmd_interrupt(ctx)
+
+        assert cancelled.is_set()
+        assert "interrupted" in out.content.lower()
+
+    @pytest.mark.asyncio
+    async def test_interrupt_sets_session_interrupt_metadata(self):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_interrupt
+        from nanobot.command.router import CommandContext
+
+        loop, bus = _make_loop()
+        session = MagicMock()
+        session.metadata = {}
+        loop.sessions.get_or_create.return_value = session
+        cancelled = asyncio.Event()
+
+        async def slow_task():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = asyncio.create_task(slow_task())
+        await asyncio.sleep(0)
+        loop._active_tasks["test:c1"] = [task]
+
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
+        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+        out = await cmd_interrupt(ctx)
+
+        assert cancelled.is_set()
+        assert session.metadata["interrupt_state"]["status"] == "interrupted"
+        assert session.metadata["interrupt_state"]["reason"] == "user_interrupt"
+        assert session.metadata["interrupt_state"]["session_key"] == "test:c1"
+        assert "redirect" in out.content.lower()
+
+    @pytest.mark.asyncio
+    async def test_interrupt_persists_inflight_partial_turn_to_session_history(self):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_interrupt
+        from nanobot.command.router import CommandContext
+        from nanobot.session.manager import Session
+
+        loop, _bus = _make_loop()
+        session = Session(key="test:c1")
+        loop.sessions.get_or_create.return_value = session
+        loop.sessions.save = MagicMock()
+        cancelled = asyncio.Event()
+
+        async def slow_task():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = asyncio.create_task(slow_task())
+        await asyncio.sleep(0)
+        loop._active_tasks["test:c1"] = [task]
+        loop._inflight_turns["test:c1"] = {
+            "role": "user",
+            "content": "/harness 修复 interrupt 的真实接线",
+            "assistant_partial": "已经输出到一半：先把 partial assistant 写入 session history。",
+        }
+
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
+        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+        with patch("nanobot.command.builtin._sync_workspace_interrupt_harness", new=AsyncMock()):
+            out = await cmd_interrupt(ctx)
+
+        assert cancelled.is_set()
+        assert "interrupted" in out.content.lower()
+        assert session.messages[-2]["role"] == "user"
+        assert session.messages[-2]["content"] == "/harness 修复 interrupt 的真实接线"
+        assert session.messages[-1]["role"] == "assistant"
+        assert "partial assistant" in session.messages[-1]["content"]
+        assert "partial_assistant_preview" in session.metadata["interrupt_state"]
+        assert "test:c1" not in loop._inflight_turns
+
+    @pytest.mark.asyncio
+    async def test_interrupt_preserved_partial_output_is_available_to_next_message_history(self):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_interrupt
+        from nanobot.command.router import CommandContext
+        from nanobot.session.manager import Session
+
+        loop, _bus = _make_loop()
+        session = Session(key="test:c1")
+        loop.sessions.get_or_create.return_value = session
+        loop.sessions.save = MagicMock()
+        cancelled = asyncio.Event()
+
+        async def slow_task():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = asyncio.create_task(slow_task())
+        await asyncio.sleep(0)
+        loop._active_tasks["test:c1"] = [task]
+        partial = "已经输出到一半：先把 partial assistant 写入 session history。"
+        loop._inflight_turns["test:c1"] = {
+            "role": "user",
+            "content": "/harness 修复 interrupt 的真实接线",
+            "assistant_partial": partial,
+        }
+
+        interrupt_msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
+        interrupt_ctx = CommandContext(msg=interrupt_msg, session=None, key=interrupt_msg.session_key, raw="/interrupt", loop=loop)
+        with patch("nanobot.command.builtin._sync_workspace_interrupt_harness", new=AsyncMock()):
+            await cmd_interrupt(interrupt_ctx)
+
+        captured = {}
+        loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
+        loop._select_history_for_reply = MagicMock(side_effect=lambda s, preflight_ok=True: s.get_history(max_messages=0))
+
+        def _build_messages(*, history, current_message, **kwargs):
+            captured["history"] = history
+            return list(history) + [{"role": "user", "content": current_message}]
+
+        async def _run_agent_loop(messages, **kwargs):
+            return "done", [], list(messages) + [{"role": "assistant", "content": "done"}]
+
+        loop.context.build_messages = MagicMock(side_effect=_build_messages)
+        loop._run_agent_loop = _run_agent_loop  # type: ignore[method-assign]
+        loop._schedule_background = lambda coro: coro.close()
+        loop.tools.get = MagicMock(return_value=None)
+
+        response = await loop._process_message(
+            InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="按这个继续")
+        )
+
+        assert cancelled.is_set()
+        assert response is not None
+        assert response.content == "done"
+        assert any(item.get("role") == "assistant" and partial in str(item.get("content") or "") for item in captured["history"])
+
+    @pytest.mark.asyncio
+    async def test_interrupt_updates_workspace_harness_state_when_active_task_exists(self, tmp_path):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_interrupt
+        from nanobot.command.router import CommandContext
+
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.metadata = {}
+        loop.sessions.get_or_create.return_value = session
+        cancelled = asyncio.Event()
+
+        async def slow_task():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = asyncio.create_task(slow_task())
+        await asyncio.sleep(0)
+        loop._active_tasks["test:c1"] = [task]
+
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
+        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+
+        with (
+            patch("nanobot.command.builtin.Path.home", return_value=tmp_path),
+            patch("nanobot.command.builtin.subprocess.run", return_value=MagicMock(stdout="updated", stderr="", returncode=0)) as mock_run,
+        ):
+            workspace_root = tmp_path / ".nanobot" / "workspace"
+            (workspace_root / "scripts").mkdir(parents=True)
+            (workspace_root / "venv" / "bin").mkdir(parents=True)
+            (workspace_root / "scripts" / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
+            (workspace_root / "venv" / "bin" / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+            out = await cmd_interrupt(ctx)
+
+        assert cancelled.is_set()
+        assert "interrupted" in out.content.lower()
+        argv = mock_run.call_args.args[0]
+        assert argv[1].endswith("router.py")
+        assert argv[2] == "--interrupt-harness"
+        assert argv[3] == "interrupted — waiting for redirect"
+
+    @pytest.mark.asyncio
+    async def test_interrupt_skips_workspace_harness_update_when_no_active_task(self, tmp_path):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_interrupt
+        from nanobot.command.router import CommandContext
+
+        loop, _bus = _make_loop()
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
+        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+
+        with (
+            patch("nanobot.command.builtin.Path.home", return_value=tmp_path),
+            patch("nanobot.command.builtin.subprocess.run") as mock_run,
+        ):
+            out = await cmd_interrupt(ctx)
+
+        assert "No active task" in out.content
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stop_does_not_set_interrupt_metadata(self):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_stop
+        from nanobot.command.router import CommandContext
+
+        loop, bus = _make_loop()
+        session = MagicMock()
+        session.metadata = {}
+        loop.sessions.get_or_create.return_value = session
+        cancelled = asyncio.Event()
+
+        async def slow_task():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = asyncio.create_task(slow_task())
+        await asyncio.sleep(0)
+        loop._active_tasks["test:c1"] = [task]
+
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/stop")
+        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/stop", loop=loop)
+        await cmd_stop(ctx)
+
+        assert cancelled.is_set()
+        assert "interrupt_state" not in session.metadata
+
+
+    @pytest.mark.asyncio
+    async def test_new_does_not_touch_workspace_harness_durable_truth(self, tmp_path):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_new
+        from nanobot.command.router import CommandContext
+
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.messages = []
+        session.last_consolidated = 0
+        session.metadata = {"interrupt_state": {"status": "interrupted"}}
+        session.clear = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/new")
+        ctx = CommandContext(msg=msg, session=session, key=msg.session_key, raw="/new", loop=loop)
+
+        with patch("nanobot.command.builtin.subprocess.run") as mock_run:
+            out = await cmd_new(ctx)
+
+        assert "interrupt_state" not in session.metadata
+        assert "new session started" in out.content.lower()
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_stop_no_active_task(self):
         from nanobot.bus.events import InboundMessage
         from nanobot.command.builtin import cmd_stop
@@ -96,6 +389,14 @@ class TestHandleStop:
 
 
 class TestDispatch:
+    def test_register_builtin_commands_marks_interrupt_as_priority(self):
+        from nanobot.command import CommandRouter, register_builtin_commands
+
+        router = CommandRouter()
+        register_builtin_commands(router)
+
+        assert router.is_priority("/interrupt") is True
+
     def test_exec_tool_not_registered_when_disabled(self):
         from nanobot.config.schema import ExecToolConfig
 
@@ -304,6 +605,88 @@ class TestSubagentCancellation:
         assert spec.concurrent_tools is False
         assert "## Dev Discipline" in spec.initial_messages[0]["content"]
         assert mgr._session_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_spawn_context_can_preserve_workspace_harness_metadata_for_subagent_completion(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.tools.spawn import SpawnTool
+        from nanobot.agent.runner import AgentRunResult
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done",
+            messages=[],
+            tools_used=[],
+            usage={},
+        ))
+
+        spawn_tool = SpawnTool(manager=mgr)
+        spawn_tool.set_context(
+            "feishu",
+            "chat-1",
+            metadata={
+                "workspace_agent_cmd": "harness",
+                "workspace_harness_auto": True,
+                "_origin_sender_id": "user1",
+            },
+        )
+        result = await spawn_tool.execute(task="do task", label="bg")
+
+        assert "started" in result.lower()
+        running = list(mgr._running_tasks.values())
+        assert len(running) == 1
+        await running[0]
+
+        follow_up = await asyncio.wait_for(bus.consume_inbound(), timeout=1.0)
+        assert follow_up.channel == "system"
+        assert follow_up.chat_id == "feishu:chat-1"
+        assert follow_up.metadata["workspace_agent_cmd"] == "harness"
+        assert follow_up.metadata["workspace_harness_auto"] is True
+        assert follow_up.metadata["_origin_sender_id"] == "user1"
+
+    @pytest.mark.asyncio
+    async def test_spawn_is_hard_blocked_when_active_harness_disallows_subagents(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.tools.spawn import SpawnTool
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+        mgr.spawn = AsyncMock()
+
+        spawn_tool = SpawnTool(manager=mgr)
+        spawn_tool.set_context(
+            "feishu",
+            "chat-1",
+            metadata={
+                "workspace_agent_cmd": "harness",
+                "workspace_runtime": {
+                    "has_active_harness": True,
+                    "active_harness": {
+                        "id": "har_0054",
+                        "status": "active",
+                        "phase": "executing",
+                        "awaiting_user": False,
+                        "blocked": False,
+                        "auto": False,
+                        "subagent_allowed": False,
+                    },
+                },
+            },
+        )
+        result = await spawn_tool.execute(task="do task", label="bg")
+
+        assert "blocked" in result.lower()
+        assert "subagent_allowed=false" in result
+        mgr.spawn.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):

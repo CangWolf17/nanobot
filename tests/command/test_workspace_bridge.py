@@ -43,7 +43,46 @@ def test_workspace_bridge_returns_fastlane_help_without_router_fallback(tmp_path
     mock_bridge_run.assert_not_called()
 
 
-def test_workspace_bridge_passes_message_context_into_router_env(tmp_path: Path) -> None:
+
+
+def test_workspace_bridge_prepares_active_merge_workflow_continuation_for_non_slash_message(tmp_path: Path) -> None:
+    harness_root = tmp_path / "harnesses"
+    harness_root.mkdir(parents=True, exist_ok=True)
+    (harness_root / "control.json").write_text(
+        '{"active_harness_id":"har_0002"}', encoding="utf-8"
+    )
+    (harness_root / "index.json").write_text(
+        '{"harnesses":{"har_0002":{"id":"har_0002","kind":"workflow","type":"workflow","status":"awaiting_decision","phase":"awaiting_decision","active":true,"awaiting_user":true,"blocked":false,"workflow_name":"merge","return_to":"har_0001"}}}',
+        encoding="utf-8",
+    )
+    ctx = CommandContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="ou_test",
+            content="可以，合并吧",
+            metadata={},
+        ),
+        session=None,
+        key="feishu:ou_test",
+        raw="可以，合并吧",
+        args="",
+        loop=None,
+    )
+
+    with (
+        patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch(
+            "nanobot.command.workspace_bridge._prepare_agent_input",
+            return_value="prepared merge continuation",
+        ),
+    ):
+        (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
+        result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is None
+    assert ctx.msg.metadata["workspace_agent_cmd"] == "merge"
+    assert ctx.msg.metadata["workspace_agent_input"] == "prepared merge continuation"
     completed = MagicMock(stdout="Autopilot: idle\n", stderr="", returncode=0)
     ctx = CommandContext(
         msg=InboundMessage(

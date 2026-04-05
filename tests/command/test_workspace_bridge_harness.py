@@ -1,0 +1,33 @@
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import asyncio
+
+from nanobot.bus.events import InboundMessage
+from nanobot.command.router import CommandContext
+from nanobot.command.workspace_bridge import cmd_workspace_bridge
+
+
+def _make_ctx(raw: str):
+    loop = MagicMock()
+    msg = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content=raw)
+    return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=loop)
+
+
+def test_workspace_bridge_marks_harness_auto_flag_for_harness_auto_command(tmp_path: Path) -> None:
+    completed = MagicMock(stdout="[AGENT]harness\n", stderr="", returncode=0)
+
+    with (
+        patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.workspace_bridge.try_workspace_fastlane", return_value=None),
+        patch("nanobot.command.workspace_bridge.subprocess.run", side_effect=[completed, MagicMock(stdout="prepared harness input", stderr="", returncode=0)]),
+    ):
+        (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
+        ctx = _make_ctx("/harness auto")
+        result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is None
+    assert ctx.msg.metadata["workspace_agent_cmd"] == "harness"
+    assert ctx.msg.metadata["workspace_agent_input"] == "prepared harness input"
+    assert ctx.msg.metadata["workspace_harness_auto"] is True
+
