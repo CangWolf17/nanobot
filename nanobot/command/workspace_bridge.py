@@ -84,6 +84,38 @@ def prepare_active_workflow_continuation(
         return False
 
     root = workspace_root or _workspace_root_from_router()
+
+    sessions_control_path = root / "sessions" / "control.json"
+    sessions_index_path = root / "sessions" / "index.json"
+    if sessions_control_path.exists() and sessions_index_path.exists():
+        try:
+            sessions_control = json.loads(sessions_control_path.read_text(encoding="utf-8"))
+            sessions_index = json.loads(sessions_index_path.read_text(encoding="utf-8"))
+            active_session_id = str(sessions_control.get("active_session_id") or "").strip()
+            sessions = sessions_index.get("sessions") if isinstance(sessions_index, dict) else None
+            if active_session_id and isinstance(sessions, dict):
+                active_session = sessions.get(active_session_id)
+                if isinstance(active_session, dict):
+                    session_root_raw = str(active_session.get("session_root") or "").strip()
+                    if session_root_raw:
+                        notes_state_path = Path(session_root_raw) / "notes_state.json"
+                        if notes_state_path.exists():
+                            notes_state = json.loads(notes_state_path.read_text(encoding="utf-8"))
+                            if (
+                                isinstance(notes_state, dict)
+                                and str(notes_state.get("mode") or "").strip() == "notes"
+                                and str(notes_state.get("phase") or "").strip() == "awaiting_confirmation"
+                            ):
+                                env = build_workspace_env(msg)
+                                prepared = _prepare_agent_input("笔记", raw, env)
+                                if prepared:
+                                    meta["workspace_agent_cmd"] = "笔记"
+                                    meta["workspace_agent_input"] = prepared
+                                    msg.metadata = meta
+                                    return True
+        except Exception:
+            pass
+
     control_path = root / "harnesses" / "control.json"
     index_path = root / "harnesses" / "index.json"
     if not control_path.exists() or not index_path.exists():
