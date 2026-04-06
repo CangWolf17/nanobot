@@ -1300,6 +1300,109 @@ def test_describe_runtime_provider_uses_custom_api_base_domain() -> None:
     assert _describe_runtime_provider(config, "gpt-5.4") == "tokenx24.com"
 
 
+
+def test_gateway_wires_provider_probe_maintenance_into_heartbeat(monkeypatch, tmp_path: Path) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+
+    captured: dict[str, object] = {}
+    maintenance_calls: list[Path] = []
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: MagicMock())
+    monkeypatch.setattr("nanobot.cli.commands._make_memory_archive_provider", lambda _config: None)
+    monkeypatch.setattr(
+        "nanobot.agent.subagent_resources.probe_due_provider_routes",
+        lambda *, workspace, routes=None, now=None, probe_runner=None: maintenance_calls.append(workspace) or [],
+    )
+
+    class _FakeBus:
+        async def publish_outbound(self, msg):
+            return None
+
+        async def consume_outbound(self):
+            raise AssertionError("consume_outbound should not be called in this test")
+
+    class _FakeCron:
+        def __init__(self, _store_path: Path) -> None:
+            pass
+
+        def status(self) -> dict:
+            return {"jobs": 0}
+
+        async def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeSessionManager:
+        def __init__(self, _workspace: Path) -> None:
+            pass
+
+        def list_sessions(self) -> list[dict[str, str]]:
+            return []
+
+    class _FakeAgentLoop:
+        def __init__(self, *args, **kwargs) -> None:
+            self.model = "gpt-5.4"
+            self.sessions = MagicMock()
+
+        async def run(self):
+            raise _StopGatewayError("stop")
+
+        async def close_mcp(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeChannels:
+        enabled_channels: list[str] = []
+
+        def __init__(self, _config, _bus) -> None:
+            pass
+
+        async def start_all(self) -> None:
+            return None
+
+        async def stop_all(self) -> None:
+            return None
+
+        def get_channel(self, name: str):
+            return None
+
+    class _FakeHeartbeatService:
+        def __init__(self, *args, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def start(self) -> None:
+            await captured["on_maintenance"]()
+            raise _StopGatewayError("stop")
+
+        def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: _FakeBus())
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannels)
+    monkeypatch.setattr("nanobot.session.manager.SessionManager", _FakeSessionManager)
+    monkeypatch.setattr("nanobot.heartbeat.service.HeartbeatService", _FakeHeartbeatService)
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    assert callable(captured["on_maintenance"])
+    assert maintenance_calls == [config.workspace_path]
+
+
 def test_gateway_skips_startup_online_notice_when_not_configured(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)

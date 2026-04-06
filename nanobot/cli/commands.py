@@ -594,6 +594,7 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.agent.subagent_resources import probe_due_provider_routes
     from nanobot.session.manager import SessionManager
 
     if verbose:
@@ -804,6 +805,9 @@ def gateway(
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
+    async def on_heartbeat_maintenance() -> None:
+        probe_due_provider_routes(workspace=config.workspace_path)
+
     def _channel_ready_for_startup_notice(channel_obj) -> bool:
         if channel_obj is None or not getattr(channel_obj, "is_running", False):
             return False
@@ -857,6 +861,7 @@ def gateway(
         model=agent.model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
+        on_maintenance=on_heartbeat_maintenance,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
