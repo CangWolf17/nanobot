@@ -689,6 +689,664 @@ class TestSubagentCancellation:
         mgr.spawn.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_spawn_acquires_resource_lease_before_starting_background_task(self, monkeypatch, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import AcquireDecision, SubagentLease
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        lease = SubagentLease(
+            model_id="standard-gpt-5.4-high-aizhiwen-top",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+        resource_manager = MagicMock()
+        resource_manager.acquire.return_value = AcquireDecision(status="granted", lease=lease)
+        resource_manager.release = MagicMock()
+        mgr.resource_manager = resource_manager
+        mgr._resolve_subagent_request = MagicMock(return_value=object())
+        mgr._run_subagent = AsyncMock()
+
+        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+
+        assert "started" in result.lower()
+        resource_manager.acquire.assert_called_once()
+        running = list(mgr._running_tasks.values())
+        assert len(running) == 1
+        await running[0]
+        mgr._run_subagent.assert_awaited_once()
+        args = mgr._run_subagent.await_args.args
+        assert args[4] == lease
+
+    def test_spawn_tool_accepts_optional_tier_and_model_parameters(self):
+        from nanobot.agent.tools.spawn import SpawnTool
+
+        mgr = MagicMock()
+        tool = SpawnTool(manager=mgr)
+
+        props = tool.parameters["properties"]
+        assert "tier" in props
+        assert props["tier"]["enum"] == ["lite", "standard"]
+        assert "model" in props
+
+    @pytest.mark.asyncio
+    async def test_spawn_rejects_when_resource_manager_denies_request(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import AcquireDecision
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        resource_manager = MagicMock()
+        resource_manager.acquire.return_value = AcquireDecision(status="rejected", reason="queue_limit")
+        resource_manager.release = MagicMock()
+        mgr.resource_manager = resource_manager
+        mgr._resolve_subagent_request = MagicMock(return_value=object())
+        mgr._run_subagent = AsyncMock()
+
+        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+
+        assert "rejected" in result.lower()
+        assert "queue_limit" in result
+        mgr._run_subagent.assert_not_awaited()
+        assert mgr._running_tasks == {}
+
+    def test_resolve_subagent_request_prefers_explicit_model_then_tier_then_harness_defaults(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "gpt-5.4"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        request = mgr._resolve_subagent_request(
+            task="do task",
+            label="bg",
+            tier="lite",
+            model="lite-minimax-m2.7-high-minimax",
+            origin={
+                "channel": "feishu",
+                "chat_id": "c1",
+                "metadata": {
+                    "workspace_runtime": {
+                        "active_harness": {
+                            "id": "har_0026",
+                            "subagent_model": "standard-gpt-5.4-high-aizhiwen-top",
+                            "subagent_tier": "standard",
+                        }
+                    }
+                },
+            },
+        )
+
+        assert request.model == "lite-minimax-m2.7-high-minimax"
+        assert request.tier == "lite"
+        assert request.harness_model == "standard-gpt-5.4-high-aizhiwen-top"
+        assert request.harness_tier == "standard"
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_rebuilds_provider_from_lease_and_uses_provider_model(self, monkeypatch, tmp_path):
+        from nanobot.agent.runner import AgentRunResult, AgentRunner
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import SubagentLease
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        parent_provider = MagicMock()
+        parent_provider.get_default_model.return_value = "parent-model"
+        mgr = SubagentManager(provider=parent_provider, workspace=tmp_path, bus=bus)
+        mgr._announce_result = AsyncMock()
+
+        lease = SubagentLease(
+            model_id="lite-minimax-m2.7-high-minimax",
+            tier="lite",
+            route="minimax",
+            effort="high",
+        )
+
+        child_provider = MagicMock()
+        child_provider.get_default_model.return_value = "MiniMax-M2.7"
+        child_provider.generation.max_tokens = 8192
+        child_provider.generation.temperature = 0.1
+        child_provider.generation.reasoning_effort = "high"
+
+        captured = {}
+
+        async def fake_run(self, spec):
+            captured["model"] = spec.model
+            return AgentRunResult(final_content="done", messages=[], tools_used=[], usage={})
+
+        monkeypatch.setattr(mgr, "_build_provider_for_lease", MagicMock(return_value=(child_provider, "MiniMax-M2.7")))
+        monkeypatch.setattr(AgentRunner, "run", fake_run)
+
+        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease)
+
+        mgr._build_provider_for_lease.assert_called_once_with(lease)
+        assert captured["model"] == "MiniMax-M2.7"
+
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_records_hard_provider_failure_and_shrinks_current_candidate_pool(self, tmp_path):
+        import json
+
+        from nanobot.agent.runner import AgentRunResult
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import SubagentLease
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 1,
+            "subagent_defaults": {"model": "gpt-5.4", "task_budget": 3, "level_limit": 2},
+            "models": {
+                "standard-gpt-5.4-high-aizhiwen-top": {
+                    "tier": "standard",
+                    "family": "gpt-5.4",
+                    "effort": "high",
+                    "route": "aizhiwen-top",
+                    "provider": "custom",
+                    "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k-a", "extra_headers": {}},
+                    "agent": {"temperature": 0.3, "max_tokens": 8192},
+                    "enabled": True,
+                    "template": False,
+                    "aliases": ["gpt-5.4"],
+                },
+                "standard-gpt-5.4-high-tokenx": {
+                    "tier": "standard",
+                    "family": "gpt-5.4",
+                    "effort": "high",
+                    "route": "tokenx",
+                    "provider": "custom",
+                    "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k-t", "extra_headers": {}},
+                    "agent": {"temperature": 0.3, "max_tokens": 8192},
+                    "enabled": True,
+                    "template": False,
+                    "aliases": [],
+                },
+            },
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "standard-gpt-5.4-high-aizhiwen-top"
+        mgr = SubagentManager(
+            provider=provider,
+            workspace=tmp_path,
+            bus=bus,
+            model="standard-gpt-5.4-high-aizhiwen-top",
+        )
+        mgr._announce_result = AsyncMock()
+        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content=None,
+            messages=[],
+            tools_used=[],
+            usage={},
+            stop_reason="error",
+            error="quota exceeded",
+        ))
+
+        lease = SubagentLease(
+            model_id="standard-gpt-5.4-high-aizhiwen-top",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+
+        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease)
+
+        assert mgr.resource_manager.route_policies["aizhiwen-top"].availability == "hard_unavailable"
+        assert mgr.resource_manager.route_policies["aizhiwen-top"].unavailable_reason == "quota_exhausted"
+
+        follow_up = mgr.resource_manager.acquire(mgr.resource_manager.default_request())
+        assert follow_up.status == "granted"
+        assert follow_up.lease is not None
+        assert follow_up.lease.model_id == "standard-gpt-5.4-high-tokenx"
+
+        updated = json.loads((tmp_path / "model_registry.json").read_text(encoding="utf-8"))
+        assert updated["provider_status"]["aizhiwen-top"]["availability"] == "hard_unavailable"
+        assert updated["provider_status"]["aizhiwen-top"]["reason"] == "quota_exhausted"
+        assert updated["provider_status"]["aizhiwen-top"]["source"] == "runtime_error"
+        assert "updated_at" in updated["provider_status"]["aizhiwen-top"]
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_records_transient_provider_failure_without_shrinking_candidate_pool(self, tmp_path):
+        import json
+
+        from nanobot.agent.runner import AgentRunResult
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import SubagentLease
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 1,
+            "subagent_defaults": {"model": "gpt-5.4", "task_budget": 3, "level_limit": 2},
+            "models": {
+                "standard-gpt-5.4-high-aizhiwen-top": {
+                    "tier": "standard",
+                    "family": "gpt-5.4",
+                    "effort": "high",
+                    "route": "aizhiwen-top",
+                    "provider": "custom",
+                    "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k-a", "extra_headers": {}},
+                    "agent": {"temperature": 0.3, "max_tokens": 8192},
+                    "enabled": True,
+                    "template": False,
+                    "aliases": ["gpt-5.4"],
+                },
+                "standard-gpt-5.4-high-tokenx": {
+                    "tier": "standard",
+                    "family": "gpt-5.4",
+                    "effort": "high",
+                    "route": "tokenx",
+                    "provider": "custom",
+                    "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k-t", "extra_headers": {}},
+                    "agent": {"temperature": 0.3, "max_tokens": 8192},
+                    "enabled": True,
+                    "template": False,
+                    "aliases": [],
+                },
+            },
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "standard-gpt-5.4-high-aizhiwen-top"
+        mgr = SubagentManager(
+            provider=provider,
+            workspace=tmp_path,
+            bus=bus,
+            model="standard-gpt-5.4-high-aizhiwen-top",
+        )
+        mgr._announce_result = AsyncMock()
+        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content=None,
+            messages=[],
+            tools_used=[],
+            usage={},
+            stop_reason="error",
+            error="HTTP 502 upstream timeout",
+        ))
+
+        lease = SubagentLease(
+            model_id="standard-gpt-5.4-high-aizhiwen-top",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+
+        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease)
+
+        assert mgr.resource_manager.route_policies["aizhiwen-top"].availability == "transient_unavailable"
+        assert mgr.resource_manager.route_policies["aizhiwen-top"].unavailable_reason == "http_502"
+
+        follow_up = mgr.resource_manager.acquire(mgr.resource_manager.default_request())
+        assert follow_up.status == "granted"
+        assert follow_up.lease is not None
+        assert follow_up.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
+
+        updated = json.loads((tmp_path / "model_registry.json").read_text(encoding="utf-8"))
+        assert updated["provider_status"]["aizhiwen-top"]["availability"] == "transient_unavailable"
+        assert updated["provider_status"]["aizhiwen-top"]["reason"] == "http_502"
+        assert updated["provider_status"]["aizhiwen-top"]["source"] == "runtime_error"
+        assert "updated_at" in updated["provider_status"]["aizhiwen-top"]
+
+
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_error_uses_provider_probe_to_refresh_route_when_probe_succeeds(self, tmp_path):
+        import json
+
+        from nanobot.agent.runner import AgentRunResult
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import SubagentLease
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 1,
+            "subagent_defaults": {"model": "gpt-5.4", "task_budget": 3, "level_limit": 2},
+            "models": {
+                "standard-gpt-5.4-high-aizhiwen-top": {
+                    "tier": "standard",
+                    "family": "gpt-5.4",
+                    "effort": "high",
+                    "route": "aizhiwen-top",
+                    "provider": "custom",
+                    "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k-a", "extra_headers": {}},
+                    "agent": {"temperature": 0.3, "max_tokens": 8192},
+                    "enabled": True,
+                    "template": False,
+                    "aliases": ["gpt-5.4"],
+                },
+                "standard-gpt-5.4-high-tokenx": {
+                    "tier": "standard",
+                    "family": "gpt-5.4",
+                    "effort": "high",
+                    "route": "tokenx",
+                    "provider": "custom",
+                    "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k-t", "extra_headers": {}},
+                    "agent": {"temperature": 0.3, "max_tokens": 8192},
+                    "enabled": True,
+                    "template": False,
+                    "aliases": [],
+                },
+            },
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "standard-gpt-5.4-high-aizhiwen-top"
+        provider_probe = MagicMock(return_value={
+            "ok": True,
+            "provider": "custom",
+            "api_base": "https://aizhiwen.top/v1",
+            "reason": "OK",
+        })
+        mgr = SubagentManager(
+            provider=provider,
+            workspace=tmp_path,
+            bus=bus,
+            model="standard-gpt-5.4-high-aizhiwen-top",
+            provider_probe=provider_probe,
+        )
+        mgr._announce_result = AsyncMock()
+        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content=None,
+            messages=[],
+            tools_used=[],
+            usage={},
+            stop_reason="error",
+            error="quota exceeded",
+        ))
+
+        lease = SubagentLease(
+            model_id="standard-gpt-5.4-high-aizhiwen-top",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+
+        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease)
+
+        provider_probe.assert_called_once_with(tmp_path, ref="standard-gpt-5.4-high-aizhiwen-top")
+        assert mgr.resource_manager.route_policies["aizhiwen-top"].availability == "available"
+        updated = json.loads((tmp_path / "model_registry.json").read_text(encoding="utf-8"))
+        assert updated["provider_status"]["aizhiwen-top"]["availability"] == "available"
+        assert updated["provider_status"]["aizhiwen-top"]["source"] == "monitor_refresh"
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_success_refreshes_current_route_status_in_manager_and_workspace(self, tmp_path):
+        import json
+
+        from nanobot.agent.runner import AgentRunResult
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import (
+            SubagentLease,
+            build_manager_from_workspace_snapshot,
+        )
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 1,
+            "provider_status": {
+                "aizhiwen-top": {
+                    "availability": "hard_unavailable",
+                    "reason": "quota_exhausted",
+                    "source": "runtime_error",
+                    "updated_at": "2026-04-06T09:40:00+00:00",
+                }
+            },
+            "subagent_defaults": {"model": "gpt-5.4", "task_budget": 3, "level_limit": 2},
+            "models": {
+                "standard-gpt-5.4-high-aizhiwen-top": {
+                    "tier": "standard",
+                    "family": "gpt-5.4",
+                    "effort": "high",
+                    "route": "aizhiwen-top",
+                    "provider": "custom",
+                    "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k-a", "extra_headers": {}},
+                    "agent": {"temperature": 0.3, "max_tokens": 8192},
+                    "enabled": True,
+                    "template": False,
+                    "aliases": ["gpt-5.4"],
+                },
+                "standard-gpt-5.4-high-tokenx": {
+                    "tier": "standard",
+                    "family": "gpt-5.4",
+                    "effort": "high",
+                    "route": "tokenx",
+                    "provider": "custom",
+                    "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k-t", "extra_headers": {}},
+                    "agent": {"temperature": 0.3, "max_tokens": 8192},
+                    "enabled": True,
+                    "template": False,
+                    "aliases": [],
+                },
+            },
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "standard-gpt-5.4-high-aizhiwen-top"
+        mgr = SubagentManager(
+            provider=provider,
+            workspace=tmp_path,
+            bus=bus,
+            model="standard-gpt-5.4-high-aizhiwen-top",
+        )
+        mgr._announce_result = AsyncMock()
+        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done",
+            messages=[],
+            tools_used=[],
+            usage={},
+        ))
+
+        lease = SubagentLease(
+            model_id="standard-gpt-5.4-high-aizhiwen-top",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+
+        assert mgr.resource_manager.route_policies["aizhiwen-top"].availability == "hard_unavailable"
+
+        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease)
+
+        assert mgr.resource_manager.route_policies["aizhiwen-top"].availability == "available"
+        assert mgr.resource_manager.route_policies["aizhiwen-top"].unavailable_reason == ""
+
+        updated = json.loads((tmp_path / "model_registry.json").read_text(encoding="utf-8"))
+        assert updated["provider_status"]["aizhiwen-top"]["availability"] == "available"
+        assert updated["provider_status"]["aizhiwen-top"]["reason"] == ""
+        assert updated["provider_status"]["aizhiwen-top"]["source"] == "monitor_refresh"
+        assert "updated_at" in updated["provider_status"]["aizhiwen-top"]
+
+        follow_up = mgr.resource_manager.acquire(mgr.resource_manager.default_request())
+        assert follow_up.status == "granted"
+        assert follow_up.lease is not None
+        assert follow_up.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
+
+        rebuilt = build_manager_from_workspace_snapshot(workspace=tmp_path)
+        rebuilt_follow_up = rebuilt.acquire(rebuilt.default_request())
+        assert rebuilt_follow_up.status == "granted"
+        assert rebuilt_follow_up.lease is not None
+        assert rebuilt_follow_up.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
+
+    @pytest.mark.asyncio
+    async def test_spawn_releases_resource_lease_after_successful_completion(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.runner import AgentRunResult
+        from nanobot.agent.subagent_resources import AcquireDecision, SubagentLease
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        lease = SubagentLease(
+            model_id="standard-gpt-5.4-high-aizhiwen-top",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+        resource_manager = MagicMock()
+        resource_manager.acquire.return_value = AcquireDecision(status="granted", lease=lease)
+        resource_manager.release = MagicMock()
+        mgr.resource_manager = resource_manager
+        mgr._resolve_subagent_request = MagicMock(return_value=object())
+        mgr._announce_result = AsyncMock()
+        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done",
+            messages=[],
+            tools_used=[],
+            usage={},
+        ))
+
+        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+        assert "started" in result.lower()
+        running = list(mgr._running_tasks.values())
+        assert len(running) == 1
+        await running[0]
+
+        resource_manager.release.assert_called_once_with(lease)
+
+    @pytest.mark.asyncio
+    async def test_spawn_releases_resource_lease_after_failure(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import AcquireDecision, SubagentLease
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        lease = SubagentLease(
+            model_id="standard-gpt-5.4-high-aizhiwen-top",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+        resource_manager = MagicMock()
+        resource_manager.acquire.return_value = AcquireDecision(status="granted", lease=lease)
+        resource_manager.release = MagicMock()
+        mgr.resource_manager = resource_manager
+        mgr._resolve_subagent_request = MagicMock(return_value=object())
+        mgr._announce_result = AsyncMock()
+        mgr.runner.run = AsyncMock(side_effect=RuntimeError("boom"))
+
+        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+        assert "started" in result.lower()
+        running = list(mgr._running_tasks.values())
+        assert len(running) == 1
+        await running[0]
+
+        resource_manager.release.assert_called_once_with(lease)
+
+    @pytest.mark.asyncio
+    async def test_cancel_by_session_releases_resource_lease(self, monkeypatch, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import AcquireDecision, SubagentLease
+        from nanobot.bus.queue import MessageBus
+        from nanobot.providers.base import LLMResponse, ToolCallRequest
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+            content="thinking",
+            tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
+        ))
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+        mgr._announce_result = AsyncMock()
+
+        lease = SubagentLease(
+            model_id="standard-gpt-5.4-high-aizhiwen-top",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+        resource_manager = MagicMock()
+        resource_manager.acquire.return_value = AcquireDecision(status="granted", lease=lease)
+        resource_manager.release = MagicMock()
+        mgr.resource_manager = resource_manager
+        mgr._resolve_subagent_request = MagicMock(return_value=object())
+
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def fake_execute(self, name, arguments):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        monkeypatch.setattr("nanobot.agent.tools.registry.ToolRegistry.execute", fake_execute)
+
+        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+        assert "started" in result.lower()
+        running = list(mgr._running_tasks.values())
+        assert len(running) == 1
+
+        await started.wait()
+        count = await mgr.cancel_by_session("test:c1")
+
+        assert count == 1
+        assert cancelled.is_set()
+        resource_manager.release.assert_called_once_with(lease)
+
+    @pytest.mark.asyncio
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus

@@ -67,11 +67,20 @@ class SpawnTool(Tool):
                     "type": "string",
                     "description": "Optional short label for the task (for display)",
                 },
+                "tier": {
+                    "type": "string",
+                    "enum": ["lite", "standard"],
+                    "description": "Optional subagent tier. lite=read/summarize style tasks; standard=full independent subtask.",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional explicit model ref. Overrides tier/default routing when provided.",
+                },
             },
             "required": ["task"],
         }
 
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+    async def execute(self, task: str, label: str | None = None, tier: str | None = None, model: str | None = None, **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
         runtime_meta = self._metadata.get("workspace_runtime")
         if self._metadata.get("workspace_agent_cmd") == "harness" and isinstance(runtime_meta, dict):
@@ -84,6 +93,8 @@ class SpawnTool(Tool):
         return await self._manager.spawn(
             task=task,
             label=label,
+            tier=tier,
+            model=model,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
