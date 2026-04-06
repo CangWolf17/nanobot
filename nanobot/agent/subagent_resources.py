@@ -341,6 +341,63 @@ def _provider_status_policy(data: dict[str, Any] | None) -> dict[str, Any]:
 
 
 
+def _provider_status_probe_interval_seconds(data: dict[str, Any] | None) -> int:
+    policy = _provider_status_policy(data)
+    value = policy.get("probe_interval_seconds")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return 6 * 3600
+
+
+
+def _probe_ref_for_route(registry: dict[str, Any], route: str) -> str:
+    route_clean = str(route or "").strip()
+    if route_clean == "minimax":
+        profile_defaults = registry.get("profile_defaults") if isinstance(registry, dict) else None
+        if isinstance(profile_defaults, dict):
+            archive = profile_defaults.get("archive")
+            if isinstance(archive, dict):
+                ref = str(archive.get("ref") or "").strip()
+                if ref:
+                    return ref
+    models = registry.get("models") if isinstance(registry, dict) else None
+    if isinstance(models, dict):
+        for model_id, raw in models.items():
+            if not isinstance(raw, dict):
+                continue
+            if not bool(raw.get("enabled", True)) or bool(raw.get("template", False)):
+                continue
+            if str(raw.get("route") or "").strip() != route_clean:
+                continue
+            return model_id
+    return ""
+
+
+
+def _provider_status_last_updated_at(data: dict[str, Any] | None, route: str) -> str:
+    provider_status = data.get("provider_status") if isinstance(data, dict) else None
+    if not isinstance(provider_status, dict):
+        return ""
+    status = provider_status.get(str(route or "").strip())
+    if not isinstance(status, dict):
+        return ""
+    return str(status.get("updated_at") or "").strip()
+
+
+
+def _is_probe_due(last_updated_at: str, *, now: str | None, probe_interval_seconds: int) -> bool:
+    if probe_interval_seconds <= 0:
+        return True
+    last_dt = _parse_iso_datetime(last_updated_at)
+    now_dt = _parse_iso_datetime(now) if now is not None else datetime.now(timezone.utc)
+    if last_dt is None or now_dt is None:
+        return True
+    return (now_dt - last_dt).total_seconds() >= int(probe_interval_seconds)
+
+
+
 def _provider_status_transient_ttl_seconds(data: dict[str, Any] | None) -> int:
     policy = _provider_status_policy(data)
     value = policy.get("transient_ttl_seconds")
@@ -540,6 +597,81 @@ def run_workspace_quick_provider_probe(workspace: Path, *, ref: str) -> dict[str
         for key in list(sys.modules.keys()):
             if key in tracked_keys and key not in original_module_keys:
                 sys.modules.pop(key, None)
+
+
+
+def probe_due_provider_routes(
+    *,
+    workspace: Path,
+    routes: list[str] | tuple[str, ...] | None = None,
+    now: str | None = None,
+    probe_runner: Any | None = None,
+) -> list[dict[str, Any]]:
+    registry = _load_json(workspace / "model_registry.json")
+    selected_routes: list[str] = []
+    if isinstance(routes, (list, tuple)):
+        for item in routes:
+            route = str(item or "").strip()
+            if route and route not in selected_routes:
+                selected_routes.append(route)
+    else:
+        provider_status = registry.get("provider_status") if isinstance(registry, dict) else None
+        if isinstance(provider_status, dict) and provider_status:
+            for route in provider_status:
+                route_clean = str(route or "").strip()
+                if route_clean and route_clean not in selected_routes:
+                    selected_routes.append(route_clean)
+        else:
+            models = registry.get("models") if isinstance(registry, dict) else None
+            if isinstance(models, dict):
+                for raw in models.values():
+                    if not isinstance(raw, dict):
+                        continue
+                    route_clean = str(raw.get("route") or "").strip()
+                    if route_clean and route_clean not in selected_routes:
+                        selected_routes.append(route_clean)
+    return [
+        probe_provider_route_status(
+            workspace=workspace,
+            route=route,
+            now=now,
+            probe_runner=probe_runner,
+        )
+        for route in selected_routes
+    ]
+
+
+
+def probe_provider_route_status(
+    *,
+    workspace: Path,
+    route: str,
+    now: str | None = None,
+    probe_runner: Any | None = None,
+) -> dict[str, Any]:
+    registry = _load_json(workspace / "model_registry.json")
+    probe_interval_seconds = _provider_status_probe_interval_seconds(registry)
+    route_clean = str(route or "").strip()
+    last_updated_at = _provider_status_last_updated_at(registry, route_clean)
+    if not _is_probe_due(last_updated_at, now=now, probe_interval_seconds=probe_interval_seconds):
+        return {"status": "skipped", "reason": "not_due", "route": route_clean}
+    ref = _probe_ref_for_route(registry, route_clean)
+    if not ref:
+        return {"status": "skipped", "reason": "no_probe_ref", "route": route_clean}
+    runner = probe_runner or run_workspace_quick_provider_probe
+    probe = runner(workspace, ref=ref)
+    applied_route = apply_provider_probe_result(
+        workspace=workspace,
+        probe=probe,
+        updated_at=now,
+    )
+    return {
+        "status": "updated" if applied_route else "skipped",
+        "reason": "applied" if applied_route else "unknown_route",
+        "route": applied_route or route_clean,
+        "ref": ref,
+        "probe": probe if isinstance(probe, dict) else None,
+    }
 
 
 

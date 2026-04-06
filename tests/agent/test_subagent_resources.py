@@ -763,6 +763,8 @@ def test_run_workspace_quick_provider_probe_supports_model_runtime_sibling_impor
 
 
 
+
+
 def test_run_workspace_quick_provider_probe_does_not_reuse_sibling_module_from_previous_workspace(tmp_path):
     from nanobot.agent.subagent_resources import run_workspace_quick_provider_probe
 
@@ -798,3 +800,231 @@ def test_run_workspace_quick_provider_probe_does_not_reuse_sibling_module_from_p
     assert second is not None
     assert first["reason"] == "tokenx"
     assert second["reason"] == "aizhiwen"
+
+
+
+def test_probe_provider_route_status_skips_when_not_due(tmp_path):
+    from nanobot.agent.subagent_resources import probe_provider_route_status
+
+    registry = _registry()
+    registry["provider_status_policy"] = {"probe_interval_seconds": 3600}
+    registry["provider_status"] = {
+        "aizhiwen-top": {
+            "availability": "available",
+            "reason": "",
+            "source": "monitor_refresh",
+            "updated_at": "2026-04-06T09:30:00+00:00",
+        }
+    }
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    called: list[str] = []
+
+    def _probe(workspace, *, ref):
+        called.append(ref)
+        return {"ok": True, "provider": "custom", "api_base": "https://aizhiwen.top/v1", "reason": "OK"}
+
+    result = probe_provider_route_status(
+        workspace=tmp_path,
+        route="aizhiwen-top",
+        now="2026-04-06T10:00:00+00:00",
+        probe_runner=_probe,
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "not_due"
+    assert called == []
+
+
+
+def test_probe_provider_route_status_runs_probe_when_due_and_refreshes_status(tmp_path):
+    from nanobot.agent.subagent_resources import probe_provider_route_status
+
+    registry = _registry()
+    registry["provider_status_policy"] = {"probe_interval_seconds": 3600}
+    registry["provider_status"] = {
+        "aizhiwen-top": {
+            "availability": "hard_unavailable",
+            "reason": "quota_exhausted",
+            "source": "runtime_error",
+            "updated_at": "2026-04-06T08:00:00+00:00",
+        }
+    }
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    called: list[str] = []
+
+    def _probe(workspace, *, ref):
+        called.append(ref)
+        return {"ok": True, "provider": "custom", "api_base": "https://aizhiwen.top/v1", "reason": "OK"}
+
+    result = probe_provider_route_status(
+        workspace=tmp_path,
+        route="aizhiwen-top",
+        now="2026-04-06T10:00:00+00:00",
+        probe_runner=_probe,
+    )
+
+    assert result["status"] == "updated"
+    assert result["route"] == "aizhiwen-top"
+    assert called == ["standard-gpt-5.4-high-aizhiwen-top"]
+    updated = json.loads((tmp_path / "model_registry.json").read_text(encoding="utf-8"))
+    assert updated["provider_status"]["aizhiwen-top"]["availability"] == "available"
+    assert updated["provider_status"]["aizhiwen-top"]["source"] == "monitor_refresh"
+
+
+
+
+
+def test_probe_provider_route_status_uses_archive_profile_default_for_minimax(tmp_path):
+    from nanobot.agent.subagent_resources import probe_provider_route_status
+
+    registry = _registry()
+    registry["provider_status_policy"] = {"probe_interval_seconds": 3600}
+    registry["provider_status"] = {
+        "minimax": {
+            "availability": "transient_unavailable",
+            "reason": "http_502",
+            "source": "runtime_error",
+            "updated_at": "2026-04-06T08:00:00+00:00",
+        }
+    }
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    called: list[str] = []
+
+    def _probe(workspace, *, ref):
+        called.append(ref)
+        return {"ok": True, "provider": "minimax", "api_base": "https://api.minimaxi.com/v1", "reason": "OK"}
+
+    result = probe_provider_route_status(
+        workspace=tmp_path,
+        route="minimax",
+        now="2026-04-06T10:00:00+00:00",
+        probe_runner=_probe,
+    )
+
+    assert result["status"] == "updated"
+    assert called == ["lite-minimax-m2.7-high-minimax"]
+
+
+
+def test_probe_due_provider_routes_only_runs_due_routes(tmp_path):
+    from nanobot.agent.subagent_resources import probe_due_provider_routes
+
+    registry = _registry()
+    registry["provider_status_policy"] = {"probe_interval_seconds": 3600}
+    registry["provider_status"] = {
+        "aizhiwen-top": {
+            "availability": "hard_unavailable",
+            "reason": "quota_exhausted",
+            "source": "runtime_error",
+            "updated_at": "2026-04-06T08:00:00+00:00",
+        },
+        "tokenx": {
+            "availability": "available",
+            "reason": "",
+            "source": "monitor_refresh",
+            "updated_at": "2026-04-06T09:30:00+00:00",
+        },
+    }
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    called: list[str] = []
+
+    def _probe(workspace, *, ref):
+        called.append(ref)
+        if "aizhiwen" in ref:
+            return {"ok": True, "provider": "custom", "api_base": "https://aizhiwen.top/v1", "reason": "OK"}
+        return {"ok": True, "provider": "custom", "api_base": "https://tokenx24.com/v1", "reason": "OK"}
+
+    results = probe_due_provider_routes(
+        workspace=tmp_path,
+        now="2026-04-06T10:00:00+00:00",
+        probe_runner=_probe,
+    )
+
+    assert [item["route"] for item in results] == ["aizhiwen-top", "tokenx"]
+    assert results[0]["status"] == "updated"
+    assert results[1]["status"] == "skipped"
+    assert results[1]["reason"] == "not_due"
+    assert called == ["standard-gpt-5.4-high-aizhiwen-top"]
+
+
+
+def test_probe_due_provider_routes_respects_explicit_route_filter(tmp_path):
+    from nanobot.agent.subagent_resources import probe_due_provider_routes
+
+    registry = _registry()
+    registry["provider_status_policy"] = {"probe_interval_seconds": 3600}
+    registry["provider_status"] = {
+        "aizhiwen-top": {
+            "availability": "hard_unavailable",
+            "reason": "quota_exhausted",
+            "source": "runtime_error",
+            "updated_at": "2026-04-06T08:00:00+00:00",
+        },
+        "minimax": {
+            "availability": "transient_unavailable",
+            "reason": "http_502",
+            "source": "runtime_error",
+            "updated_at": "2026-04-06T08:00:00+00:00",
+        },
+    }
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    called: list[str] = []
+
+    def _probe(workspace, *, ref):
+        called.append(ref)
+        return {"ok": True, "provider": "minimax", "api_base": "https://api.minimaxi.com/v1", "reason": "OK"}
+
+    results = probe_due_provider_routes(
+        workspace=tmp_path,
+        routes=["minimax"],
+        now="2026-04-06T10:00:00+00:00",
+        probe_runner=_probe,
+    )
+
+    assert [item["route"] for item in results] == ["minimax"]
+    assert called == ["lite-minimax-m2.7-high-minimax"]
