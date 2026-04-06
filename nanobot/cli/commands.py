@@ -816,9 +816,17 @@ def gateway(
         heartbeat_raw_task = (tasks or "").strip()
         direct_content = heartbeat_raw_task if heartbeat_metadata else heartbeat_message
         if heartbeat_metadata:
+            prepared_workspace_input = str(heartbeat_metadata.get("workspace_agent_input") or "").strip()
+            combined_workspace_input = heartbeat_message
+            if prepared_workspace_input:
+                combined_workspace_input = (
+                    f"{heartbeat_message}\n\n"
+                    "[WORKSPACE PREPARED INPUT]\n"
+                    f"{prepared_workspace_input}"
+                ).strip()
             heartbeat_metadata = {
                 **heartbeat_metadata,
-                "workspace_agent_input": heartbeat_message,
+                "workspace_agent_input": combined_workspace_input,
             }
 
         async def _silent(*_args, **_kwargs):
