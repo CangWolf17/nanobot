@@ -195,9 +195,38 @@ class AgentLoop:
             if not isinstance(harness, dict):
                 runtime_meta["has_active_harness"] = False
                 return runtime_meta
-            runtime_meta["has_active_harness"] = True
+
+            def _is_completed(item: dict[str, Any]) -> bool:
+                status = str(item.get("status") or "").strip().lower()
+                phase = str(item.get("phase") or "").strip().lower()
+                return status == "completed" or phase == "completed"
+
+            def _queue_order(item: dict[str, Any]) -> int:
+                value = item.get("queue_order")
+                try:
+                    normalized = int(value)
+                except (TypeError, ValueError):
+                    normalized = 0
+                if normalized > 0:
+                    return normalized
+                hid = str(item.get("id") or "").strip()
+                if hid.startswith("har_") and hid[4:].isdigit():
+                    return int(hid[4:])
+                return 10**9
+
+            def _child_payload(item: dict[str, Any], *, durable_auto: bool = False) -> dict[str, Any]:
+                return {
+                    "id": str(item.get("id") or "").strip(),
+                    "type": str(item.get("type") or "").strip(),
+                    "status": str(item.get("status") or "").strip(),
+                    "phase": str(item.get("phase") or "").strip(),
+                    "awaiting_user": bool(item.get("awaiting_user")),
+                    "blocked": bool(item.get("blocked")),
+                    "auto": durable_auto or bool(item.get("auto")),
+                }
+
             durable_auto = bool(harness.get("auto"))
-            runtime_meta["active_harness"] = {
+            active_payload = {
                 "id": str(harness.get("id") or "").strip(),
                 "type": str(harness.get("type") or "").strip(),
                 "status": str(harness.get("status") or "").strip(),
@@ -209,6 +238,46 @@ class AgentLoop:
                 "subagent_allowed": bool(harness.get("subagent_allowed", False)),
                 "runner": str(harness.get("runner") or "main").strip() or "main",
             }
+            runtime_meta["has_active_harness"] = True
+            runtime_meta["active_harness"] = active_payload
+
+            main_harness = harness
+            parent_id = str(harness.get("parent_id") or "").strip()
+            if parent_id:
+                parent = harnesses.get(parent_id)
+                if isinstance(parent, dict):
+                    main_harness = parent
+
+            main_payload = _child_payload(main_harness, durable_auto=active_payload["auto"])
+            main_payload["auto"] = active_payload["auto"]
+            runtime_meta["main_harness"] = main_payload
+
+            if str(main_harness.get("type") or "").strip() == "project":
+                children = [
+                    item for item in harnesses.values()
+                    if isinstance(item, dict) and str(item.get("parent_id") or "").strip() == str(main_harness.get("id") or "").strip()
+                ]
+                children.sort(key=lambda item: (_queue_order(item), str(item.get("created_at") or item.get("updated_at") or ""), str(item.get("id") or "")))
+                stop_gate_child = None
+                next_runnable_child = None
+                has_open_children = False
+                for child in children:
+                    status = str(child.get("status") or "").strip().lower()
+                    phase = str(child.get("phase") or "").strip().lower()
+                    if not _is_completed(child):
+                        has_open_children = True
+                    if stop_gate_child is None and (status in {"awaiting_decision", "blocked", "failed", "interrupted"} or phase in {"awaiting_decision", "blocked", "failed", "interrupted"}):
+                        stop_gate_child = _child_payload(child)
+                        break
+                    if next_runnable_child is None and not _is_completed(child):
+                        next_runnable_child = _child_payload(child)
+                main_payload["has_open_children"] = has_open_children
+                runtime_meta["main_harness"] = main_payload
+                runtime_meta["next_runnable_child"] = next_runnable_child
+                runtime_meta["stop_gate_child"] = stop_gate_child
+            else:
+                runtime_meta["next_runnable_child"] = None
+                runtime_meta["stop_gate_child"] = None
         except Exception:
             runtime_meta["has_active_harness"] = False
             return runtime_meta
@@ -242,6 +311,46 @@ class AgentLoop:
             decision["reason"] = "no_active_harness"
             return decision
 
+        main_harness = runtime_meta.get("main_harness") if isinstance(runtime_meta, dict) else None
+        stop_gate_child = runtime_meta.get("stop_gate_child") if isinstance(runtime_meta, dict) else None
+        next_runnable_child = runtime_meta.get("next_runnable_child") if isinstance(runtime_meta, dict) else None
+        main_target = main_harness if isinstance(main_harness, dict) else active_harness
+
+        if isinstance(stop_gate_child, dict):
+            if bool(stop_gate_child.get("awaiting_user")):
+                decision["reason"] = "awaiting_user"
+                return decision
+            if bool(stop_gate_child.get("blocked")):
+                decision["reason"] = "blocked"
+                return decision
+            stop_status = str(stop_gate_child.get("status") or "").strip().lower()
+            if stop_status in {"awaiting_decision", "failed", "interrupted"}:
+                decision["reason"] = stop_status
+                return decision
+
+        if bool(main_target.get("awaiting_user")):
+            decision["reason"] = "awaiting_user"
+            return decision
+        if bool(main_target.get("blocked")):
+            decision["reason"] = "blocked"
+            return decision
+        if not bool(main_target.get("auto") or active_harness.get("auto")):
+            decision["reason"] = "durable_auto_disabled"
+            return decision
+
+        main_status = str(main_target.get("status") or "").strip().lower()
+        has_open_children = bool(main_target.get("has_open_children"))
+        if main_status == "completed" and not (has_open_children and isinstance(next_runnable_child, dict)):
+            decision["reason"] = "completed"
+            return decision
+
+        if isinstance(next_runnable_child, dict):
+            child_status = str(next_runnable_child.get("status") or "").strip().lower()
+            if child_status in {"planning", "active"}:
+                decision["should_fire"] = True
+                decision["reason"] = "continue"
+                return decision
+
         status = str(active_harness.get("status") or "").strip().lower()
         if status == "completed":
             decision["reason"] = "completed"
@@ -251,9 +360,6 @@ class AgentLoop:
             return decision
         if bool(active_harness.get("blocked")):
             decision["reason"] = "blocked"
-            return decision
-        if not bool(active_harness.get("auto")):
-            decision["reason"] = "durable_auto_disabled"
             return decision
 
         decision["should_fire"] = True
@@ -1268,6 +1374,7 @@ class AgentLoop:
                 "sync": "正在同步与消化内容…",
                 "merge": "正在准备合并流程…",
                 "harness": "正在初始化 harness 并推进目标…",
+                "weather_brief": "正在生成天气早报…",
             }
             hint = progress_map.get(workspace_cmd, f"正在处理 /{workspace_cmd} …")
             await _bus_progress(hint)

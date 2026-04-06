@@ -167,6 +167,38 @@ def test_workspace_harness_runtime_metadata_falls_back_to_durable_auto_false_whe
     assert runtime_meta["active_harness"]["auto"] is False
 
 
+def test_workspace_harness_runtime_metadata_exposes_main_harness_and_next_runnable_child(tmp_path: Path) -> None:
+    loop, _bus = _make_loop(tmp_path)
+    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses" / "control.json").write_text(
+        '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
+    )
+    (tmp_path / "harnesses" / "index.json").write_text(
+        '{"harnesses":{'
+        '"har_0001":{"id":"har_0001","type":"project","status":"completed","phase":"completed","awaiting_user":false,"blocked":false,"auto":true,"queue_order":1},'
+        '"har_0002":{"id":"har_0002","type":"feature","parent_id":"har_0001","status":"planning","phase":"planning","awaiting_user":false,"blocked":false,"auto":false,"queue_order":2},'
+        '"har_0003":{"id":"har_0003","type":"feature","parent_id":"har_0001","status":"planning","phase":"planning","awaiting_user":false,"blocked":false,"auto":false,"queue_order":3}'
+        '}}',
+        encoding="utf-8",
+    )
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="user1",
+        chat_id="chat1",
+        content="/harness auto",
+        metadata={"workspace_agent_cmd": "harness", "workspace_harness_auto": True},
+    )
+
+    runtime_meta = loop._extract_runtime_metadata(msg)
+
+    assert runtime_meta["has_active_harness"] is True
+    assert runtime_meta["active_harness"]["id"] == "har_0001"
+    assert runtime_meta["main_harness"]["id"] == "har_0001"
+    assert runtime_meta["main_harness"]["has_open_children"] is True
+    assert runtime_meta["next_runnable_child"]["id"] == "har_0002"
+    assert runtime_meta.get("stop_gate_child") is None
+
+
 def test_workspace_harness_runtime_metadata_includes_subagent_policy_fields(tmp_path: Path) -> None:
     loop, _bus = _make_loop(tmp_path)
     (tmp_path / "harnesses").mkdir(parents=True)
@@ -191,6 +223,7 @@ def test_workspace_harness_runtime_metadata_includes_subagent_policy_fields(tmp_
     assert runtime_meta["active_harness"]["executor_mode"] == "auto"
     assert runtime_meta["active_harness"]["subagent_allowed"] is True
     assert runtime_meta["active_harness"]["runner"] == "subagent"
+
 
 
 def test_workspace_harness_turn_sets_spawn_context_with_computed_runtime_policy(tmp_path: Path) -> None:
@@ -234,6 +267,138 @@ def test_workspace_harness_turn_sets_spawn_context_with_computed_runtime_policy(
         assert result.content == "done"
 
     asyncio.run(run())
+
+
+def test_workspace_harness_auto_reentry_continues_when_project_completed_but_next_child_exists(tmp_path: Path) -> None:
+    loop, _bus = _make_loop(tmp_path)
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="user1",
+        chat_id="chat1",
+        content="/harness auto",
+        metadata={
+            "workspace_agent_cmd": "harness",
+            "workspace_harness_auto": True,
+            "workspace_runtime": {
+                "has_active_harness": True,
+                "active_harness": {
+                    "id": "har_0001",
+                    "type": "project",
+                    "status": "completed",
+                    "phase": "completed",
+                    "awaiting_user": False,
+                    "blocked": False,
+                    "auto": True,
+                },
+                "main_harness": {
+                    "id": "har_0001",
+                    "type": "project",
+                    "status": "completed",
+                    "phase": "completed",
+                    "awaiting_user": False,
+                    "blocked": False,
+                    "auto": True,
+                    "has_open_children": True,
+                },
+                "next_runnable_child": {
+                    "id": "har_0002",
+                    "type": "feature",
+                    "status": "planning",
+                    "phase": "planning",
+                    "awaiting_user": False,
+                    "blocked": False,
+                    "auto": False,
+                },
+                "stop_gate_child": None,
+            },
+        },
+    )
+
+    decision = loop._decide_harness_auto_reentry(msg)
+
+    assert decision["should_fire"] is True
+    assert decision["reason"] == "continue"
+
+
+
+def test_workspace_harness_auto_reentry_stops_on_stop_gate_child_even_if_project_has_more_queue(tmp_path: Path) -> None:
+    loop, _bus = _make_loop(tmp_path)
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="user1",
+        chat_id="chat1",
+        content="/harness auto",
+        metadata={
+            "workspace_agent_cmd": "harness",
+            "workspace_harness_auto": True,
+            "workspace_runtime": {
+                "has_active_harness": True,
+                "active_harness": {
+                    "id": "har_0001",
+                    "type": "project",
+                    "status": "active",
+                    "phase": "planning",
+                    "awaiting_user": False,
+                    "blocked": False,
+                    "auto": True,
+                },
+                "main_harness": {
+                    "id": "har_0001",
+                    "type": "project",
+                    "status": "active",
+                    "phase": "planning",
+                    "awaiting_user": False,
+                    "blocked": False,
+                    "auto": True,
+                    "has_open_children": True,
+                },
+                "next_runnable_child": None,
+                "stop_gate_child": {
+                    "id": "har_0002",
+                    "type": "feature",
+                    "status": "blocked",
+                    "phase": "blocked",
+                    "awaiting_user": False,
+                    "blocked": True,
+                    "auto": False,
+                },
+            },
+        },
+    )
+
+    decision = loop._decide_harness_auto_reentry(msg)
+
+    assert decision["should_fire"] is False
+    assert decision["reason"] == "blocked"
+
+
+
+def test_workspace_harness_runtime_metadata_prefers_queue_order_over_updated_at_for_next_child(tmp_path: Path) -> None:
+    loop, _bus = _make_loop(tmp_path)
+    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses" / "control.json").write_text(
+        '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
+    )
+    (tmp_path / "harnesses" / "index.json").write_text(
+        '{"harnesses":{'
+        '"har_0001":{"id":"har_0001","type":"project","status":"active","phase":"planning","awaiting_user":false,"blocked":false,"auto":true,"queue_order":1},'
+        '"har_0002":{"id":"har_0002","type":"feature","parent_id":"har_0001","status":"planning","phase":"planning","awaiting_user":false,"blocked":false,"auto":false,"queue_order":2,"updated_at":"2026-04-06T01:00:00"},'
+        '"har_0003":{"id":"har_0003","type":"feature","parent_id":"har_0001","status":"planning","phase":"planning","awaiting_user":false,"blocked":false,"auto":false,"queue_order":3,"updated_at":"2026-04-06T09:00:00"}'
+        '}}',
+        encoding="utf-8",
+    )
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="user1",
+        chat_id="chat1",
+        content="/harness auto",
+        metadata={"workspace_agent_cmd": "harness", "workspace_harness_auto": True},
+    )
+
+    runtime_meta = loop._extract_runtime_metadata(msg)
+
+    assert runtime_meta["next_runnable_child"]["id"] == "har_0002"
+
 
 
 def test_stream_completion_notice_skips_when_harness_auto_will_continue(tmp_path: Path) -> None:
