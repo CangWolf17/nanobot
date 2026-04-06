@@ -1120,6 +1120,180 @@ def test_gateway_heartbeat_execution_uses_explicit_execution_prompt_and_isolated
     assert "not background metadata" in str(captured["message"])
     assert captured["session_key"] != "heartbeat"
     assert str(captured["session_key"]).startswith("heartbeat:")
+
+
+def test_build_weather_brief_prompt_locks_fixed_morning_template_without_calendar() -> None:
+    from nanobot.cli.commands import _build_weather_brief_prompt
+
+    prompt = _build_weather_brief_prompt(
+        "🌤️ 早上好！今日天气预报：重庆南岸区 + 你的飞书日程"
+    )
+
+    assert "重庆南岸区" in prompt
+    assert "3月29日那套固定版式" in prompt
+    assert "### 📍 重庆南岸区天气" in prompt
+    assert "### 📅 今日日程" in prompt
+    assert "📭 **飞书日历暂未接入**" in prompt
+    assert "不要调用飞书日历" in prompt
+
+
+def test_gateway_cron_weather_job_uses_fixed_prepared_prompt(monkeypatch, tmp_path: Path) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    config = Config.model_validate(
+        {
+            "channels": {
+                "feishu": {
+                    "enabled": True,
+                    "appId": "x",
+                    "appSecret": "y",
+                    "allowFrom": ["*"],
+                }
+            },
+            "gateway": {
+                "heartbeat": {
+                    "enabled": False,
+                }
+            },
+        }
+    )
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.cli.commands._make_memory_archive_provider", lambda _config: None)
+    monkeypatch.setattr("nanobot.utils.evaluator.evaluate_response", AsyncMock(return_value=True))
+
+    class _FakeBus:
+        async def publish_outbound(self, msg):
+            captured.setdefault("published", []).append((msg.channel, msg.chat_id, msg.content))
+
+        async def consume_outbound(self):
+            raise AssertionError("consume_outbound should not be called in this test")
+
+    class _FakeCron:
+        last_instance = None
+
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+            _FakeCron.last_instance = self
+
+        def status(self) -> dict:
+            return {"jobs": 0}
+
+        async def start(self) -> None:
+            from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+
+            assert self.on_job is not None
+            job = CronJob(
+                id="weather001",
+                name="🌤️ 早上好！今日天气预报：重庆南岸区 + 你的飞书日程",
+                schedule=CronSchedule(kind="cron", expr="0 8 * * *", tz="Asia/Shanghai"),
+                payload=CronPayload(
+                    kind="agent_turn",
+                    message="🌤️ 早上好！今日天气预报：重庆南岸区 + 你的飞书日程",
+                    deliver=True,
+                    channel="feishu",
+                    to="ou_test",
+                ),
+            )
+            await self.on_job(job)
+            raise _StopGatewayError("stop")
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeSessionManager:
+        def __init__(self, _workspace: Path) -> None:
+            pass
+
+        def list_sessions(self) -> list[dict[str, str]]:
+            return []
+
+    class _FakeAgentLoop:
+        def __init__(self, *args, **kwargs) -> None:
+            self.channels_config = None
+            self.model = "minimax/MiniMax-M2.7"
+            self.sessions = MagicMock()
+            self.tools = {
+                "cron": MagicMock(),
+                "message": MagicMock(_sent_in_turn=False),
+            }
+            self.tools["cron"].set_cron_context.return_value = object()
+            self.tools["cron"].reset_cron_context.return_value = None
+
+        async def process_direct(self, message, session_key, **kwargs):
+            captured["message"] = message
+            captured["session_key"] = session_key
+            captured["kwargs"] = kwargs
+            return OutboundMessage(channel="feishu", chat_id="ou_test", content="weather ok")
+
+        async def run(self):
+            raise _StopGatewayError("stop")
+
+        async def close_mcp(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeChannels:
+        enabled_channels: list[str] = ["feishu"]
+
+        def __init__(self, _config, _bus) -> None:
+            pass
+
+        async def start_all(self) -> None:
+            return None
+
+        async def stop_all(self) -> None:
+            return None
+
+        def get_channel(self, _name: str):
+            return None
+
+    class _FakeHeartbeatService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    async def _fake_gather(*aws, **_kwargs):
+        for aw in aws:
+            close = getattr(aw, "close", None)
+            if callable(close):
+                close()
+            cancel = getattr(aw, "cancel", None)
+            if callable(cancel):
+                cancel()
+        raise _StopGatewayError("stop")
+
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: _FakeBus())
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannels)
+    monkeypatch.setattr("nanobot.session.manager.SessionManager", _FakeSessionManager)
+    monkeypatch.setattr("nanobot.heartbeat.service.HeartbeatService", _FakeHeartbeatService)
+    monkeypatch.setattr("nanobot.cli.commands.asyncio.gather", _fake_gather)
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    assert captured["message"] == "🌤️ 早上好！今日天气预报：重庆南岸区 + 你的飞书日程"
+    assert captured["session_key"] == "cron:weather001"
+    metadata = captured["kwargs"]["metadata"]
+    assert metadata["workspace_agent_cmd"] == "weather_brief"
+    assert "3月29日那套固定版式" in metadata["workspace_agent_input"]
+    assert "📭 **飞书日历暂未接入**" in metadata["workspace_agent_input"]
 def test_gateway_sends_startup_online_notice_to_configured_target(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
@@ -1279,18 +1453,18 @@ def test_describe_runtime_provider_uses_forced_provider_name() -> None:
     assert _describe_runtime_provider(config, "minimax/MiniMax-M2.7") == "minimax"
 
 
-def test_describe_runtime_provider_uses_custom_api_base_domain() -> None:
+def test_describe_runtime_provider_uses_api_base_domain_even_for_non_custom_provider() -> None:
     config = Config.model_validate(
         {
             "agents": {
                 "defaults": {
-                    "provider": "custom",
+                    "provider": "openai",
                     "model": "gpt-5.4",
                 }
             },
             "providers": {
-                "custom": {
-                    "apiKey": "custom-key",
+                "openai": {
+                    "apiKey": "openai-key",
                     "apiBase": "https://tokenx24.com/v1",
                 }
             },
@@ -1298,6 +1472,7 @@ def test_describe_runtime_provider_uses_custom_api_base_domain() -> None:
     )
 
     assert _describe_runtime_provider(config, "gpt-5.4") == "tokenx24.com"
+
 
 
 
@@ -1470,6 +1645,10 @@ def test_gateway_skips_startup_online_notice_when_not_configured(monkeypatch, tm
 
         def stop(self) -> None:
             return None
+
+    class _FakeRuntimeChannel:
+        is_running = True
+        _client = object()
 
     class _FakeChannels:
         enabled_channels: list[str] = ["feishu"]

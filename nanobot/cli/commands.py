@@ -561,18 +561,54 @@ def _migrate_cron_store(config: "Config") -> None:
 def _describe_runtime_provider(config: Config, model: str | None = None) -> str:
     """Return a user-facing provider label for runtime status/notifications."""
     provider_name = config.get_provider_name(model) or "unknown"
-    if provider_name != "custom":
-        return provider_name
 
     api_base = (config.get_api_base(model) or "").strip()
-    if not api_base:
-        return "custom"
+    if api_base:
+        parsed = urlparse(api_base if "://" in api_base else f"https://{api_base}")
+        hostname = (parsed.hostname or "").strip().lower()
+        if hostname.startswith("www."):
+            hostname = hostname[4:]
+        if hostname:
+            return hostname
 
-    parsed = urlparse(api_base if "://" in api_base else f"https://{api_base}")
-    hostname = (parsed.hostname or "").strip().lower()
-    if hostname.startswith("www."):
-        hostname = hostname[4:]
-    return hostname or "custom"
+    return provider_name
+
+
+def _build_weather_brief_prompt(task_message: str) -> str:
+    normalized = (task_message or "").strip() or "🌤️ 早上好！今日天气预报：重庆南岸区 + 你的飞书日程"
+    return (
+        "你正在执行固定版 08:00 天气早报。\n"
+        "目标：生成一条面向用户的早报，版式强制对齐 3月29日那套固定版式；不要自由发挥成散文或口水话。\n"
+        "硬规则：\n"
+        "1. 只关注重庆南岸区天气。\n"
+        "2. 必须使用表格 + 分段标题，结构固定。\n"
+        "3. 必须包含 `### 📍 重庆南岸区天气`、`### 📅 今日日程`、`### 📌 提醒` 三段。\n"
+        "4. 今日日程段先不要调用飞书日历；直接写 `📭 **飞书日历暂未接入**`。\n"
+        "5. 不要调用飞书日历、不要搜索 workspace 里的日历脚本、不要解释限制来源。\n"
+        "6. 天气数据优先使用 Open-Meteo（重庆南岸区固定坐标可用 29.5,106.5），需要今天 current + daily forecast，并尽量补未来几天趋势。\n"
+        "7. 最终只输出发给用户的成品 Markdown，不要输出思考过程、说明、工具解释。\n\n"
+        f"触发任务: {normalized}\n\n"
+        "输出模板（按这个骨架来，内容按当天真实天气填）：\n"
+        "🌤️ **早上好！X月X日 周X**\n\n"
+        "---\n\n"
+        "### 📍 重庆南岸区天气\n\n"
+        "| 时间 | 天气 | 温度 |\n"
+        "|------|------|------|\n"
+        "| 🌅 今早 8:00 | <天气> | <温度> |\n"
+        "| ☀️ 白天 | <天气> | 最高 **<温度>** |\n"
+        "| 🌙 今晚 | <天气> | 最低 **<温度>** |\n\n"
+        "**未来几天：**\n"
+        "- 明天 (M/D): <天气> <温度> / <温度>\n"
+        "- 周X (M/D): <天气> <温度> / <温度>\n"
+        "- 周X (M/D): <天气> <温度> / <温度>\n\n"
+        "---\n\n"
+        "### 📅 今日日程\n\n"
+        "📭 **飞书日历暂未接入**\n\n"
+        "---\n\n"
+        "### 📌 提醒\n"
+        "- 根据天气趋势提炼 1-2 条真正有用的提醒\n\n"
+        "最后用一句简短收尾。"
+    )
 
 
 # ============================================================================
@@ -655,6 +691,13 @@ def gateway(
             f"Task '{job.name}' has been triggered.\n"
             f"Scheduled instruction: {job.payload.message}"
         )
+        metadata: dict[str, Any] | None = None
+        weather_task = "重庆南岸区" in (job.payload.message or "") and "天气预报" in (job.payload.message or "")
+        if weather_task:
+            metadata = {
+                "workspace_agent_cmd": "weather_brief",
+                "workspace_agent_input": _build_weather_brief_prompt(job.payload.message),
+            }
 
         cron_tool = agent.tools.get("cron")
         cron_token = None
@@ -662,10 +705,11 @@ def gateway(
             cron_token = cron_tool.set_cron_context(True)
         try:
             resp = await agent.process_direct(
-                reminder_note,
+                job.payload.message if weather_task else reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                metadata=metadata,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
