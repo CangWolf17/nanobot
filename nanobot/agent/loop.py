@@ -121,6 +121,8 @@ class AgentLoop:
 
     _TOOL_RESULT_MAX_CHARS = 16_000
     _LEGACY_RUNTIME_CONTEXT_PREFIX = "Current Time:"
+    _PRE_REPLY_CONSOLIDATION_SKIP_REASON_HARNESS_AUTO = "harness_auto_skip"
+    _PRE_REPLY_CONSOLIDATION_SKIP_REASON_UNDER_BUDGET = "under_budget_skip"
     _RUNTIME_CONTEXT_ECHO_RE = re.compile(
         rf"^{re.escape(ContextBuilder._RUNTIME_CONTEXT_TAG)}\n"
         r"(?:(?:Rules:\n(?:- [^\n]*\n)+\n))?"
@@ -1176,6 +1178,33 @@ class AgentLoop:
             logger.exception("Pre-reply consolidation failed for {}", session.key)
             return False
 
+    def _should_run_pre_reply_consolidation(
+        self,
+        session: Session,
+        *,
+        msg: InboundMessage | None = None,
+    ) -> tuple[bool, str]:
+        if not self.memory_config.enabled:
+            return False, "memory_disabled"
+        if msg is not None and bool((msg.metadata or {}).get("workspace_harness_auto")):
+            return False, self._PRE_REPLY_CONSOLIDATION_SKIP_REASON_HARNESS_AUTO
+        over_budget, _estimated, _source = self.memory_consolidator.is_over_budget(session)
+        if not over_budget:
+            return False, self._PRE_REPLY_CONSOLIDATION_SKIP_REASON_UNDER_BUDGET
+        return True, "over_budget"
+
+    async def _maybe_run_pre_reply_consolidation(
+        self,
+        session: Session,
+        *,
+        msg: InboundMessage | None = None,
+    ) -> bool:
+        should_run, reason = self._should_run_pre_reply_consolidation(session, msg=msg)
+        if not should_run:
+            logger.debug("Pre-reply consolidation skipped for {}: {}", session.key, reason)
+            return True
+        return await self._run_pre_reply_consolidation(session)
+
     async def _run_background_consolidation(self, session: Session) -> None:
         """Best-effort background consolidation with a looser timeout."""
         if not self.memory_config.enabled:
@@ -1296,7 +1325,7 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            await self._run_pre_reply_consolidation(session)
+            await self._maybe_run_pre_reply_consolidation(session, msg=msg)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), msg.metadata)
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
@@ -1345,7 +1374,7 @@ class AgentLoop:
             self._redirect_workspace_harness_if_interrupted(msg.content)
             self.sessions.save(session)
 
-        preflight_ok = await self._run_pre_reply_consolidation(session)
+        preflight_ok = await self._maybe_run_pre_reply_consolidation(session, msg=msg)
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})

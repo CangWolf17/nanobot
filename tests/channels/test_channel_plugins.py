@@ -506,6 +506,50 @@ async def test_send_with_retry_skips_send_when_streamed():
 
 
 @pytest.mark.asyncio
+async def test_send_with_retry_sends_streamed_message_when_completion_notice_requested():
+    """_streamed messages stay skippable by default, but explicit completion notices must still send."""
+    send_called = False
+
+    class _CompletionNoticeChannel(BaseChannel):
+        name = "streamed_notice"
+        display_name = "Streamed Notice"
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        async def send(self, msg: OutboundMessage) -> None:
+            nonlocal send_called
+            send_called = True
+
+        async def send_delta(self, chat_id: str, delta: str, metadata: dict | None = None) -> None:
+            pass
+
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(send_max_retries=3),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.bus = MessageBus()
+    mgr.channels = {"streamed_notice": _CompletionNoticeChannel(fake_config, mgr.bus)}
+    mgr._dispatch_task = None
+
+    msg = OutboundMessage(
+        channel="streamed_notice",
+        chat_id="123",
+        content="already streamed",
+        metadata={"_streamed": True, "_completion_notice": True, "_completion_notice_text": "✅ 回复完成"},
+    )
+    await mgr._send_with_retry(mgr.channels["streamed_notice"], msg)
+
+    assert send_called is True
+
+
+@pytest.mark.asyncio
 async def test_send_with_retry_propagates_cancelled_error():
     """_send_with_retry should re-raise CancelledError for graceful shutdown."""
     class _CancellingChannel(BaseChannel):

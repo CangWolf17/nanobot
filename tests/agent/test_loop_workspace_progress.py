@@ -825,7 +825,53 @@ def test_workspace_harness_auto_keeps_running_in_verify_phase_by_scheduling_foll
     asyncio.run(run())
 
 
-def test_workspace_harness_auto_does_not_run_multiple_iterations_inline_anymore(tmp_path: Path) -> None:
+
+
+def test_workspace_harness_auto_skips_pre_reply_consolidation(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, _bus = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="telegram",
+            sender_id="user1",
+            chat_id="chat1",
+            content="/harness auto",
+            metadata={
+                "workspace_agent_cmd": "harness",
+                "workspace_agent_input": "prepared iteration 1",
+                "workspace_harness_auto": True,
+                "workspace_runtime": {
+                    "has_active_harness": True,
+                    "active_harness": {
+                        "id": "har_0001",
+                        "status": "active",
+                        "phase": "executing",
+                        "awaiting_user": False,
+                        "blocked": False,
+                        "auto": True,
+                    },
+                },
+            },
+        )
+
+        loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
+        loop._run_agent_loop = AsyncMock(return_value=("iteration-1", [], [{"role": "assistant", "content": "iteration-1"}]))
+        loop._select_history_for_reply = MagicMock(return_value=[])
+        loop.context.build_messages = MagicMock(return_value=[])
+        loop._save_turn = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._schedule_background = lambda coro: coro.close()
+        loop.tools.get = MagicMock(return_value=None)
+
+        with patch.object(AgentLoop, "_postprocess_workspace_agent_output", return_value="iteration-1-post"):
+            result = await loop._process_message(msg)
+
+        assert result is not None
+        assert result.content == "iteration-1-post"
+        loop._run_pre_reply_consolidation.assert_not_awaited()
+
+    asyncio.run(run())
+
+
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(

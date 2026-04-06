@@ -253,6 +253,23 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
     assert order.index("consolidate") < order.index("llm")
 
 
+
+
+@pytest.mark.asyncio
+async def test_pre_reply_consolidation_skips_when_prompt_under_budget(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
+    session = loop.sessions.get_or_create("cli:test")
+
+    loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
+    loop.memory_consolidator.is_over_budget = lambda _session, max_history_messages=0: (False, 80, "test")  # type: ignore[method-assign]
+
+    result = await loop.process_direct("hello", session_key="cli:test")
+
+    assert result is not None
+    assert result.content == "ok"
+    loop._run_pre_reply_consolidation.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_pre_reply_consolidation_timeout_fail_open_still_replies(tmp_path) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)

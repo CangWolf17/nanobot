@@ -252,6 +252,10 @@ class FeishuConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"
     reply_to_message: bool = False  # If True, bot replies quote the user's original message
     streaming: bool = True
+    streaming_completion_notice_enabled: bool = False
+    streaming_completion_notice_text: str = "✅ 回复完成"
+    streaming_completion_notice_mention_user: bool = False
+    streaming_completion_notice_mention_fallback_name: str = ""
 
 
 _STREAM_ELEMENT_ID = "streaming_md"
@@ -1087,6 +1091,45 @@ class FeishuChannel(BaseChannel):
             await loop.run_in_executor(None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence)
             buf.last_edit = now
 
+    async def _send_stream_completion_notice(self, receive_id_type: str, msg: OutboundMessage) -> None:
+        notice_text = str(
+            msg.metadata.get("_completion_notice_text")
+            or self.config.streaming_completion_notice_text
+            or ""
+        ).strip()
+        mention_user_id = str(
+            msg.metadata.get("_completion_notice_mention_user_id") or ""
+        ).strip()
+        if not notice_text:
+            return
+
+        at_tag = {"tag": "at", "user_id": mention_user_id}
+        fallback_name = str(
+            getattr(self.config, "streaming_completion_notice_mention_fallback_name", "")
+            or ""
+        ).strip()
+        if fallback_name:
+            at_tag["user_name"] = fallback_name
+
+        loop = asyncio.get_running_loop()
+        if mention_user_id:
+            post_body = json.dumps(
+                {
+                    "zh_cn": {
+                        "content": [[
+                            at_tag,
+                            {"tag": "text", "text": f" {notice_text}"},
+                        ]]
+                    }
+                },
+                ensure_ascii=False,
+            )
+            await loop.run_in_executor(None, self._send_message_sync, receive_id_type, msg.chat_id, "post", post_body)
+            return
+
+        text_body = json.dumps({"text": notice_text}, ensure_ascii=False)
+        await loop.run_in_executor(None, self._send_message_sync, receive_id_type, msg.chat_id, "text", text_body)
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
         if not self._client:
@@ -1131,6 +1174,10 @@ class FeishuChannel(BaseChannel):
                         return
                     # Fall back to regular send if reply fails
                 self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
+
+            if msg.metadata.get("_completion_notice"):
+                await self._send_stream_completion_notice(receive_id_type, msg)
+                return
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
