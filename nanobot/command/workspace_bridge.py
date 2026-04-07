@@ -14,6 +14,7 @@ from pathlib import Path
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command.fastlane import build_workspace_env, try_workspace_fastlane
 from nanobot.command.router import CommandContext
+from nanobot.config.paths import get_workspace_path
 
 WORKSPACE_ROUTER = Path.home() / ".nanobot" / "workspace" / "scripts" / "router.py"
 BRIDGE_TIMEOUT_SECONDS = 25
@@ -159,7 +160,10 @@ def prepare_active_workflow_continuation(
 async def cmd_workspace_bridge(ctx: CommandContext) -> OutboundMessage | None:
     raw = (ctx.raw or "").strip()
     if not raw.startswith("/"):
-        prepare_active_workflow_continuation(ctx.msg)
+        workspace_root = None
+        if ctx.loop is not None:
+            workspace_root = get_workspace_path(getattr(ctx.loop, "workspace", None))
+        prepare_active_workflow_continuation(ctx.msg, workspace_root=workspace_root)
         return None
     if raw.lower() == "/harness" or raw.lower().startswith("/harness "):
         return None

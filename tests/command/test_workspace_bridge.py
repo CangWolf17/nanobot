@@ -451,3 +451,38 @@ def test_workspace_bridge_no_longer_marks_harness_agent_cmd_when_runtime_handler
 
     assert result is None
     assert "workspace_agent_cmd" not in ctx.msg.metadata
+
+
+def test_workspace_bridge_non_slash_continuation_uses_loop_workspace_root(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "runtime-workspace"
+    harness_root = workspace_root / "harnesses"
+    harness_root.mkdir(parents=True, exist_ok=True)
+    (harness_root / "control.json").write_text('{"active_harness_id":"har_0002"}', encoding="utf-8")
+    (harness_root / "index.json").write_text(
+        '{"harnesses":{"har_0002":{"id":"har_0002","kind":"workflow","type":"workflow","status":"awaiting_decision","phase":"awaiting_decision","active":true,"awaiting_user":true,"blocked":false,"workflow_name":"merge","return_to":"har_0001"}}}',
+        encoding="utf-8",
+    )
+    ctx = CommandContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="ou_test",
+            content="可以，合并吧",
+            metadata={},
+        ),
+        session=None,
+        key="feishu:ou_test",
+        raw="可以，合并吧",
+        args="",
+        loop=MagicMock(workspace=workspace_root),
+    )
+
+    with patch(
+        "nanobot.command.workspace_bridge._prepare_agent_input",
+        return_value="prepared merge continuation",
+    ):
+        result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is None
+    assert ctx.msg.metadata["workspace_agent_cmd"] == "merge"
+    assert ctx.msg.metadata["workspace_agent_input"] == "prepared merge continuation"

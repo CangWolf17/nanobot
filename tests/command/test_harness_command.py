@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -59,3 +60,16 @@ def test_runtime_harness_command_returns_text_response_for_status() -> None:
     assert result.content == "Active harness: har_0001"
     assert result.metadata == {"render_as": "text"}
     assert ctx.msg.metadata == {}
+
+
+def test_runtime_harness_command_accepts_uppercase_prefix_for_status(tmp_path: Path) -> None:
+    router = CommandRouter()
+    register_builtin_commands(router)
+    ctx = _make_ctx("/HARNESS status")
+
+    with patch("nanobot.command.harness.get_workspace_path", return_value=tmp_path):
+        result = asyncio.run(router.dispatch(ctx))
+
+    assert result is not None
+    assert result.content == "No active harness."
+    assert result.metadata == {"render_as": "text"}

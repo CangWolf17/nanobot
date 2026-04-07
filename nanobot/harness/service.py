@@ -45,7 +45,8 @@ class HarnessService:
         sender_id: str,
     ) -> HarnessCommandResult:
         command = (raw or "").strip()
-        if not command.startswith("/harness"):
+        command_lower = command.lower()
+        if not command_lower.startswith("/harness"):
             raise ValueError("expected a /harness command")
 
         goal = command[len("/harness") :].strip()

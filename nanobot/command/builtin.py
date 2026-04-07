@@ -26,6 +26,7 @@ def build_help_text() -> str:
         "/interrupt — Interrupt current execution and keep context",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/harness — Manage the runtime harness",
         "/help — Show available commands",
     ]
     return "\n".join(lines)

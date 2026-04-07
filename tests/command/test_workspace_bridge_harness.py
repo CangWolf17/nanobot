@@ -5,6 +5,7 @@ import asyncio
 
 from nanobot.bus.events import InboundMessage
 from nanobot.command.router import CommandContext
+from nanobot.command.builtin import build_help_text
 from nanobot.command.workspace_bridge import cmd_workspace_bridge
 
 
@@ -28,3 +29,7 @@ def test_workspace_bridge_ignores_harness_commands_for_runtime_handler(tmp_path:
 
     assert result is None
     assert ctx.msg.metadata == {}
+
+
+def test_build_help_text_includes_harness_command() -> None:
+    assert "/harness" in build_help_text()
