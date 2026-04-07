@@ -201,6 +201,22 @@ def test_store_save_writes_exact_canonical_json_shape(tmp_path: Path) -> None:
     assert payload == snapshot.to_dict()
 
 
+def test_store_save_is_atomic_and_leaves_no_temp_file(tmp_path: Path) -> None:
+    snapshot = HarnessSnapshot(
+        updated_at="2026-04-07T11:00:00",
+        active_harness_id="har_0002",
+        records={"har_0002": HarnessRecord(id="har_0002", title="Atomic save")},
+    )
+
+    store = HarnessStore.for_workspace(tmp_path)
+    store.save(snapshot)
+
+    payload = json.loads(store.store_path.read_text(encoding="utf-8"))
+
+    assert payload == snapshot.to_dict()
+    assert sorted(path.name for path in store.harnesses_dir.iterdir()) == ["store.json"]
+
+
 def test_store_does_not_read_markdown_projections_as_runtime_input(tmp_path: Path) -> None:
     _write_legacy_workspace_files(tmp_path)
     harness_dir = tmp_path / "harnesses" / "har_0001"
@@ -216,3 +232,70 @@ def test_store_does_not_read_markdown_projections_as_runtime_input(tmp_path: Pat
     assert snapshot.records["har_0001"].summary == "state summary wins"
     assert reloaded.records["har_0001"].summary == "state summary wins"
     assert reloaded.records["har_0001"].phase == "executing"
+
+
+def test_legacy_migration_uses_same_normalization_as_canonical_load(tmp_path: Path) -> None:
+    harness_dir = tmp_path / "harnesses" / "har_0001"
+    harness_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "harnesses" / "index.json").write_text(
+        json.dumps(
+            {
+                "harnesses": {
+                    "har_0001": {
+                        "id": "har_0001",
+                        "kind": "bad-kind",
+                        "type": "bad-type",
+                        "status": "bad-status",
+                        "phase": "bad-phase",
+                        "awaiting_user": "false",
+                        "blocked": "TRUE",
+                        "workflow_name": "merge",
+                    }
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "harnesses" / "control.json").write_text(
+        json.dumps(
+            {"active_harness_id": "har_0001", "updated_at": "2026-04-07T12:00:00"}, indent=2
+        ),
+        encoding="utf-8",
+    )
+    (harness_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "executor_mode": "bad-mode",
+                "auto_continue": "false",
+                "subagent_allowed": "TRUE",
+                "runner": "bad-runner",
+                "subagent_status": "bad-status",
+                "auto_state": "bad-auto",
+                "awaiting_confirmation": "false",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    store = HarnessStore.for_workspace(tmp_path)
+
+    migrated = store.load()
+    canonical = HarnessSnapshot.from_dict(json.loads(store.store_path.read_text(encoding="utf-8")))
+
+    assert migrated == canonical
+    record = migrated.records["har_0001"]
+    assert record.kind == "work"
+    assert record.type == "feature"
+    assert record.status == "active"
+    assert record.phase == "planning"
+    assert record.awaiting_user is False
+    assert record.blocked is True
+    assert record.execution_policy.executor_mode == "main"
+    assert record.execution_policy.auto_continue is False
+    assert record.execution_policy.subagent_allowed is True
+    assert record.runtime_state.runner == "main"
+    assert record.runtime_state.subagent_status == "idle"
+    assert record.runtime_state.auto_state == "idle"
+    assert record.workflow["awaiting_confirmation"] is False
