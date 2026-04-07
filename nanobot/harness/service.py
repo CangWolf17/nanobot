@@ -84,6 +84,7 @@ class HarnessService:
     ) -> WorkflowStartResult:
         snapshot = self.store.load()
         definition = get_workflow_definition(workflow_name)
+        prior_active_id = snapshot.active_harness_id
         record = snapshot.records.get(definition.stable_harness_id)
         if record is None:
             record = self._create_workflow_harness(snapshot, definition)
@@ -95,10 +96,14 @@ class HarnessService:
         record.phase = "planning"
         record.updated_at = timestamp()
         record.workflow["name"] = definition.name
-        memory = dict(record.workflow.get("memory") or {})
+        memory: dict[str, str] = {}
         if requested_goal_after_cleanup:
             memory["requested_goal_after_cleanup"] = requested_goal_after_cleanup
         record.workflow["memory"] = memory
+        record.workflow["return_to"] = self._workflow_return_target(
+            prior_active_id=prior_active_id,
+            workflow_id=record.id,
+        )
         snapshot.active_harness_id = record.id
         self._save_snapshot(snapshot)
 
@@ -274,3 +279,8 @@ class HarnessService:
     def _save_snapshot(self, snapshot: HarnessSnapshot) -> None:
         snapshot.updated_at = timestamp()
         self.store.save(snapshot)
+
+    def _workflow_return_target(self, *, prior_active_id: str, workflow_id: str) -> str:
+        if not prior_active_id or prior_active_id == workflow_id:
+            return ""
+        return prior_active_id

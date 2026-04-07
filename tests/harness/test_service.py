@@ -54,6 +54,37 @@ def test_service_start_workflow_stores_requested_goal_and_sets_active_harness(
     assert record.kind == "workflow"
     assert record.workflow["name"] == "cleanup"
     assert record.workflow["memory"]["requested_goal_after_cleanup"] == "resume original goal"
+    assert record.workflow["return_to"] == ""
+
+
+def test_service_start_workflow_reuse_refreshes_goal_memory_and_return_to(tmp_path: Path) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    work_result = service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    first = service.start_workflow(
+        "cleanup",
+        origin_command="/harness cleanup",
+        requested_goal_after_cleanup="first goal",
+    )
+
+    snapshot = service.store.load()
+    snapshot.active_harness_id = work_result.active_harness_id
+    service.store.save(snapshot)
+
+    second = service.start_workflow("cleanup", origin_command="/harness cleanup")
+
+    reused_snapshot = service.store.load()
+    record = reused_snapshot.records[second.workflow_id]
+
+    assert first.workflow_id == "har_cleanup"
+    assert second.workflow_id == "har_cleanup"
+    assert second.created_copy is False
+    assert record.workflow["memory"] == {}
+    assert record.workflow["return_to"] == work_result.active_harness_id
 
 
 def test_service_renderers_use_canonical_store_views(tmp_path: Path) -> None:
