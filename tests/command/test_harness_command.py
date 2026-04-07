@@ -1,10 +1,15 @@
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from nanobot.bus.events import InboundMessage
-from nanobot.command.builtin import cmd_help, register_builtin_commands
+from nanobot.command.builtin import (
+    _read_workspace_harness_status_summary,
+    _sync_workspace_interrupt_harness,
+    cmd_help,
+    register_builtin_commands,
+)
 from nanobot.command.router import CommandContext, CommandRouter
 
 
@@ -99,3 +104,65 @@ def test_runtime_help_includes_harness_even_when_workspace_help_exists(tmp_path:
     assert "/plan -- Workspace planner help" in result.content
     assert "/harness" in result.content
     assert result.metadata == {"render_as": "text"}
+
+
+def test_runtime_help_uses_loop_workspace_root_and_still_includes_harness(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "runtime-workspace"
+    router_path = workspace_root / "scripts" / "router.py"
+    router_path.parent.mkdir(parents=True, exist_ok=True)
+    router_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    loop = MagicMock(workspace=workspace_root)
+    msg = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/help")
+    ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/help", loop=loop)
+
+    with patch(
+        "nanobot.command.builtin.subprocess.run",
+        return_value=SimpleNamespace(
+            stdout="/plan -- Workspace planner help\n/help -- Workspace help\n",
+            stderr="",
+        ),
+    ) as mock_run:
+        result = asyncio.run(cmd_help(ctx))
+
+    assert result is not None
+    assert "/harness" in result.content
+    assert mock_run.call_args.args[0] == [str(router_path)]
+
+
+def test_status_summary_helper_reads_from_explicit_workspace_root(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "runtime-workspace"
+    task_path = workspace_root / "TASK.md"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    task_path.write_text(
+        "- status: interrupted\n- phase: planning\n- summary: waiting for redirect\n",
+        encoding="utf-8",
+    )
+
+    result = asyncio.run(_read_workspace_harness_status_summary(workspace_root=workspace_root))
+
+    assert result == "interrupted / planning — waiting for redirect"
+
+
+def test_interrupt_sync_helper_uses_explicit_workspace_root(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "runtime-workspace"
+    router_path = workspace_root / "scripts" / "router.py"
+    python_path = workspace_root / "venv" / "bin" / "python"
+    router_path.parent.mkdir(parents=True, exist_ok=True)
+    python_path.parent.mkdir(parents=True, exist_ok=True)
+    router_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    python_path.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    with patch("nanobot.command.builtin.subprocess.run") as mock_run:
+        asyncio.run(
+            _sync_workspace_interrupt_harness(
+                "interrupted — waiting for redirect",
+                workspace_root=workspace_root,
+            )
+        )
+
+    assert mock_run.call_args.args[0] == [
+        str(python_path),
+        str(router_path),
+        "--interrupt-harness",
+        "interrupted — waiting for redirect",
+    ]

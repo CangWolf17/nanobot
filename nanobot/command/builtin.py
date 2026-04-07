@@ -14,6 +14,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.command.harness import cmd_harness
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.command.workspace_bridge import cmd_workspace_bridge
+from nanobot.config.paths import get_workspace_path
 from nanobot.utils.helpers import build_status_content
 
 
@@ -42,6 +43,11 @@ def _merge_runtime_help_text(workspace_help: str) -> str:
     return f"{text}\n/harness — Manage the runtime harness"
 
 
+def _resolve_workspace_root(loop: object | None = None) -> Path:
+    """Resolve the runtime workspace root, preferring loop configuration."""
+    return get_workspace_path(getattr(loop, "workspace", None) if loop is not None else None)
+
+
 async def _cancel_session_work(ctx: CommandContext) -> tuple[int, int, int]:
     """Cancel active loop tasks and subagents for the current session."""
     loop = ctx.loop
@@ -58,8 +64,12 @@ async def _cancel_session_work(ctx: CommandContext) -> tuple[int, int, int]:
     return cancelled, sub_cancelled, total
 
 
-async def _sync_workspace_interrupt_harness(summary: str) -> None:
-    workspace_root = Path.home() / ".nanobot" / "workspace"
+async def _sync_workspace_interrupt_harness(
+    summary: str,
+    *,
+    workspace_root: Path | None = None,
+) -> None:
+    workspace_root = workspace_root or _resolve_workspace_root()
     router_path = workspace_root / "scripts" / "router.py"
     python_path = workspace_root / "venv" / "bin" / "python"
     if not router_path.exists() or not python_path.exists():
@@ -76,8 +86,11 @@ async def _sync_workspace_interrupt_harness(summary: str) -> None:
         return
 
 
-async def _read_workspace_harness_status_summary() -> str | None:
-    workspace_root = Path.home() / ".nanobot" / "workspace"
+async def _read_workspace_harness_status_summary(
+    *,
+    workspace_root: Path | None = None,
+) -> str | None:
+    workspace_root = workspace_root or _resolve_workspace_root()
     task_path = workspace_root / "TASK.md"
     if not task_path.exists():
         return None
@@ -134,7 +147,10 @@ async def cmd_interrupt(ctx: CommandContext) -> OutboundMessage:
         if hasattr(loop, "persist_interrupted_turn"):
             preserved = loop.persist_interrupted_turn(session, msg.session_key)
         summary = "interrupted — waiting for redirect"
-        await _sync_workspace_interrupt_harness(summary)
+        await _sync_workspace_interrupt_harness(
+            summary,
+            workspace_root=_resolve_workspace_root(loop),
+        )
         interrupt_state = {
             "status": "interrupted",
             "reason": "user_interrupt",
@@ -184,7 +200,9 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         ctx_est = loop._last_usage.get("prompt_tokens", 0)
     interrupt_state = session.metadata.get("interrupt_state") or {}
     interrupt_summary = str(interrupt_state.get("summary") or "").strip() or None
-    harness_summary = await _read_workspace_harness_status_summary()
+    harness_summary = await _read_workspace_harness_status_summary(
+        workspace_root=_resolve_workspace_root(loop)
+    )
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
@@ -223,7 +241,7 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
 
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Return available slash commands, preferring workspace help when available."""
-    router_path = Path.home() / ".nanobot" / "workspace" / "scripts" / "router.py"
+    router_path = _resolve_workspace_root(ctx.loop) / "scripts" / "router.py"
     if router_path.exists():
         try:
             result = subprocess.run(
