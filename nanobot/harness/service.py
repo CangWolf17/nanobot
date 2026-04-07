@@ -57,7 +57,7 @@ class HarnessService:
 
         snapshot = self.store.load()
         active_record = self._get_active_record(snapshot)
-        if active_record is None:
+        if active_record is None or (goal and active_record.kind == "workflow"):
             if not goal:
                 raise ValueError("/harness requires a goal when no active harness exists")
             active_record = self._create_work_harness(snapshot, goal)
@@ -254,6 +254,7 @@ class HarnessService:
     def _workflow_lines(self, record: HarnessRecord) -> list[str]:
         return [
             f"- workflow_name: {record.workflow.get('name', '')}",
+            f"- return_to: {record.workflow.get('return_to', '')}",
             f"- memory: {record.workflow.get('memory', {})}",
         ]
 
