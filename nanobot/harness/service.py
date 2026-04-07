@@ -11,9 +11,11 @@ from nanobot.utils.helpers import timestamp
 
 @dataclass(frozen=True)
 class HarnessCommandResult:
-    agent_cmd: str
-    active_harness_id: str
-    prepared_input: str
+    response_mode: str
+    agent_cmd: str = "harness"
+    active_harness_id: str = ""
+    prepared_input: str = ""
+    text: str = ""
 
 
 @dataclass(frozen=True)
@@ -47,9 +49,16 @@ class HarnessService:
             raise ValueError("expected a /harness command")
 
         goal = command[len("/harness") :].strip()
+        if goal.lower() == "status":
+            return HarnessCommandResult(response_mode="text", text=self.render_status())
+        if goal.lower() == "list":
+            return HarnessCommandResult(response_mode="text", text=self.render_list())
+        if goal.lower() == "workflows":
+            return HarnessCommandResult(response_mode="text", text=self.render_workflows())
         if goal.lower() == "cleanup":
             workflow = self.start_workflow("cleanup", origin_command=command)
             return HarnessCommandResult(
+                response_mode="agent",
                 agent_cmd="harness",
                 active_harness_id=workflow.workflow_id,
                 prepared_input=workflow.prepared_input,
@@ -70,6 +79,7 @@ class HarnessService:
             sender_id=sender_id,
         )
         return HarnessCommandResult(
+            response_mode="agent",
             agent_cmd="harness",
             active_harness_id=active_record.id,
             prepared_input=prepared_input,

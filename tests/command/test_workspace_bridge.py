@@ -43,14 +43,12 @@ def test_workspace_bridge_returns_fastlane_help_without_router_fallback(tmp_path
     mock_bridge_run.assert_not_called()
 
 
-
-
-def test_workspace_bridge_prepares_active_merge_workflow_continuation_for_non_slash_message(tmp_path: Path) -> None:
+def test_workspace_bridge_prepares_active_merge_workflow_continuation_for_non_slash_message(
+    tmp_path: Path,
+) -> None:
     harness_root = tmp_path / "harnesses"
     harness_root.mkdir(parents=True, exist_ok=True)
-    (harness_root / "control.json").write_text(
-        '{"active_harness_id":"har_0002"}', encoding="utf-8"
-    )
+    (harness_root / "control.json").write_text('{"active_harness_id":"har_0002"}', encoding="utf-8")
     (harness_root / "index.json").write_text(
         '{"harnesses":{"har_0002":{"id":"har_0002","kind":"workflow","type":"workflow","status":"awaiting_decision","phase":"awaiting_decision","active":true,"awaiting_user":true,"blocked":false,"workflow_name":"merge","return_to":"har_0001"}}}',
         encoding="utf-8",
@@ -431,3 +429,25 @@ def test_workspace_bridge_returns_exception_message_instead_of_raising(tmp_path:
     assert result is not None
     assert "workspace-router error" in result.content
     assert "router boom" in result.content
+
+
+def test_workspace_bridge_no_longer_marks_harness_agent_cmd_when_runtime_handler_exists() -> None:
+    ctx = CommandContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="ou_test",
+            content="/harness auto",
+            metadata={},
+        ),
+        session=None,
+        key="feishu:ou_test",
+        raw="/harness auto",
+        args="auto",
+        loop=None,
+    )
+
+    result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is None
+    assert "workspace_agent_cmd" not in ctx.msg.metadata

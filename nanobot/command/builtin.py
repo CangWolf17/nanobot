@@ -11,6 +11,7 @@ from time import time
 
 from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
+from nanobot.command.harness import cmd_harness
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.command.workspace_bridge import cmd_workspace_bridge
 from nanobot.utils.helpers import build_status_content
@@ -247,7 +248,9 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/interrupt", cmd_interrupt)
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
+    router.exact("/harness", cmd_harness)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
     router.exact("/help", cmd_help)
+    router.prefix("/harness ", cmd_harness)
     router.intercept(cmd_workspace_bridge)

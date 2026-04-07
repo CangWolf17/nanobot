@@ -17,7 +17,7 @@ from nanobot.command.router import CommandContext
 
 WORKSPACE_ROUTER = Path.home() / ".nanobot" / "workspace" / "scripts" / "router.py"
 BRIDGE_TIMEOUT_SECONDS = 25
-PREPARED_INPUT_CMDS = {"小结", "simplify", "笔记", "merge", "harness"}
+PREPARED_INPUT_CMDS = {"小结", "simplify", "笔记", "merge"}
 POSTPROCESSABLE_AGENT_CMDS = {
     "plan",
     "plan-exec",
@@ -29,7 +29,6 @@ POSTPROCESSABLE_AGENT_CMDS = {
     "小结",
     "感悟",
     "笔记",
-    "harness",
 }
 
 
@@ -104,7 +103,8 @@ def prepare_active_workflow_continuation(
                             if (
                                 isinstance(notes_state, dict)
                                 and str(notes_state.get("mode") or "").strip() == "notes"
-                                and str(notes_state.get("phase") or "").strip() == "awaiting_confirmation"
+                                and str(notes_state.get("phase") or "").strip()
+                                == "awaiting_confirmation"
                             ):
                                 env = build_workspace_env(msg)
                                 prepared = _prepare_agent_input("笔记", raw, env)
@@ -160,6 +160,8 @@ async def cmd_workspace_bridge(ctx: CommandContext) -> OutboundMessage | None:
     raw = (ctx.raw or "").strip()
     if not raw.startswith("/"):
         prepare_active_workflow_continuation(ctx.msg)
+        return None
+    if raw.lower() == "/harness" or raw.lower().startswith("/harness "):
         return None
     if not WORKSPACE_ROUTER.exists():
         return None
@@ -221,8 +223,6 @@ async def cmd_workspace_bridge(ctx: CommandContext) -> OutboundMessage | None:
                 ctx.msg.metadata["workspace_work_mode"] = (
                     "build" if agent_cmd == "plan-exec" else "plan"
                 )
-            if agent_cmd == "harness" and raw.strip().lower() == "/harness auto":
-                ctx.msg.metadata["workspace_harness_auto"] = True
             prepared = _prepare_agent_input(agent_cmd, raw, env)
             if prepared:
                 ctx.msg.metadata["workspace_agent_input"] = prepared

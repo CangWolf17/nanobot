@@ -14,20 +14,17 @@ def _make_ctx(raw: str):
     return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=loop)
 
 
-def test_workspace_bridge_marks_harness_auto_flag_for_harness_auto_command(tmp_path: Path) -> None:
-    completed = MagicMock(stdout="[AGENT]harness\n", stderr="", returncode=0)
-
+def test_workspace_bridge_ignores_harness_commands_for_runtime_handler(tmp_path: Path) -> None:
     with (
         patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
-        patch("nanobot.command.workspace_bridge.try_workspace_fastlane", return_value=None),
-        patch("nanobot.command.workspace_bridge.subprocess.run", side_effect=[completed, MagicMock(stdout="prepared harness input", stderr="", returncode=0)]),
+        patch(
+            "nanobot.command.workspace_bridge.subprocess.run",
+            side_effect=AssertionError("workspace subprocess should not run for /harness"),
+        ),
     ):
         (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
         ctx = _make_ctx("/harness auto")
         result = asyncio.run(cmd_workspace_bridge(ctx))
 
     assert result is None
-    assert ctx.msg.metadata["workspace_agent_cmd"] == "harness"
-    assert ctx.msg.metadata["workspace_agent_input"] == "prepared harness input"
-    assert ctx.msg.metadata["workspace_harness_auto"] is True
-
+    assert ctx.msg.metadata == {}
