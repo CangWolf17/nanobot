@@ -13,6 +13,7 @@ class SpawnTool(Tool):
 
     _PASSTHROUGH_META_KEYS = {
         "workspace_agent_cmd",
+        "workspace_harness_id",
         "workspace_harness_auto",
         "workspace_work_mode",
         "_origin_sender_id",
@@ -26,7 +27,9 @@ class SpawnTool(Tool):
         self._session_key = "cli:direct"
         self._metadata: dict[str, Any] = {}
 
-    def set_context(self, channel: str, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
+    def set_context(
+        self, channel: str, chat_id: str, metadata: dict[str, Any] | None = None
+    ) -> None:
         """Set the origin context for subagent announcements."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
@@ -80,12 +83,23 @@ class SpawnTool(Tool):
             "required": ["task"],
         }
 
-    async def execute(self, task: str, label: str | None = None, tier: str | None = None, model: str | None = None, **kwargs: Any) -> str:
+    async def execute(
+        self,
+        task: str,
+        label: str | None = None,
+        tier: str | None = None,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> str:
         """Spawn a subagent to execute the given task."""
         runtime_meta = self._metadata.get("workspace_runtime")
-        if self._metadata.get("workspace_agent_cmd") == "harness" and isinstance(runtime_meta, dict):
+        if self._metadata.get("workspace_agent_cmd") == "harness" and isinstance(
+            runtime_meta, dict
+        ):
             active_harness = runtime_meta.get("active_harness")
-            if isinstance(active_harness, dict) and not bool(active_harness.get("subagent_allowed", False)):
+            if isinstance(active_harness, dict) and not bool(
+                active_harness.get("subagent_allowed", False)
+            ):
                 return (
                     "Error: spawn blocked by harness policy "
                     "(subagent_allowed=false for active harness)."

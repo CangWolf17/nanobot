@@ -147,6 +147,34 @@ def test_harness_auto_continue_decision_comes_from_service_not_workspace_project
     assert decision.reason in {"continue", "awaiting_user", "blocked", "completed"}
 
 
+def test_auto_continue_decision_falls_back_to_session_bound_harness(tmp_path: Path) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    first = service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    snapshot = service.store.load()
+    snapshot.active_harness_id = ""
+    service.store.save(snapshot)
+    second = service.handle_command(
+        "/harness 修复 delayed apply 目标绑定",
+        session_key="feishu:c2",
+        sender_id="u2",
+    )
+
+    snapshot = service.store.load()
+    snapshot.records[second.active_harness_id].blocked = True
+    snapshot.active_harness_id = second.active_harness_id
+    service.store.save(snapshot)
+
+    decision = service.decide_auto_continue(session_key="feishu:c1", sender_id="u1")
+
+    assert decision.should_fire is True
+    assert decision.reason == "continue"
+
+
 def test_interrupt_updates_harness_state_without_workspace_router_subprocess(
     tmp_path: Path,
 ) -> None:
@@ -162,6 +190,57 @@ def test_interrupt_updates_harness_state_without_workspace_router_subprocess(
     status = service.render_status()
 
     assert "interrupted" in status.lower()
+
+
+def test_redirect_after_interrupt_resumes_active_harness_from_service(tmp_path: Path) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    service.interrupt_active("interrupted — waiting for redirect")
+
+    redirected = service.redirect_after_interrupt("继续处理 redirect 接线")
+    status = service.render_status().lower()
+
+    assert redirected is True
+    assert "active" in status
+    assert "planning" in status
+
+
+def test_redirect_after_interrupt_falls_back_to_session_bound_harness(tmp_path: Path) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    first = service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    snapshot = service.store.load()
+    snapshot.active_harness_id = ""
+    service.store.save(snapshot)
+    second = service.handle_command(
+        "/harness 修复 delayed apply 目标绑定",
+        session_key="feishu:c2",
+        sender_id="u2",
+    )
+
+    service.interrupt_active("interrupted — waiting for redirect", session_key="feishu:c1")
+
+    snapshot = service.store.load()
+    snapshot.records[second.active_harness_id].status = "interrupted"
+    snapshot.records[second.active_harness_id].phase = "interrupted"
+    snapshot.active_harness_id = second.active_harness_id
+    service.store.save(snapshot)
+
+    redirected = service.redirect_after_interrupt("继续处理 redirect 接线", session_key="feishu:c1")
+    refreshed = service.store.load()
+
+    assert redirected is True
+    assert refreshed.records[first.active_harness_id].status == "active"
+    assert refreshed.records[second.active_harness_id].status == "interrupted"
 
 
 def test_structured_harness_apply_updates_store_and_generates_closeout(tmp_path: Path) -> None:
@@ -180,3 +259,73 @@ def test_structured_harness_apply_updates_store_and_generates_closeout(tmp_path:
 
     assert result.closeout_required is True
     assert "focused tests passed" in result.closeout_summary
+
+
+def test_structured_harness_apply_targets_bound_harness_not_current_active(tmp_path: Path) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    first = service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    snapshot = service.store.load()
+    snapshot.active_harness_id = ""
+    service.store.save(snapshot)
+    second = service.handle_command(
+        "/harness 修复 delayed apply 目标绑定",
+        session_key="feishu:c2",
+        sender_id="u2",
+    )
+
+    snapshot = service.store.load()
+    snapshot.active_harness_id = second.active_harness_id
+    service.store.save(snapshot)
+
+    update = """```json
+    {"harness": {"status": "completed", "phase": "completed", "summary": "done", "verification_status": "passed", "verification_summary": "focused tests passed", "git_delivery_status": "no_commit_required", "git_delivery_summary": "analysis-only"}}
+    ```"""
+
+    service.apply_agent_update(
+        update,
+        session_key="feishu:c1",
+        harness_id=first.active_harness_id,
+    )
+
+    refreshed = service.store.load()
+
+    assert refreshed.records[first.active_harness_id].status == "completed"
+    assert refreshed.records[second.active_harness_id].status == "active"
+
+
+def test_structured_harness_apply_falls_back_to_session_bound_harness(tmp_path: Path) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    first = service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    snapshot = service.store.load()
+    snapshot.active_harness_id = ""
+    service.store.save(snapshot)
+    second = service.handle_command(
+        "/harness 修复 delayed apply 目标绑定",
+        session_key="feishu:c2",
+        sender_id="u2",
+    )
+
+    snapshot = service.store.load()
+    snapshot.active_harness_id = second.active_harness_id
+    service.store.save(snapshot)
+
+    update = """```json
+    {"harness": {"status": "completed", "phase": "completed", "summary": "done", "verification_status": "passed", "verification_summary": "focused tests passed", "git_delivery_status": "no_commit_required", "git_delivery_summary": "analysis-only"}}
+    ```"""
+
+    service.apply_agent_update(update, session_key="feishu:c1")
+
+    refreshed = service.store.load()
+
+    assert refreshed.records[first.active_harness_id].status == "completed"
+    assert refreshed.records[second.active_harness_id].status == "active"

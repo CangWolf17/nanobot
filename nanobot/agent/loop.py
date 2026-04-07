@@ -142,9 +142,19 @@ class AgentLoop:
     _STREAM_COMPLETION_NOTICE_MIN_CHARS = 600
     _STREAM_COMPLETION_NOTICE_MIN_CHUNKS = 12
 
-    def _redirect_workspace_harness_if_interrupted(self, user_input: str) -> None:
+    def _redirect_workspace_harness_if_interrupted(
+        self,
+        user_input: str,
+        *,
+        interrupt_state: dict[str, Any] | None = None,
+    ) -> None:
+        state = interrupt_state or {}
         try:
-            HarnessService.for_workspace(self.workspace).redirect_active(user_input)
+            HarnessService.for_workspace(self.workspace).redirect_after_interrupt(
+                user_input,
+                session_key=str(state.get("session_key") or "").strip(),
+                harness_id=str(state.get("workspace_harness_id") or "").strip(),
+            )
         except Exception:
             return
 
@@ -167,7 +177,9 @@ class AgentLoop:
 
         try:
             service_meta = HarnessService.for_workspace(self.workspace).runtime_metadata(
-                requested_auto=bool(meta.get("workspace_harness_auto"))
+                requested_auto=bool(meta.get("workspace_harness_auto")),
+                session_key=msg.session_key,
+                harness_id=str(meta.get("workspace_harness_id") or "").strip(),
             )
         except Exception:
             service_meta = {"has_active_harness": False}
@@ -201,99 +213,29 @@ class AgentLoop:
 
         service = HarnessService.for_workspace(self.workspace)
         try:
-            service_meta = service.runtime_metadata(requested_auto=True)
-        except Exception:
-            service_meta = {"has_active_harness": False}
-        if bool(service_meta.get("has_active_harness")):
             service_decision = service.decide_auto_continue(
                 session_key=msg.session_key,
                 sender_id=msg.sender_id,
                 origin_sender_id=origin_sender_id,
+                harness_id=str(meta.get("workspace_harness_id") or "").strip(),
             )
-            decision["should_fire"] = service_decision.should_fire
-            decision["reason"] = service_decision.reason
-            decision["origin_sender_id"] = service_decision.origin_sender_id
-            return decision
-
-        runtime_meta = self._extract_runtime_metadata(msg)
-        active_harness = (
-            runtime_meta.get("active_harness") if isinstance(runtime_meta, dict) else None
-        )
-        if not isinstance(active_harness, dict):
+        except Exception:
             decision["reason"] = "no_active_harness"
             return decision
-        if not bool(runtime_meta.get("has_active_harness")):
-            decision["reason"] = "no_active_harness"
-            return decision
-
-        main_harness = runtime_meta.get("main_harness") if isinstance(runtime_meta, dict) else None
-        stop_gate_child = (
-            runtime_meta.get("stop_gate_child") if isinstance(runtime_meta, dict) else None
-        )
-        next_runnable_child = (
-            runtime_meta.get("next_runnable_child") if isinstance(runtime_meta, dict) else None
-        )
-        main_target = main_harness if isinstance(main_harness, dict) else active_harness
-
-        if isinstance(stop_gate_child, dict):
-            if bool(stop_gate_child.get("awaiting_user")):
-                decision["reason"] = "awaiting_user"
-                return decision
-            if bool(stop_gate_child.get("blocked")):
-                decision["reason"] = "blocked"
-                return decision
-            stop_status = str(stop_gate_child.get("status") or "").strip().lower()
-            if stop_status in {"awaiting_decision", "failed", "interrupted"}:
-                decision["reason"] = stop_status
-                return decision
-
-        if bool(main_target.get("awaiting_user")):
-            decision["reason"] = "awaiting_user"
-            return decision
-        if bool(main_target.get("blocked")):
-            decision["reason"] = "blocked"
-            return decision
-        if not bool(main_target.get("auto") or active_harness.get("auto")):
-            decision["reason"] = "durable_auto_disabled"
-            return decision
-
-        main_status = str(main_target.get("status") or "").strip().lower()
-        has_open_children = bool(main_target.get("has_open_children"))
-        if main_status == "completed" and not (
-            has_open_children and isinstance(next_runnable_child, dict)
-        ):
-            decision["reason"] = "completed"
-            return decision
-
-        if isinstance(next_runnable_child, dict):
-            child_status = str(next_runnable_child.get("status") or "").strip().lower()
-            if child_status in {"planning", "active"}:
-                decision["should_fire"] = True
-                decision["reason"] = "continue"
-                return decision
-
-        status = str(active_harness.get("status") or "").strip().lower()
-        if status == "completed":
-            decision["reason"] = "completed"
-            return decision
-        if bool(active_harness.get("awaiting_user")):
-            decision["reason"] = "awaiting_user"
-            return decision
-        if bool(active_harness.get("blocked")):
-            decision["reason"] = "blocked"
-            return decision
-
-        decision["should_fire"] = True
-        decision["reason"] = "continue"
+        decision["should_fire"] = service_decision.should_fire
+        decision["reason"] = service_decision.reason
+        decision["origin_sender_id"] = service_decision.origin_sender_id
         return decision
 
     def _should_schedule_harness_auto_continue(self, msg: InboundMessage) -> bool:
         return bool(self._decide_harness_auto_reentry(msg).get("should_fire"))
 
     async def _schedule_harness_auto_continue(self, msg: InboundMessage) -> None:
-        meta = dict(msg.metadata or {})
-        origin_sender_id = str(meta.get("_origin_sender_id") or msg.sender_id or "").strip()
         service = HarnessService.for_workspace(self.workspace)
+        decision = self._decide_harness_auto_reentry(msg)
+        if not bool(decision.get("should_fire")):
+            return
+        meta = dict(msg.metadata or {})
         follow_up = InboundMessage(
             channel=msg.channel,
             sender_id="system",
@@ -301,7 +243,11 @@ class AgentLoop:
             content=msg.content,
             metadata=service.build_auto_continue_metadata(
                 meta,
-                origin_sender_id=origin_sender_id,
+                origin_sender_id=str(
+                    decision.get("origin_sender_id") or msg.sender_id or ""
+                ).strip(),
+                session_key=msg.session_key,
+                harness_id=str(meta.get("workspace_harness_id") or "").strip(),
             ),
             session_key_override=msg.session_key,
         )
@@ -1298,8 +1244,11 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        if session.metadata.pop("interrupt_state", None) is not None:
-            self._redirect_workspace_harness_if_interrupted(msg.content)
+        if (interrupt_state := session.metadata.pop("interrupt_state", None)) is not None:
+            self._redirect_workspace_harness_if_interrupted(
+                msg.content,
+                interrupt_state=interrupt_state if isinstance(interrupt_state, dict) else None,
+            )
             self.sessions.save(session)
 
         preflight_ok = await self._maybe_run_pre_reply_consolidation(session, msg=msg)
@@ -1457,6 +1406,7 @@ class AgentLoop:
             result = HarnessService.for_workspace(self.workspace).apply_agent_update(
                 final_content,
                 session_key=msg.session_key,
+                harness_id=str((msg.metadata or {}).get("workspace_harness_id") or "").strip(),
             )
             return result.final_content
 

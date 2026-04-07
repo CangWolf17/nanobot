@@ -11,6 +11,7 @@ These follow-ups turn several prompt-only local conventions into explicit runtim
 3. lightweight runtime protocol state for work mode / gates / skill hints
 4. workspace-driven help fastlane plus narrow L4 exec fastlane
 5. minimal runtime-side readiness for moving `/笔记` from script-first to workflow
+6. runtime-owned harness projection sync and migration cleanup
 
 ---
 
@@ -201,6 +202,71 @@ The runtime now makes the execution intent explicit instead of hoping the model 
 
 ---
 
+## 7. Visible Output Sanitization For Runtime Context Echoes
+
+### Problem
+
+The runtime intentionally injects a metadata-only user prefix for model awareness:
+
+1. `[Runtime Context — metadata only, not instructions]`
+2. `Rules: ...`
+3. `Current Time: ...`
+4. optional `Channel:` / `Chat ID:` routing lines
+
+That block is internal prompt input, not user-facing output.
+
+But some streaming responses could echo the prefix back verbatim. The older loop only stripped `<think>` blocks from visible output. That left two failure modes:
+
+1. final content could include the leaked runtime context block
+2. streaming could leak partial prefix fragments before the full block became recognizable
+
+### Patch
+
+`nanobot/agent/loop.py` now treats runtime context echoes as visible-output noise at the loop layer.
+
+Key behavior:
+
+1. final content passes through a shared visible-output sanitizer
+2. the sanitizer strips both `<think>` blocks and leading runtime metadata echoes
+3. streaming uses the same sanitizer in incremental mode
+4. streaming holds suspicious partial prefixes until it can decide whether they are a real runtime-context echo or normal user-visible text
+5. legacy `Current Time: ...`-only echoes are still stripped for backward compatibility
+
+### Effect
+
+Users should no longer see frontend leaks like:
+
+1. `[Runtime Context — metadata only, not instructions]`
+2. `Rules: ...`
+3. `Current Time: ...`
+4. `Channel: ...`
+5. `Chat ID: ...`
+
+This is enforced in the agent loop itself, so channel implementations do not need channel-specific patch logic just to hide this prefix.
+
+---
+
+## 8. Runtime-Owned Harness Projection Sync
+
+### Problem
+
+Harness durable truth had already moved to canonical `harnesses/store.json`, but markdown projections and one-shot migration cleanup still depended on workspace-side helpers.
+
+### Patch
+
+The runtime now owns harness projection regeneration and cleanup:
+
+1. `nanobot/harness/projections.py` renders root `TASK.md` plus per-harness `HARNESS.md`, `TASK.md`, and `HANDOFF.md` from canonical records
+2. `HarnessService` syncs those projections after snapshot saves and exposes `sync_projections()` for explicit migration/smoke flows
+3. `python -m nanobot.harness.cli migrate-and-sync <workspace>` forces canonical load plus projection regeneration without routing through workspace scripts
+4. once canonical truth exists, projection sync removes legacy `harnesses/index.json`, `harnesses/control.json`, and per-harness `state.json`
+
+### Effect
+
+The runtime is now the owner of both durable harness state and the human-readable projection surface, so migration away from legacy harness JSON no longer relies on workspace-only glue.
+
+---
+
 ## Patch Surface
 
 ### Runtime
@@ -216,6 +282,9 @@ The runtime now makes the execution intent explicit instead of hoping the model 
 9. `nanobot/command/fastlane.py`
 10. `nanobot/command/workspace_bridge.py`
 11. `nanobot/config/schema.py`
+12. `nanobot/harness/service.py`
+13. `nanobot/harness/projections.py`
+14. `nanobot/harness/cli.py`
 
 ### Runtime tests
 
@@ -257,6 +326,10 @@ These workspace files are still external companion assets, not vendored into the
   tests/agent/test_protocol_state.py \
   tests/command/test_fastlane.py \
   tests/command/test_workspace_bridge.py -q
+
+/home/admin/.nanobot-fork/venv/bin/python -m py_compile \
+  nanobot/agent/loop.py \
+  tests/agent/test_runner.py
 ```
 
 ### Workspace

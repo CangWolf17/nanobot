@@ -153,6 +153,7 @@ class HarnessRuntimeState:
     subagent_last_summary: str = ""
     auto_state: Literal["idle", "queued", "running", "stopped"] = "idle"
     continuation_token: str = ""
+    session_key: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "HarnessRuntimeState":
@@ -165,6 +166,7 @@ class HarnessRuntimeState:
             subagent_last_summary=_string_value(payload.get("subagent_last_summary")),
             auto_state=_enum_value(payload.get("auto_state"), _AUTO_STATES, "idle"),
             continuation_token=_string_value(payload.get("continuation_token")),
+            session_key=_string_value(payload.get("session_key")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -176,6 +178,7 @@ class HarnessRuntimeState:
             "subagent_last_summary": self.subagent_last_summary,
             "auto_state": self.auto_state,
             "continuation_token": self.continuation_token,
+            "session_key": self.session_key,
         }
 
 

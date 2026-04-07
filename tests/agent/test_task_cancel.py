@@ -141,8 +141,7 @@ class TestHandleStop:
         ctx = CommandContext(
             msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop
         )
-        with patch("nanobot.command.builtin._sync_workspace_interrupt_harness", new=AsyncMock()):
-            out = await cmd_interrupt(ctx)
+        out = await cmd_interrupt(ctx)
 
         assert cancelled.is_set()
         assert "interrupted" in out.content.lower()
@@ -193,8 +192,7 @@ class TestHandleStop:
             raw="/interrupt",
             loop=loop,
         )
-        with patch("nanobot.command.builtin._sync_workspace_interrupt_harness", new=AsyncMock()):
-            await cmd_interrupt(interrupt_ctx)
+        await cmd_interrupt(interrupt_ctx)
 
         captured = {}
         loop._maybe_run_pre_reply_consolidation = AsyncMock(return_value=True)
@@ -269,6 +267,7 @@ class TestHandleStop:
         assert cancelled.is_set()
         assert "interrupted" in out.content.lower()
         assert "interrupted" in service.render_status().lower()
+        assert session.metadata["interrupt_state"]["workspace_harness_id"]
 
     @pytest.mark.asyncio
     async def test_interrupt_skips_workspace_harness_update_when_no_active_task(self, tmp_path):

@@ -1,13 +1,13 @@
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from nanobot.bus.events import InboundMessage
 from nanobot.command.builtin import (
     _read_workspace_harness_status_summary,
-    _sync_workspace_interrupt_harness,
     cmd_help,
+    cmd_interrupt,
     register_builtin_commands,
 )
 from nanobot.command.router import CommandContext, CommandRouter
@@ -27,6 +27,7 @@ def test_runtime_harness_command_handles_harness_auto_without_workspace_subproce
     fake_service = SimpleNamespace(
         handle_command=lambda *args, **kwargs: SimpleNamespace(
             response_mode="agent",
+            active_harness_id="har_0001",
             prepared_input="prepared harness auto input",
         )
     )
@@ -43,6 +44,7 @@ def test_runtime_harness_command_handles_harness_auto_without_workspace_subproce
     assert result is None
     assert ctx.msg.metadata["workspace_agent_cmd"] == "harness"
     assert ctx.msg.metadata["workspace_agent_input"] == "prepared harness auto input"
+    assert ctx.msg.metadata["workspace_harness_id"] == "har_0001"
     assert ctx.msg.metadata["workspace_harness_auto"] is True
 
 
@@ -144,7 +146,7 @@ def test_status_summary_helper_reads_from_explicit_workspace_root(tmp_path: Path
     assert result == "interrupted / planning — waiting for redirect"
 
 
-def test_interrupt_sync_helper_uses_explicit_workspace_root(tmp_path: Path) -> None:
+def test_interrupt_command_updates_harness_using_explicit_workspace_root(tmp_path: Path) -> None:
     workspace_root = tmp_path / "runtime-workspace"
     service = HarnessService.for_workspace(workspace_root)
     service.handle_command(
@@ -152,12 +154,19 @@ def test_interrupt_sync_helper_uses_explicit_workspace_root(tmp_path: Path) -> N
         session_key="feishu:c1",
         sender_id="u1",
     )
+    loop = MagicMock(workspace=workspace_root)
+    loop._active_tasks = {
+        "feishu:c1": [
+            MagicMock(done=MagicMock(return_value=False), cancel=MagicMock(return_value=True))
+        ]
+    }
+    loop.subagents.cancel_by_session = AsyncMock(return_value=0)
+    loop.sessions.get_or_create.return_value = MagicMock(metadata={})
+    loop.sessions.save = MagicMock()
+    loop.persist_interrupted_turn = MagicMock(return_value=None)
+    msg = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/interrupt")
+    ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
 
-    asyncio.run(
-        _sync_workspace_interrupt_harness(
-            "interrupted — waiting for redirect",
-            workspace_root=workspace_root,
-        )
-    )
+    asyncio.run(cmd_interrupt(ctx))
 
     assert "interrupted" in service.render_status().lower()

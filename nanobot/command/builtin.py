@@ -65,15 +65,6 @@ async def _cancel_session_work(ctx: CommandContext) -> tuple[int, int, int]:
     return cancelled, sub_cancelled, total
 
 
-async def _sync_workspace_interrupt_harness(
-    summary: str,
-    *,
-    workspace_root: Path | None = None,
-) -> None:
-    workspace_root = workspace_root or _resolve_workspace_root()
-    HarnessService.for_workspace(workspace_root).interrupt_active(summary)
-
-
 async def _read_workspace_harness_status_summary(
     *,
     workspace_root: Path | None = None,
@@ -133,10 +124,15 @@ async def cmd_interrupt(ctx: CommandContext) -> OutboundMessage:
         if hasattr(loop, "persist_interrupted_turn"):
             preserved = loop.persist_interrupted_turn(session, msg.session_key)
         summary = "interrupted — waiting for redirect"
-        await _sync_workspace_interrupt_harness(
-            summary,
-            workspace_root=_resolve_workspace_root(loop),
+        service = HarnessService.for_workspace(_resolve_workspace_root(loop))
+        runtime_meta = service.runtime_metadata(session_key=msg.session_key)
+        harness_id = ""
+        active_harness = (
+            runtime_meta.get("active_harness") if isinstance(runtime_meta, dict) else None
         )
+        if isinstance(active_harness, dict):
+            harness_id = str(active_harness.get("id") or "").strip()
+        service.interrupt_active(summary, session_key=msg.session_key, harness_id=harness_id)
         interrupt_state = {
             "status": "interrupted",
             "reason": "user_interrupt",
@@ -144,6 +140,8 @@ async def cmd_interrupt(ctx: CommandContext) -> OutboundMessage:
             "interrupted_at": time(),
             "summary": summary,
         }
+        if harness_id:
+            interrupt_state["workspace_harness_id"] = harness_id
         if isinstance(preserved, dict):
             partial_preview = str(preserved.get("assistant_partial") or "").strip()
             user_content = str(preserved.get("content") or "").strip()

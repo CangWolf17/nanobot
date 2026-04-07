@@ -28,6 +28,34 @@ def _make_loop(tmp_path: Path) -> tuple[AgentLoop, MessageBus]:
     return loop, bus
 
 
+def _start_harness(
+    tmp_path: Path,
+    *,
+    session_key: str = "feishu:chat1",
+    sender_id: str = "user1",
+    status: str = "active",
+    phase: str = "executing",
+    auto_continue: bool = True,
+    awaiting_user: bool = False,
+    blocked: bool = False,
+) -> HarnessService:
+    service = HarnessService.for_workspace(tmp_path)
+    result = service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key=session_key,
+        sender_id=sender_id,
+    )
+    snapshot = service.store.load()
+    active = snapshot.records[result.active_harness_id]
+    active.status = status
+    active.phase = phase
+    active.awaiting_user = awaiting_user
+    active.blocked = blocked
+    active.execution_policy.auto_continue = auto_continue
+    service.store.save(snapshot)
+    return service
+
+
 def test_workspace_agent_command_emits_progress_before_agent_run(tmp_path: Path) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
@@ -244,7 +272,11 @@ def test_workspace_harness_turn_sets_spawn_context_with_computed_runtime_policy(
             sender_id="user1",
             chat_id="chat1",
             content="/harness",
-            metadata={"workspace_agent_cmd": "harness", "workspace_agent_input": "prepared"},
+            metadata={
+                "workspace_agent_cmd": "harness",
+                "workspace_agent_input": "prepared",
+                "workspace_harness_id": "har_0001",
+            },
         )
 
         loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
@@ -258,6 +290,7 @@ def test_workspace_harness_turn_sets_spawn_context_with_computed_runtime_policy(
             spawn_tool = loop.tools.get("spawn")
             assert spawn_tool is not None
             assert spawn_tool._metadata["workspace_agent_cmd"] == "harness"
+            assert spawn_tool._metadata["workspace_harness_id"] == "har_0001"
             assert (
                 spawn_tool._metadata["workspace_runtime"]["active_harness"]["subagent_allowed"]
                 is False
@@ -278,47 +311,23 @@ def test_workspace_harness_auto_reentry_continues_when_project_completed_but_nex
     tmp_path: Path,
 ) -> None:
     loop, _bus = _make_loop(tmp_path)
+    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses" / "control.json").write_text(
+        '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
+    )
+    (tmp_path / "harnesses" / "index.json").write_text(
+        '{"harnesses":{'
+        '"har_0001":{"id":"har_0001","type":"project","status":"completed","phase":"completed","awaiting_user":false,"blocked":false,"auto":true,"queue_order":1},'
+        '"har_0002":{"id":"har_0002","type":"feature","parent_id":"har_0001","status":"planning","phase":"planning","awaiting_user":false,"blocked":false,"auto":false,"queue_order":2}'
+        "}}",
+        encoding="utf-8",
+    )
     msg = InboundMessage(
         channel="feishu",
         sender_id="user1",
         chat_id="chat1",
         content="/harness auto",
-        metadata={
-            "workspace_agent_cmd": "harness",
-            "workspace_harness_auto": True,
-            "workspace_runtime": {
-                "has_active_harness": True,
-                "active_harness": {
-                    "id": "har_0001",
-                    "type": "project",
-                    "status": "completed",
-                    "phase": "completed",
-                    "awaiting_user": False,
-                    "blocked": False,
-                    "auto": True,
-                },
-                "main_harness": {
-                    "id": "har_0001",
-                    "type": "project",
-                    "status": "completed",
-                    "phase": "completed",
-                    "awaiting_user": False,
-                    "blocked": False,
-                    "auto": True,
-                    "has_open_children": True,
-                },
-                "next_runnable_child": {
-                    "id": "har_0002",
-                    "type": "feature",
-                    "status": "planning",
-                    "phase": "planning",
-                    "awaiting_user": False,
-                    "blocked": False,
-                    "auto": False,
-                },
-                "stop_gate_child": None,
-            },
-        },
+        metadata={"workspace_agent_cmd": "harness", "workspace_harness_auto": True},
     )
 
     decision = loop._decide_harness_auto_reentry(msg)
@@ -331,47 +340,23 @@ def test_workspace_harness_auto_reentry_stops_on_stop_gate_child_even_if_project
     tmp_path: Path,
 ) -> None:
     loop, _bus = _make_loop(tmp_path)
+    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses" / "control.json").write_text(
+        '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
+    )
+    (tmp_path / "harnesses" / "index.json").write_text(
+        '{"harnesses":{'
+        '"har_0001":{"id":"har_0001","type":"project","status":"active","phase":"planning","awaiting_user":false,"blocked":false,"auto":true,"queue_order":1},'
+        '"har_0002":{"id":"har_0002","type":"feature","parent_id":"har_0001","status":"blocked","phase":"blocked","awaiting_user":false,"blocked":true,"auto":false,"queue_order":2}'
+        "}}",
+        encoding="utf-8",
+    )
     msg = InboundMessage(
         channel="feishu",
         sender_id="user1",
         chat_id="chat1",
         content="/harness auto",
-        metadata={
-            "workspace_agent_cmd": "harness",
-            "workspace_harness_auto": True,
-            "workspace_runtime": {
-                "has_active_harness": True,
-                "active_harness": {
-                    "id": "har_0001",
-                    "type": "project",
-                    "status": "active",
-                    "phase": "planning",
-                    "awaiting_user": False,
-                    "blocked": False,
-                    "auto": True,
-                },
-                "main_harness": {
-                    "id": "har_0001",
-                    "type": "project",
-                    "status": "active",
-                    "phase": "planning",
-                    "awaiting_user": False,
-                    "blocked": False,
-                    "auto": True,
-                    "has_open_children": True,
-                },
-                "next_runnable_child": None,
-                "stop_gate_child": {
-                    "id": "har_0002",
-                    "type": "feature",
-                    "status": "blocked",
-                    "phase": "blocked",
-                    "awaiting_user": False,
-                    "blocked": True,
-                    "auto": False,
-                },
-            },
-        },
+        metadata={"workspace_agent_cmd": "harness", "workspace_harness_auto": True},
     )
 
     decision = loop._decide_harness_auto_reentry(msg)
@@ -406,6 +391,38 @@ def test_workspace_harness_auto_continue_decision_comes_from_service_not_workspa
 
     assert decision["should_fire"] is True
     assert decision["reason"] == "continue"
+
+
+def test_workspace_harness_auto_continue_ignores_stale_workspace_projection_without_store_state(
+    tmp_path: Path,
+) -> None:
+    loop, _bus = _make_loop(tmp_path)
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="u1",
+        chat_id="c1",
+        content="/harness auto",
+        metadata={
+            "workspace_agent_cmd": "harness",
+            "workspace_harness_auto": True,
+            "workspace_runtime": {
+                "has_active_harness": True,
+                "active_harness": {
+                    "id": "har_stale",
+                    "status": "active",
+                    "phase": "executing",
+                    "awaiting_user": False,
+                    "blocked": False,
+                    "auto": True,
+                },
+            },
+        },
+    )
+
+    decision = loop._decide_harness_auto_reentry(msg)
+
+    assert decision["should_fire"] is False
+    assert decision["reason"] == "no_active_harness"
 
 
 def test_workspace_harness_runtime_metadata_prefers_queue_order_over_updated_at_for_next_child(
@@ -459,6 +476,39 @@ def test_workspace_harness_postprocess_uses_service_apply_closeout(tmp_path: Pat
     processed = loop._postprocess_workspace_agent_output(msg, update)
 
     assert "focused tests passed" in processed
+
+
+def test_workspace_harness_auto_continue_follow_up_uses_service_origin_sender(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        service = HarnessService.for_workspace(tmp_path)
+        service.handle_command(
+            "/harness 修复 interrupt 的真实接线",
+            session_key="feishu:c1",
+            sender_id="user1",
+        )
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="system",
+            chat_id="c1",
+            content="/harness auto",
+            metadata={
+                "workspace_agent_cmd": "harness",
+                "workspace_harness_auto": True,
+                "_completion_notice_mention_user_id": "user1",
+            },
+        )
+
+        await loop._schedule_harness_auto_continue(msg)
+
+        follow_up = await asyncio.wait_for(bus.consume_inbound(), timeout=1.0)
+
+        assert follow_up.sender_id == "system"
+        assert follow_up.metadata["_origin_sender_id"] == "user1"
+
+    asyncio.run(run())
 
 
 def test_stream_completion_notice_skips_when_harness_auto_will_continue(tmp_path: Path) -> None:
@@ -734,6 +784,7 @@ def test_workspace_harness_auto_continuation_hook_publishes_single_internal_reen
 ) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
+        _start_harness(tmp_path, session_key="feishu:chat1", sender_id="user1")
         msg = InboundMessage(
             channel="feishu",
             sender_id="user1",
@@ -789,6 +840,7 @@ def test_workspace_harness_auto_continuation_hook_allows_chained_system_reentry(
 ) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
+        _start_harness(tmp_path, session_key="feishu:chat1", sender_id="user1")
         msg = InboundMessage(
             channel="feishu",
             sender_id="system",
@@ -885,6 +937,12 @@ def test_workspace_harness_auto_keeps_running_in_verify_phase_by_scheduling_foll
 ) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
+        _start_harness(
+            tmp_path,
+            session_key="telegram:chat1",
+            sender_id="user1",
+            phase="verify",
+        )
         msg = InboundMessage(
             channel="telegram",
             sender_id="user1",
@@ -983,6 +1041,7 @@ def test_workspace_harness_auto_skips_pre_reply_consolidation(tmp_path: Path) ->
 
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
+        _start_harness(tmp_path, session_key="telegram:chat1", sender_id="user1")
         msg = InboundMessage(
             channel="telegram",
             sender_id="user1",
@@ -1091,6 +1150,7 @@ def test_subagent_system_message_preserves_harness_postprocess_and_auto_follow_u
 ) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
+        _start_harness(tmp_path, session_key="system:feishu:chat1", sender_id="user1")
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",

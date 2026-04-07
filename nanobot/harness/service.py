@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.harness.models import HarnessRecord, HarnessSnapshot
+from nanobot.harness.projections import sync_workspace_projections
 from nanobot.harness.store import HarnessStore
 from nanobot.harness.workflows import WorkflowDefinition, get_workflow_definition
 from nanobot.utils.helpers import timestamp
@@ -76,7 +77,11 @@ class HarnessService:
         if goal.lower() == "workflows":
             return HarnessCommandResult(response_mode="text", text=self.render_workflows())
         if goal.lower() == "cleanup":
-            workflow = self.start_workflow("cleanup", origin_command=command)
+            workflow = self.start_workflow(
+                "cleanup",
+                origin_command=command,
+                session_key=session_key,
+            )
             return HarnessCommandResult(
                 response_mode="agent",
                 agent_cmd="harness",
@@ -90,7 +95,8 @@ class HarnessService:
             if not goal:
                 raise ValueError("/harness requires a goal when no active harness exists")
             active_record = self._create_work_harness(snapshot, goal)
-            self._save_snapshot(snapshot)
+        self._bind_session(snapshot, active_record=active_record, session_key=session_key)
+        self._save_snapshot(snapshot)
         prepared_input = self._build_goal_prepared_input(
             snapshot=snapshot,
             active_record=active_record,
@@ -110,6 +116,7 @@ class HarnessService:
         workflow_name: str,
         *,
         origin_command: str,
+        session_key: str = "",
         requested_goal_after_cleanup: str = "",
     ) -> WorkflowStartResult:
         snapshot = self.store.load()
@@ -134,6 +141,7 @@ class HarnessService:
             prior_active_id=prior_active_id,
             workflow_id=record.id,
         )
+        self._bind_session(snapshot, active_record=record, session_key=session_key)
         snapshot.active_harness_id = record.id
         self._save_snapshot(snapshot)
 
@@ -191,9 +199,19 @@ class HarnessService:
             for record in sorted(records, key=lambda item: item.id)
         )
 
-    def runtime_metadata(self, *, requested_auto: bool = False) -> dict[str, Any]:
+    def runtime_metadata(
+        self,
+        *,
+        requested_auto: bool = False,
+        session_key: str = "",
+        harness_id: str = "",
+    ) -> dict[str, Any]:
         snapshot = self.store.load()
-        active = self._get_active_record(snapshot)
+        active = self._resolve_harness_target(
+            snapshot,
+            harness_id=harness_id,
+            session_key=session_key,
+        )
         if active is None:
             return {"has_active_harness": False}
 
@@ -241,8 +259,13 @@ class HarnessService:
         session_key: str,
         sender_id: str,
         origin_sender_id: str = "",
+        harness_id: str = "",
     ) -> HarnessAutoContinueDecision:
-        runtime_meta = self.runtime_metadata(requested_auto=True)
+        runtime_meta = self.runtime_metadata(
+            requested_auto=True,
+            session_key=session_key,
+            harness_id=harness_id,
+        )
         origin = origin_sender_id or sender_id
         if not bool(runtime_meta.get("has_active_harness")):
             return HarnessAutoContinueDecision(
@@ -298,20 +321,32 @@ class HarnessService:
         metadata: dict[str, Any] | None,
         *,
         origin_sender_id: str,
+        session_key: str = "",
+        harness_id: str = "",
     ) -> dict[str, Any]:
         base = dict(metadata or {})
         base["_auto_continue"] = True
         base["_origin_sender_id"] = origin_sender_id
+        if harness_id:
+            base["workspace_harness_id"] = harness_id
         runtime_meta = self.runtime_metadata(
-            requested_auto=bool(base.get("workspace_harness_auto"))
+            requested_auto=bool(base.get("workspace_harness_auto")),
+            session_key=session_key,
+            harness_id=harness_id,
         )
         if runtime_meta:
             base["workspace_runtime"] = runtime_meta
         return base
 
-    def interrupt_active(self, summary: str) -> bool:
+    def interrupt_active(
+        self, summary: str, *, session_key: str = "", harness_id: str = ""
+    ) -> bool:
         snapshot = self.store.load()
-        active = self._get_active_record(snapshot)
+        active = self._resolve_harness_target(
+            snapshot,
+            harness_id=harness_id,
+            session_key=session_key,
+        )
         if active is None:
             return False
         active.status = "interrupted"
@@ -322,9 +357,19 @@ class HarnessService:
         self._save_snapshot(snapshot)
         return True
 
-    def redirect_active(self, user_input: str) -> bool:
+    def redirect_after_interrupt(
+        self,
+        user_input: str,
+        *,
+        session_key: str = "",
+        harness_id: str = "",
+    ) -> bool:
         snapshot = self.store.load()
-        active = self._get_active_record(snapshot)
+        active = self._resolve_harness_target(
+            snapshot,
+            harness_id=harness_id,
+            session_key=session_key,
+        )
         if active is None or active.status != "interrupted":
             return False
         active.status = "active"
@@ -335,7 +380,16 @@ class HarnessService:
         self._save_snapshot(snapshot)
         return True
 
-    def apply_agent_update(self, content: str, *, session_key: str) -> HarnessApplyResult:
+    def redirect_active(self, user_input: str) -> bool:
+        return self.redirect_after_interrupt(user_input)
+
+    def apply_agent_update(
+        self,
+        content: str,
+        *,
+        session_key: str,
+        harness_id: str = "",
+    ) -> HarnessApplyResult:
         payload = self._extract_harness_update_payload(content)
         if not isinstance(payload, dict):
             return HarnessApplyResult(
@@ -345,24 +399,77 @@ class HarnessService:
             )
 
         snapshot = self.store.load()
-        active = self._get_active_record(snapshot)
-        if active is None:
+        target = self._resolve_apply_target(
+            snapshot, harness_id=harness_id, session_key=session_key
+        )
+        if target is None:
             return HarnessApplyResult(
                 final_content=content,
                 closeout_required=False,
                 closeout_summary="",
             )
 
-        self._apply_record_update(active, payload)
+        self._apply_record_update(target, payload)
         self._save_snapshot(snapshot)
 
-        closeout_required = self._is_completed(active)
-        closeout_summary = self._build_closeout_summary(active) if closeout_required else ""
+        closeout_required = self._is_completed(target)
+        closeout_summary = self._build_closeout_summary(target) if closeout_required else ""
         return HarnessApplyResult(
             final_content=closeout_summary or content,
             closeout_required=closeout_required,
             closeout_summary=closeout_summary,
         )
+
+    def sync_projections(self) -> None:
+        sync_workspace_projections(self.workspace_root, self.store.load())
+
+    def _resolve_apply_target(
+        self,
+        snapshot: HarnessSnapshot,
+        *,
+        harness_id: str,
+        session_key: str,
+    ) -> HarnessRecord | None:
+        return self._resolve_harness_target(
+            snapshot,
+            harness_id=harness_id,
+            session_key=session_key,
+        )
+
+    def _resolve_harness_target(
+        self,
+        snapshot: HarnessSnapshot,
+        *,
+        harness_id: str,
+        session_key: str,
+    ) -> HarnessRecord | None:
+        target_id = harness_id.strip()
+        if target_id:
+            return snapshot.records.get(target_id)
+        bound_session_key = session_key.strip()
+        if bound_session_key:
+            for record in snapshot.records.values():
+                if record.runtime_state.session_key == bound_session_key:
+                    return record
+        return self._get_active_record(snapshot)
+
+    @staticmethod
+    def _bind_session(
+        snapshot: HarnessSnapshot,
+        *,
+        active_record: HarnessRecord,
+        session_key: str,
+    ) -> None:
+        bound_session_key = session_key.strip()
+        if not bound_session_key:
+            return
+        for record in snapshot.records.values():
+            if (
+                record.id != active_record.id
+                and record.runtime_state.session_key == bound_session_key
+            ):
+                record.runtime_state.session_key = ""
+        active_record.runtime_state.session_key = bound_session_key
 
     def _create_work_harness(self, snapshot: HarnessSnapshot, goal: str) -> HarnessRecord:
         record = HarnessRecord(
@@ -597,6 +704,7 @@ class HarnessService:
     def _save_snapshot(self, snapshot: HarnessSnapshot) -> None:
         snapshot.updated_at = timestamp()
         self.store.save(snapshot)
+        sync_workspace_projections(self.workspace_root, snapshot)
 
     def _workflow_return_target(self, *, prior_active_id: str, workflow_id: str) -> str:
         if not prior_active_id or prior_active_id == workflow_id:

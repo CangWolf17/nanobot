@@ -36,6 +36,8 @@ async def cmd_harness(ctx: CommandContext) -> OutboundMessage | None:
 
     ctx.msg.metadata["workspace_agent_cmd"] = getattr(result, "agent_cmd", "harness")
     ctx.msg.metadata["workspace_agent_input"] = result.prepared_input
+    if getattr(result, "active_harness_id", ""):
+        ctx.msg.metadata["workspace_harness_id"] = result.active_harness_id
     if ctx.raw.strip().lower() == "/harness auto":
         ctx.msg.metadata["workspace_harness_auto"] = True
     return None

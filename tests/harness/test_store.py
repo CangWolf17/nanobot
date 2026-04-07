@@ -150,6 +150,7 @@ def test_store_migrates_legacy_index_control_and_state_into_single_store(tmp_pat
         subagent_last_summary="state runtime summary",
         auto_state="queued",
         continuation_token="token-1",
+        session_key="",
     )
     assert (tmp_path / "harnesses" / "store.json").exists()
 

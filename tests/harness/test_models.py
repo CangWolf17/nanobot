@@ -50,7 +50,11 @@ def test_snapshot_to_dict_includes_canonical_store_fields() -> None:
                 execution_policy=HarnessExecutionPolicy(
                     executor_mode="auto", subagent_allowed=True
                 ),
-                runtime_state=HarnessRuntimeState(runner="subagent", subagent_status="running"),
+                runtime_state=HarnessRuntimeState(
+                    runner="subagent",
+                    subagent_status="running",
+                    session_key="feishu:c1",
+                ),
             )
         },
     )
@@ -101,7 +105,9 @@ def test_snapshot_to_dict_includes_canonical_store_fields() -> None:
                     executor_mode="auto", subagent_allowed=True
                 ).to_dict(),
                 "runtime_state": HarnessRuntimeState(
-                    runner="subagent", subagent_status="running"
+                    runner="subagent",
+                    subagent_status="running",
+                    session_key="feishu:c1",
                 ).to_dict(),
             }
         },
@@ -162,4 +168,5 @@ def test_snapshot_from_dict_normalizes_invalid_enum_and_boolean_values() -> None
         runner="main",
         subagent_status="idle",
         auto_state="idle",
+        session_key="",
     )
