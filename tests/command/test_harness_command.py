@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from nanobot.bus.events import InboundMessage
-from nanobot.command.builtin import register_builtin_commands
+from nanobot.command.builtin import cmd_help, register_builtin_commands
 from nanobot.command.router import CommandContext, CommandRouter
 
 
@@ -72,4 +72,30 @@ def test_runtime_harness_command_accepts_uppercase_prefix_for_status(tmp_path: P
 
     assert result is not None
     assert result.content == "No active harness."
+    assert result.metadata == {"render_as": "text"}
+
+
+def test_runtime_help_includes_harness_even_when_workspace_help_exists(tmp_path: Path) -> None:
+    msg = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/help")
+    ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/help", loop=None)
+    home = tmp_path / "home"
+    router_path = home / ".nanobot" / "workspace" / "scripts" / "router.py"
+    router_path.parent.mkdir(parents=True, exist_ok=True)
+    router_path.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    with (
+        patch("nanobot.command.builtin.Path.home", return_value=home),
+        patch(
+            "nanobot.command.builtin.subprocess.run",
+            return_value=SimpleNamespace(
+                stdout="/plan -- Workspace planner help\n/help -- Workspace help\n",
+                stderr="",
+            ),
+        ),
+    ):
+        result = asyncio.run(cmd_help(ctx))
+
+    assert result is not None
+    assert "/plan -- Workspace planner help" in result.content
+    assert "/harness" in result.content
     assert result.metadata == {"render_as": "text"}

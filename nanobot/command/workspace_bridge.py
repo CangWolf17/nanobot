@@ -46,14 +46,21 @@ def _extract_agent_marker(content: str) -> str | None:
     return stripped[len("[AGENT]") :].strip()
 
 
-def _prepare_agent_input(agent_cmd: str, raw: str, env: dict[str, str] | None) -> str | None:
+def _prepare_agent_input(
+    agent_cmd: str,
+    raw: str,
+    env: dict[str, str] | None,
+    *,
+    workspace_root: Path | None = None,
+) -> str | None:
     if agent_cmd not in PREPARED_INPUT_CMDS:
         return None
+    root = workspace_root or _workspace_root_from_router()
     try:
         result = subprocess.run(
             [
-                str(Path.home() / ".nanobot" / "workspace" / "venv" / "bin" / "python"),
-                str(WORKSPACE_ROUTER),
+                str(root / "venv" / "bin" / "python"),
+                str(root / "scripts" / "router.py"),
                 "--prepare-agent-input",
                 agent_cmd,
             ],
@@ -108,7 +115,12 @@ def prepare_active_workflow_continuation(
                                 == "awaiting_confirmation"
                             ):
                                 env = build_workspace_env(msg)
-                                prepared = _prepare_agent_input("笔记", raw, env)
+                                prepared = _prepare_agent_input(
+                                    "笔记",
+                                    raw,
+                                    env,
+                                    workspace_root=root,
+                                )
                                 if prepared:
                                     meta["workspace_agent_cmd"] = "笔记"
                                     meta["workspace_agent_input"] = prepared
@@ -148,7 +160,7 @@ def prepare_active_workflow_continuation(
         return False
 
     env = build_workspace_env(msg)
-    prepared = _prepare_agent_input("merge", raw, env)
+    prepared = _prepare_agent_input("merge", raw, env, workspace_root=root)
     if not prepared:
         return False
     meta["workspace_agent_cmd"] = "merge"

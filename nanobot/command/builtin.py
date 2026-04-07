@@ -32,6 +32,16 @@ def build_help_text() -> str:
     return "\n".join(lines)
 
 
+def _merge_runtime_help_text(workspace_help: str) -> str:
+    """Append runtime-only commands when workspace help omits them."""
+    text = workspace_help.strip()
+    if not text:
+        return build_help_text()
+    if "/harness" in text:
+        return text
+    return f"{text}\n/harness — Manage the runtime harness"
+
+
 async def _cancel_session_work(ctx: CommandContext) -> tuple[int, int, int]:
     """Cancel active loop tasks and subagents for the current session."""
     loop = ctx.loop
@@ -229,7 +239,7 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
                 return OutboundMessage(
                     channel=ctx.msg.channel,
                     chat_id=ctx.msg.chat_id,
-                    content=stdout,
+                    content=_merge_runtime_help_text(stdout),
                     metadata={"render_as": "text"},
                 )
         except Exception:

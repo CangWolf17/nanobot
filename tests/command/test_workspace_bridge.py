@@ -486,3 +486,49 @@ def test_workspace_bridge_non_slash_continuation_uses_loop_workspace_root(tmp_pa
     assert result is None
     assert ctx.msg.metadata["workspace_agent_cmd"] == "merge"
     assert ctx.msg.metadata["workspace_agent_input"] == "prepared merge continuation"
+
+
+def test_workspace_bridge_non_slash_continuation_prepares_input_with_loop_workspace_paths(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "runtime-workspace"
+    harness_root = workspace_root / "harnesses"
+    harness_root.mkdir(parents=True, exist_ok=True)
+    (harness_root / "control.json").write_text('{"active_harness_id":"har_0002"}', encoding="utf-8")
+    (harness_root / "index.json").write_text(
+        '{"harnesses":{"har_0002":{"id":"har_0002","kind":"workflow","type":"workflow","status":"awaiting_decision","phase":"awaiting_decision","active":true,"awaiting_user":true,"blocked":false,"workflow_name":"merge","return_to":"har_0001"}}}',
+        encoding="utf-8",
+    )
+    ctx = CommandContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="ou_test",
+            content="可以，合并吧",
+            metadata={"message_id": "om_test"},
+        ),
+        session=None,
+        key="feishu:ou_test",
+        raw="可以，合并吧",
+        args="",
+        loop=MagicMock(workspace=workspace_root),
+    )
+    prepared = MagicMock(stdout="prepared merge continuation\n", stderr="", returncode=0)
+
+    with patch(
+        "nanobot.command.workspace_bridge.subprocess.run",
+        return_value=prepared,
+    ) as mock_run:
+        result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is None
+    assert ctx.msg.metadata["workspace_agent_cmd"] == "merge"
+    assert ctx.msg.metadata["workspace_agent_input"] == "prepared merge continuation"
+    assert mock_run.call_args.args[0] == [
+        str(workspace_root / "venv" / "bin" / "python"),
+        str(workspace_root / "scripts" / "router.py"),
+        "--prepare-agent-input",
+        "merge",
+    ]
+    env = mock_run.call_args.kwargs["env"]
+    assert env["NANOBOT_MESSAGE_ID"] == "om_test"
