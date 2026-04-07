@@ -309,7 +309,8 @@ class HarnessRecord:
                     or legacy_index.get("delegation_level"),
                     "risk_level": legacy_state.get("risk_level") or legacy_index.get("risk_level"),
                     "auto_continue": legacy_state.get(
-                        "auto_continue", legacy_index.get("auto_continue", False)
+                        "auto_continue",
+                        legacy_index.get("auto_continue", legacy_index.get("auto", False)),
                     ),
                     "subagent_allowed": legacy_state.get(
                         "subagent_allowed", legacy_index.get("subagent_allowed", False)

@@ -8,6 +8,7 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ChannelsConfig
+from nanobot.harness.service import HarnessService
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
@@ -93,8 +94,6 @@ def test_workspace_agent_notes_emits_progress_before_agent_run(tmp_path: Path) -
     asyncio.run(run())
 
 
-
-
 def test_workspace_agent_diagnose_emits_progress_before_agent_run(tmp_path: Path) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
@@ -115,8 +114,6 @@ def test_workspace_agent_diagnose_emits_progress_before_agent_run(tmp_path: Path
         assert result.content == "done"
 
     asyncio.run(run())
-
-
 
 
 def test_workspace_harness_runtime_metadata_prefers_durable_auto_from_store(tmp_path: Path) -> None:
@@ -143,7 +140,9 @@ def test_workspace_harness_runtime_metadata_prefers_durable_auto_from_store(tmp_
     assert runtime_meta["active_harness"]["auto"] is True
 
 
-def test_workspace_harness_runtime_metadata_falls_back_to_durable_auto_false_when_flag_absent(tmp_path: Path) -> None:
+def test_workspace_harness_runtime_metadata_falls_back_to_durable_auto_false_when_flag_absent(
+    tmp_path: Path,
+) -> None:
     loop, _bus = _make_loop(tmp_path)
     (tmp_path / "harnesses").mkdir(parents=True)
     (tmp_path / "harnesses" / "control.json").write_text(
@@ -167,7 +166,9 @@ def test_workspace_harness_runtime_metadata_falls_back_to_durable_auto_false_whe
     assert runtime_meta["active_harness"]["auto"] is False
 
 
-def test_workspace_harness_runtime_metadata_exposes_main_harness_and_next_runnable_child(tmp_path: Path) -> None:
+def test_workspace_harness_runtime_metadata_exposes_main_harness_and_next_runnable_child(
+    tmp_path: Path,
+) -> None:
     loop, _bus = _make_loop(tmp_path)
     (tmp_path / "harnesses").mkdir(parents=True)
     (tmp_path / "harnesses" / "control.json").write_text(
@@ -178,7 +179,7 @@ def test_workspace_harness_runtime_metadata_exposes_main_harness_and_next_runnab
         '"har_0001":{"id":"har_0001","type":"project","status":"completed","phase":"completed","awaiting_user":false,"blocked":false,"auto":true,"queue_order":1},'
         '"har_0002":{"id":"har_0002","type":"feature","parent_id":"har_0001","status":"planning","phase":"planning","awaiting_user":false,"blocked":false,"auto":false,"queue_order":2},'
         '"har_0003":{"id":"har_0003","type":"feature","parent_id":"har_0001","status":"planning","phase":"planning","awaiting_user":false,"blocked":false,"auto":false,"queue_order":3}'
-        '}}',
+        "}}",
         encoding="utf-8",
     )
     msg = InboundMessage(
@@ -225,8 +226,9 @@ def test_workspace_harness_runtime_metadata_includes_subagent_policy_fields(tmp_
     assert runtime_meta["active_harness"]["runner"] == "subagent"
 
 
-
-def test_workspace_harness_turn_sets_spawn_context_with_computed_runtime_policy(tmp_path: Path) -> None:
+def test_workspace_harness_turn_sets_spawn_context_with_computed_runtime_policy(
+    tmp_path: Path,
+) -> None:
     async def run() -> None:
         loop, _bus = _make_loop(tmp_path)
         (tmp_path / "harnesses").mkdir(parents=True)
@@ -256,7 +258,10 @@ def test_workspace_harness_turn_sets_spawn_context_with_computed_runtime_policy(
             spawn_tool = loop.tools.get("spawn")
             assert spawn_tool is not None
             assert spawn_tool._metadata["workspace_agent_cmd"] == "harness"
-            assert spawn_tool._metadata["workspace_runtime"]["active_harness"]["subagent_allowed"] is False
+            assert (
+                spawn_tool._metadata["workspace_runtime"]["active_harness"]["subagent_allowed"]
+                is False
+            )
             return "done", [], list(messages) + [{"role": "assistant", "content": "done"}]
 
         loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
@@ -269,7 +274,9 @@ def test_workspace_harness_turn_sets_spawn_context_with_computed_runtime_policy(
     asyncio.run(run())
 
 
-def test_workspace_harness_auto_reentry_continues_when_project_completed_but_next_child_exists(tmp_path: Path) -> None:
+def test_workspace_harness_auto_reentry_continues_when_project_completed_but_next_child_exists(
+    tmp_path: Path,
+) -> None:
     loop, _bus = _make_loop(tmp_path)
     msg = InboundMessage(
         channel="feishu",
@@ -320,8 +327,9 @@ def test_workspace_harness_auto_reentry_continues_when_project_completed_but_nex
     assert decision["reason"] == "continue"
 
 
-
-def test_workspace_harness_auto_reentry_stops_on_stop_gate_child_even_if_project_has_more_queue(tmp_path: Path) -> None:
+def test_workspace_harness_auto_reentry_stops_on_stop_gate_child_even_if_project_has_more_queue(
+    tmp_path: Path,
+) -> None:
     loop, _bus = _make_loop(tmp_path)
     msg = InboundMessage(
         channel="feishu",
@@ -372,8 +380,37 @@ def test_workspace_harness_auto_reentry_stops_on_stop_gate_child_even_if_project
     assert decision["reason"] == "blocked"
 
 
+def test_workspace_harness_auto_continue_decision_comes_from_service_not_workspace_projection(
+    tmp_path: Path,
+) -> None:
+    loop, _bus = _make_loop(tmp_path)
+    service = HarnessService.for_workspace(tmp_path)
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="u1",
+        chat_id="c1",
+        content="/harness auto",
+        metadata={
+            "workspace_agent_cmd": "harness",
+            "workspace_harness_auto": True,
+            "workspace_runtime": {"has_active_harness": False},
+        },
+    )
 
-def test_workspace_harness_runtime_metadata_prefers_queue_order_over_updated_at_for_next_child(tmp_path: Path) -> None:
+    decision = loop._decide_harness_auto_reentry(msg)
+
+    assert decision["should_fire"] is True
+    assert decision["reason"] == "continue"
+
+
+def test_workspace_harness_runtime_metadata_prefers_queue_order_over_updated_at_for_next_child(
+    tmp_path: Path,
+) -> None:
     loop, _bus = _make_loop(tmp_path)
     (tmp_path / "harnesses").mkdir(parents=True)
     (tmp_path / "harnesses" / "control.json").write_text(
@@ -384,7 +421,7 @@ def test_workspace_harness_runtime_metadata_prefers_queue_order_over_updated_at_
         '"har_0001":{"id":"har_0001","type":"project","status":"active","phase":"planning","awaiting_user":false,"blocked":false,"auto":true,"queue_order":1},'
         '"har_0002":{"id":"har_0002","type":"feature","parent_id":"har_0001","status":"planning","phase":"planning","awaiting_user":false,"blocked":false,"auto":false,"queue_order":2,"updated_at":"2026-04-06T01:00:00"},'
         '"har_0003":{"id":"har_0003","type":"feature","parent_id":"har_0001","status":"planning","phase":"planning","awaiting_user":false,"blocked":false,"auto":false,"queue_order":3,"updated_at":"2026-04-06T09:00:00"}'
-        '}}',
+        "}}",
         encoding="utf-8",
     )
     msg = InboundMessage(
@@ -400,18 +437,43 @@ def test_workspace_harness_runtime_metadata_prefers_queue_order_over_updated_at_
     assert runtime_meta["next_runnable_child"]["id"] == "har_0002"
 
 
+def test_workspace_harness_postprocess_uses_service_apply_closeout(tmp_path: Path) -> None:
+    loop, _bus = _make_loop(tmp_path)
+    service = HarnessService.for_workspace(tmp_path)
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="u1",
+        chat_id="c1",
+        content="/harness",
+        metadata={"workspace_agent_cmd": "harness"},
+    )
+    update = """```json
+    {"harness": {"status": "completed", "phase": "completed", "summary": "done", "verification_status": "passed", "verification_summary": "focused tests passed", "git_delivery_status": "no_commit_required", "git_delivery_summary": "analysis-only"}}
+    ```"""
+
+    processed = loop._postprocess_workspace_agent_output(msg, update)
+
+    assert "focused tests passed" in processed
+
 
 def test_stream_completion_notice_skips_when_harness_auto_will_continue(tmp_path: Path) -> None:
     loop, _bus = _make_loop(tmp_path)
-    loop.channels_config = ChannelsConfig.model_validate({
-        "feishu": {
-            "enabled": True,
-            "streaming": True,
-            "streamingCompletionNoticeEnabled": True,
-            "streamingCompletionNoticeText": "✅ 回复完成",
-            "streamingCompletionNoticeMentionUser": True,
+    loop.channels_config = ChannelsConfig.model_validate(
+        {
+            "feishu": {
+                "enabled": True,
+                "streaming": True,
+                "streamingCompletionNoticeEnabled": True,
+                "streamingCompletionNoticeText": "✅ 回复完成",
+                "streamingCompletionNoticeMentionUser": True,
+            }
         }
-    })
+    )
     msg = InboundMessage(
         channel="feishu",
         sender_id="user1",
@@ -419,7 +481,9 @@ def test_stream_completion_notice_skips_when_harness_auto_will_continue(tmp_path
         content="/harness auto",
         metadata={"workspace_agent_cmd": "harness", "workspace_harness_auto": True},
     )
-    response = OutboundMessage(channel="feishu", chat_id="chat1", content="done", metadata={"_streamed": True})
+    response = OutboundMessage(
+        channel="feishu", chat_id="chat1", content="done", metadata={"_streamed": True}
+    )
 
     with patch.object(AgentLoop, "_should_schedule_harness_auto_continue", return_value=True):
         loop._maybe_mark_stream_completion_notice(
@@ -437,15 +501,17 @@ def test_stream_completion_notice_skips_when_harness_auto_will_continue(tmp_path
 
 def test_stream_completion_notice_marks_harness_auto_stop_with_mention(tmp_path: Path) -> None:
     loop, _bus = _make_loop(tmp_path)
-    loop.channels_config = ChannelsConfig.model_validate({
-        "feishu": {
-            "enabled": True,
-            "streaming": True,
-            "streamingCompletionNoticeEnabled": True,
-            "streamingCompletionNoticeText": "✅ 回复完成",
-            "streamingCompletionNoticeMentionUser": True,
+    loop.channels_config = ChannelsConfig.model_validate(
+        {
+            "feishu": {
+                "enabled": True,
+                "streaming": True,
+                "streamingCompletionNoticeEnabled": True,
+                "streamingCompletionNoticeText": "✅ 回复完成",
+                "streamingCompletionNoticeMentionUser": True,
+            }
         }
-    })
+    )
     msg = InboundMessage(
         channel="feishu",
         sender_id="user1",
@@ -453,7 +519,9 @@ def test_stream_completion_notice_marks_harness_auto_stop_with_mention(tmp_path:
         content="/harness auto",
         metadata={"workspace_agent_cmd": "harness", "workspace_harness_auto": True},
     )
-    response = OutboundMessage(channel="feishu", chat_id="chat1", content="done", metadata={"_streamed": True})
+    response = OutboundMessage(
+        channel="feishu", chat_id="chat1", content="done", metadata={"_streamed": True}
+    )
 
     with patch.object(AgentLoop, "_should_schedule_harness_auto_continue", return_value=False):
         loop._maybe_mark_stream_completion_notice(
@@ -470,17 +538,21 @@ def test_stream_completion_notice_marks_harness_auto_stop_with_mention(tmp_path:
     assert response.metadata["_completion_notice_mention_user_id"] == "user1"
 
 
-def test_stream_completion_notice_on_system_harness_auto_stop_mentions_origin_user(tmp_path: Path) -> None:
+def test_stream_completion_notice_on_system_harness_auto_stop_mentions_origin_user(
+    tmp_path: Path,
+) -> None:
     loop, _bus = _make_loop(tmp_path)
-    loop.channels_config = ChannelsConfig.model_validate({
-        "feishu": {
-            "enabled": True,
-            "streaming": True,
-            "streamingCompletionNoticeEnabled": True,
-            "streamingCompletionNoticeText": "✅ 回复完成",
-            "streamingCompletionNoticeMentionUser": True,
+    loop.channels_config = ChannelsConfig.model_validate(
+        {
+            "feishu": {
+                "enabled": True,
+                "streaming": True,
+                "streamingCompletionNoticeEnabled": True,
+                "streamingCompletionNoticeText": "✅ 回复完成",
+                "streamingCompletionNoticeMentionUser": True,
+            }
         }
-    })
+    )
     msg = InboundMessage(
         channel="feishu",
         sender_id="system",
@@ -493,7 +565,9 @@ def test_stream_completion_notice_on_system_harness_auto_stop_mentions_origin_us
             "_origin_sender_id": "user1",
         },
     )
-    response = OutboundMessage(channel="feishu", chat_id="chat1", content="done", metadata={"_streamed": True})
+    response = OutboundMessage(
+        channel="feishu", chat_id="chat1", content="done", metadata={"_streamed": True}
+    )
 
     with patch.object(AgentLoop, "_should_schedule_harness_auto_continue", return_value=False):
         loop._maybe_mark_stream_completion_notice(
@@ -511,14 +585,16 @@ def test_stream_completion_notice_on_system_harness_auto_stop_mentions_origin_us
 
 def test_stream_completion_notice_skips_short_plain_reply(tmp_path: Path) -> None:
     loop, _bus = _make_loop(tmp_path)
-    loop.channels_config = ChannelsConfig.model_validate({
-        "feishu": {
-            "enabled": True,
-            "streaming": True,
-            "streamingCompletionNoticeEnabled": True,
-            "streamingCompletionNoticeText": "✅ 回复完成",
+    loop.channels_config = ChannelsConfig.model_validate(
+        {
+            "feishu": {
+                "enabled": True,
+                "streaming": True,
+                "streamingCompletionNoticeEnabled": True,
+                "streamingCompletionNoticeText": "✅ 回复完成",
+            }
         }
-    })
+    )
     msg = InboundMessage(
         channel="feishu",
         sender_id="user1",
@@ -526,7 +602,9 @@ def test_stream_completion_notice_skips_short_plain_reply(tmp_path: Path) -> Non
         content="hi",
         metadata={},
     )
-    response = OutboundMessage(channel="feishu", chat_id="chat1", content="短回复", metadata={"_streamed": True})
+    response = OutboundMessage(
+        channel="feishu", chat_id="chat1", content="短回复", metadata={"_streamed": True}
+    )
 
     loop._maybe_mark_stream_completion_notice(
         msg,
@@ -542,14 +620,16 @@ def test_stream_completion_notice_skips_short_plain_reply(tmp_path: Path) -> Non
 
 def test_stream_completion_notice_marks_long_reply_even_without_workflow(tmp_path: Path) -> None:
     loop, _bus = _make_loop(tmp_path)
-    loop.channels_config = ChannelsConfig.model_validate({
-        "feishu": {
-            "enabled": True,
-            "streaming": True,
-            "streamingCompletionNoticeEnabled": True,
-            "streamingCompletionNoticeText": "✅ 回复完成",
+    loop.channels_config = ChannelsConfig.model_validate(
+        {
+            "feishu": {
+                "enabled": True,
+                "streaming": True,
+                "streamingCompletionNoticeEnabled": True,
+                "streamingCompletionNoticeText": "✅ 回复完成",
+            }
         }
-    })
+    )
     msg = InboundMessage(
         channel="feishu",
         sender_id="user1",
@@ -557,7 +637,12 @@ def test_stream_completion_notice_marks_long_reply_even_without_workflow(tmp_pat
         content="解释一下",
         metadata={},
     )
-    response = OutboundMessage(channel="feishu", chat_id="chat1", content=("很长的解释" * 200), metadata={"_streamed": True})
+    response = OutboundMessage(
+        channel="feishu",
+        chat_id="chat1",
+        content=("很长的解释" * 200),
+        metadata={"_streamed": True},
+    )
 
     loop._maybe_mark_stream_completion_notice(
         msg,
@@ -612,6 +697,7 @@ active_harness:
 
         async def fake_run(spec):
             from nanobot.agent.hook import AgentHookContext
+
             ctx = AgentHookContext(
                 iteration=0,
                 messages=[],
@@ -619,14 +705,18 @@ active_harness:
                 tool_calls=[tool_call],
             )
             await spec.hook.before_execute_tools(ctx)
-            return type("Result", (), {
-                "final_content": None,
-                "tools_used": ["read_file"],
-                "messages": [],
-                "usage": {},
-                "stop_reason": "completed",
-                "error": None,
-            })()
+            return type(
+                "Result",
+                (),
+                {
+                    "final_content": None,
+                    "tools_used": ["read_file"],
+                    "messages": [],
+                    "usage": {},
+                    "stop_reason": "completed",
+                    "error": None,
+                },
+            )()
 
         loop.runner.run = AsyncMock(side_effect=fake_run)
 
@@ -639,7 +729,9 @@ active_harness:
     asyncio.run(run())
 
 
-def test_workspace_harness_auto_continuation_hook_publishes_single_internal_reentry(tmp_path: Path) -> None:
+def test_workspace_harness_auto_continuation_hook_publishes_single_internal_reentry(
+    tmp_path: Path,
+) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(
@@ -671,7 +763,9 @@ def test_workspace_harness_auto_continuation_hook_publishes_single_internal_reen
         loop.sessions.save = MagicMock()
         loop._schedule_background = lambda coro: coro.close()
         loop.tools.get = MagicMock(return_value=None)
-        loop._run_agent_loop = AsyncMock(return_value=("done", [], [{"role": "assistant", "content": "done"}]))
+        loop._run_agent_loop = AsyncMock(
+            return_value=("done", [], [{"role": "assistant", "content": "done"}])
+        )
 
         with (
             patch.object(AgentLoop, "_postprocess_workspace_agent_output", return_value="done"),
@@ -690,7 +784,9 @@ def test_workspace_harness_auto_continuation_hook_publishes_single_internal_reen
     asyncio.run(run())
 
 
-def test_workspace_harness_auto_continuation_hook_allows_chained_system_reentry(tmp_path: Path) -> None:
+def test_workspace_harness_auto_continuation_hook_allows_chained_system_reentry(
+    tmp_path: Path,
+) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(
@@ -724,7 +820,9 @@ def test_workspace_harness_auto_continuation_hook_allows_chained_system_reentry(
         loop.sessions.save = MagicMock()
         loop._schedule_background = lambda coro: coro.close()
         loop.tools.get = MagicMock(return_value=None)
-        loop._run_agent_loop = AsyncMock(return_value=("done", [], [{"role": "assistant", "content": "done"}]))
+        loop._run_agent_loop = AsyncMock(
+            return_value=("done", [], [{"role": "assistant", "content": "done"}])
+        )
 
         with (
             patch.object(AgentLoop, "_postprocess_workspace_agent_output", return_value="done"),
@@ -743,7 +841,9 @@ def test_workspace_harness_auto_continuation_hook_allows_chained_system_reentry(
     asyncio.run(run())
 
 
-def test_workspace_harness_auto_continuation_hook_skips_when_user_decision_needed(tmp_path: Path) -> None:
+def test_workspace_harness_auto_continuation_hook_skips_when_user_decision_needed(
+    tmp_path: Path,
+) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(
@@ -764,7 +864,9 @@ def test_workspace_harness_auto_continuation_hook_skips_when_user_decision_neede
         loop.sessions.save = MagicMock()
         loop._schedule_background = lambda coro: coro.close()
         loop.tools.get = MagicMock(return_value=None)
-        loop._run_agent_loop = AsyncMock(return_value=("done", [], [{"role": "assistant", "content": "done"}]))
+        loop._run_agent_loop = AsyncMock(
+            return_value=("done", [], [{"role": "assistant", "content": "done"}])
+        )
 
         with (
             patch.object(AgentLoop, "_postprocess_workspace_agent_output", return_value="done"),
@@ -778,7 +880,9 @@ def test_workspace_harness_auto_continuation_hook_skips_when_user_decision_neede
     asyncio.run(run())
 
 
-def test_workspace_harness_auto_keeps_running_in_verify_phase_by_scheduling_follow_up(tmp_path: Path) -> None:
+def test_workspace_harness_auto_keeps_running_in_verify_phase_by_scheduling_follow_up(
+    tmp_path: Path,
+) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(
@@ -804,7 +908,9 @@ def test_workspace_harness_auto_keeps_running_in_verify_phase_by_scheduling_foll
             },
         )
 
-        loop._run_agent_loop = AsyncMock(return_value=("iteration-1", [], [{"role": "assistant", "content": "iteration-1"}]))
+        loop._run_agent_loop = AsyncMock(
+            return_value=("iteration-1", [], [{"role": "assistant", "content": "iteration-1"}])
+        )
         loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
         loop._select_history_for_reply = MagicMock(return_value=[])
         loop.context.build_messages = MagicMock(return_value=[])
@@ -813,7 +919,9 @@ def test_workspace_harness_auto_keeps_running_in_verify_phase_by_scheduling_foll
         loop._schedule_background = lambda coro: coro.close()
         loop.tools.get = MagicMock(return_value=None)
 
-        with patch.object(AgentLoop, "_postprocess_workspace_agent_output", return_value="iteration-1-post"):
+        with patch.object(
+            AgentLoop, "_postprocess_workspace_agent_output", return_value="iteration-1-post"
+        ):
             result = await loop._process_message(msg)
 
         assert result is not None
@@ -823,8 +931,6 @@ def test_workspace_harness_auto_keeps_running_in_verify_phase_by_scheduling_foll
         assert follow_up.metadata["workspace_harness_auto"] is True
 
     asyncio.run(run())
-
-
 
 
 def test_workspace_harness_auto_skips_pre_reply_consolidation(tmp_path: Path) -> None:
@@ -854,7 +960,9 @@ def test_workspace_harness_auto_skips_pre_reply_consolidation(tmp_path: Path) ->
         )
 
         loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
-        loop._run_agent_loop = AsyncMock(return_value=("iteration-1", [], [{"role": "assistant", "content": "iteration-1"}]))
+        loop._run_agent_loop = AsyncMock(
+            return_value=("iteration-1", [], [{"role": "assistant", "content": "iteration-1"}])
+        )
         loop._select_history_for_reply = MagicMock(return_value=[])
         loop.context.build_messages = MagicMock(return_value=[])
         loop._save_turn = MagicMock()
@@ -862,7 +970,9 @@ def test_workspace_harness_auto_skips_pre_reply_consolidation(tmp_path: Path) ->
         loop._schedule_background = lambda coro: coro.close()
         loop.tools.get = MagicMock(return_value=None)
 
-        with patch.object(AgentLoop, "_postprocess_workspace_agent_output", return_value="iteration-1-post"):
+        with patch.object(
+            AgentLoop, "_postprocess_workspace_agent_output", return_value="iteration-1-post"
+        ):
             result = await loop._process_message(msg)
 
         assert result is not None
@@ -870,7 +980,6 @@ def test_workspace_harness_auto_skips_pre_reply_consolidation(tmp_path: Path) ->
         loop._run_pre_reply_consolidation.assert_not_awaited()
 
     asyncio.run(run())
-
 
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
@@ -897,7 +1006,9 @@ def test_workspace_harness_auto_skips_pre_reply_consolidation(tmp_path: Path) ->
             },
         )
 
-        loop._run_agent_loop = AsyncMock(return_value=("iteration-1", [], [{"role": "assistant", "content": "iteration-1"}]))
+        loop._run_agent_loop = AsyncMock(
+            return_value=("iteration-1", [], [{"role": "assistant", "content": "iteration-1"}])
+        )
         loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
         loop._select_history_for_reply = MagicMock(return_value=[])
         loop.context.build_messages = MagicMock(return_value=[])
@@ -907,7 +1018,9 @@ def test_workspace_harness_auto_skips_pre_reply_consolidation(tmp_path: Path) ->
         loop.tools.get = MagicMock(return_value=None)
 
         with (
-            patch.object(AgentLoop, "_postprocess_workspace_agent_output", return_value="iteration-1-post"),
+            patch.object(
+                AgentLoop, "_postprocess_workspace_agent_output", return_value="iteration-1-post"
+            ),
             patch("nanobot.command.workspace_bridge._prepare_agent_input") as mock_prepare,
         ):
             result = await loop._process_message(msg)
@@ -922,7 +1035,9 @@ def test_workspace_harness_auto_skips_pre_reply_consolidation(tmp_path: Path) ->
     asyncio.run(run())
 
 
-def test_workspace_harness_auto_skips_follow_up_when_harness_requests_user_decision(tmp_path: Path) -> None:
+def test_workspace_harness_auto_skips_follow_up_when_harness_requests_user_decision(
+    tmp_path: Path,
+) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(
@@ -948,7 +1063,9 @@ def test_workspace_harness_auto_skips_follow_up_when_harness_requests_user_decis
             },
         )
 
-        loop._run_agent_loop = AsyncMock(return_value=("iteration-1", [], [{"role": "assistant", "content": "iteration-1"}]))
+        loop._run_agent_loop = AsyncMock(
+            return_value=("iteration-1", [], [{"role": "assistant", "content": "iteration-1"}])
+        )
         loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
         loop._select_history_for_reply = MagicMock(return_value=[])
         loop.context.build_messages = MagicMock(return_value=[])
@@ -957,7 +1074,9 @@ def test_workspace_harness_auto_skips_follow_up_when_harness_requests_user_decis
         loop._schedule_background = lambda coro: coro.close()
         loop.tools.get = MagicMock(return_value=None)
 
-        with patch.object(AgentLoop, "_postprocess_workspace_agent_output", return_value="iteration-1-post"):
+        with patch.object(
+            AgentLoop, "_postprocess_workspace_agent_output", return_value="iteration-1-post"
+        ):
             result = await loop._process_message(msg)
 
         assert result is not None
@@ -967,7 +1086,9 @@ def test_workspace_harness_auto_skips_follow_up_when_harness_requests_user_decis
     asyncio.run(run())
 
 
-def test_subagent_system_message_preserves_harness_postprocess_and_auto_follow_up(tmp_path: Path) -> None:
+def test_subagent_system_message_preserves_harness_postprocess_and_auto_follow_up(
+    tmp_path: Path,
+) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(
@@ -997,10 +1118,20 @@ def test_subagent_system_message_preserves_harness_postprocess_and_auto_follow_u
         loop._save_turn = MagicMock()
         loop.sessions.save = MagicMock()
         loop._schedule_background = lambda coro: coro.close()
-        loop._run_agent_loop = AsyncMock(return_value=("raw-subagent-summary", [], [{"role": "assistant", "content": "raw-subagent-summary"}]))
+        loop._run_agent_loop = AsyncMock(
+            return_value=(
+                "raw-subagent-summary",
+                [],
+                [{"role": "assistant", "content": "raw-subagent-summary"}],
+            )
+        )
 
         with (
-            patch.object(AgentLoop, "_postprocess_workspace_agent_output", return_value="postprocessed-subagent-summary") as mock_post,
+            patch.object(
+                AgentLoop,
+                "_postprocess_workspace_agent_output",
+                return_value="postprocessed-subagent-summary",
+            ) as mock_post,
             patch.object(AgentLoop, "_should_schedule_harness_auto_continue", return_value=True),
         ):
             result = await loop._process_message(msg)
@@ -1053,7 +1184,10 @@ def test_subagent_system_message_sets_spawn_context_with_runtime_policy(tmp_path
             spawn_tool = loop.tools.get("spawn")
             assert spawn_tool is not None
             assert spawn_tool._metadata["workspace_agent_cmd"] == "harness"
-            assert spawn_tool._metadata["workspace_runtime"]["active_harness"]["subagent_allowed"] is False
+            assert (
+                spawn_tool._metadata["workspace_runtime"]["active_harness"]["subagent_allowed"]
+                is False
+            )
             return "done", [], list(messages) + [{"role": "assistant", "content": "done"}]
 
         loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
@@ -1066,7 +1200,9 @@ def test_subagent_system_message_sets_spawn_context_with_runtime_policy(tmp_path
     asyncio.run(run())
 
 
-def test_workspace_agent_summary_uses_prepared_input_but_persists_raw_slash_command(tmp_path: Path) -> None:
+def test_workspace_agent_summary_uses_prepared_input_but_persists_raw_slash_command(
+    tmp_path: Path,
+) -> None:
     async def run() -> None:
         loop, _bus = _make_loop(tmp_path)
         msg = InboundMessage(
@@ -1084,7 +1220,11 @@ def test_workspace_agent_summary_uses_prepared_input_but_persists_raw_slash_comm
 
         async def _run_agent_loop(messages, **kwargs):
             captured_messages[:] = messages
-            return "生成好的小结", [], list(messages) + [{"role": "assistant", "content": "生成好的小结"}]
+            return (
+                "生成好的小结",
+                [],
+                list(messages) + [{"role": "assistant", "content": "生成好的小结"}],
+            )
 
         loop._run_agent_loop = _run_agent_loop  # type: ignore[method-assign]
         loop._run_pre_reply_consolidation = AsyncMock(return_value=True)

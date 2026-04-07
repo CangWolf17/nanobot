@@ -33,6 +33,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.command.fastlane import try_workspace_fastlane
 from nanobot.bus.queue import MessageBus
+from nanobot.harness.service import HarnessService
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
@@ -141,31 +142,15 @@ class AgentLoop:
     _STREAM_COMPLETION_NOTICE_MIN_CHARS = 600
     _STREAM_COMPLETION_NOTICE_MIN_CHUNKS = 12
 
-    @staticmethod
-    def _redirect_workspace_harness_if_interrupted(user_input: str) -> None:
-        workspace_root = Path.home() / ".nanobot" / "workspace"
-        router_path = workspace_root / "scripts" / "router.py"
-        python_path = workspace_root / "venv" / "bin" / "python"
-        if not router_path.exists() or not python_path.exists():
-            return
+    def _redirect_workspace_harness_if_interrupted(self, user_input: str) -> None:
         try:
-            subprocess.run(
-                [str(python_path), str(router_path), "--redirect-harness", user_input],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                timeout=10,
-            )
+            HarnessService.for_workspace(self.workspace).redirect_active(user_input)
         except Exception:
             return
 
     def _extract_runtime_metadata(self, msg: InboundMessage) -> dict[str, Any]:
         meta = msg.metadata or {}
         explicit_runtime = meta.get("workspace_runtime")
-        if isinstance(explicit_runtime, dict) and explicit_runtime:
-            return explicit_runtime
-
-        workspace_root = self.workspace
         runtime_meta: dict[str, Any] = {}
 
         work_mode = str(meta.get("workspace_work_mode") or "").strip()
@@ -173,116 +158,26 @@ class AgentLoop:
             try:
                 from nanobot.agent.policy.dev_discipline import load_runtime_protocol
 
-                protocol = load_runtime_protocol(workspace_root)
+                protocol = load_runtime_protocol(self.workspace)
                 work_mode = str((protocol or {}).get("work_mode") or "").strip()
             except Exception:
                 work_mode = ""
         if work_mode in {"plan", "build"}:
             runtime_meta["work_mode"] = work_mode
 
-        control_path = workspace_root / "harnesses" / "control.json"
-        index_path = workspace_root / "harnesses" / "index.json"
-        if not control_path.exists() or not index_path.exists():
-            runtime_meta["has_active_harness"] = False
-            return runtime_meta
         try:
-            control = json.loads(control_path.read_text(encoding="utf-8"))
-            index = json.loads(index_path.read_text(encoding="utf-8"))
-            active_id = str(control.get("active_harness_id") or "").strip()
-            harnesses = index.get("harnesses") if isinstance(index, dict) else None
-            if not active_id or not isinstance(harnesses, dict):
-                runtime_meta["has_active_harness"] = False
-                return runtime_meta
-            harness = harnesses.get(active_id)
-            if not isinstance(harness, dict):
-                runtime_meta["has_active_harness"] = False
-                return runtime_meta
-
-            def _is_completed(item: dict[str, Any]) -> bool:
-                status = str(item.get("status") or "").strip().lower()
-                phase = str(item.get("phase") or "").strip().lower()
-                return status == "completed" or phase == "completed"
-
-            def _queue_order(item: dict[str, Any]) -> int:
-                value = item.get("queue_order")
-                try:
-                    normalized = int(value)
-                except (TypeError, ValueError):
-                    normalized = 0
-                if normalized > 0:
-                    return normalized
-                hid = str(item.get("id") or "").strip()
-                if hid.startswith("har_") and hid[4:].isdigit():
-                    return int(hid[4:])
-                return 10**9
-
-            def _child_payload(item: dict[str, Any], *, durable_auto: bool = False) -> dict[str, Any]:
-                return {
-                    "id": str(item.get("id") or "").strip(),
-                    "type": str(item.get("type") or "").strip(),
-                    "status": str(item.get("status") or "").strip(),
-                    "phase": str(item.get("phase") or "").strip(),
-                    "awaiting_user": bool(item.get("awaiting_user")),
-                    "blocked": bool(item.get("blocked")),
-                    "auto": durable_auto or bool(item.get("auto")),
-                }
-
-            durable_auto = bool(harness.get("auto"))
-            active_payload = {
-                "id": str(harness.get("id") or "").strip(),
-                "type": str(harness.get("type") or "").strip(),
-                "status": str(harness.get("status") or "").strip(),
-                "phase": str(harness.get("phase") or "").strip(),
-                "awaiting_user": bool(harness.get("awaiting_user")),
-                "blocked": bool(harness.get("blocked")),
-                "auto": bool(meta.get("workspace_harness_auto")) or durable_auto,
-                "executor_mode": str(harness.get("executor_mode") or "main").strip() or "main",
-                "subagent_allowed": bool(harness.get("subagent_allowed", False)),
-                "runner": str(harness.get("runner") or "main").strip() or "main",
-            }
-            runtime_meta["has_active_harness"] = True
-            runtime_meta["active_harness"] = active_payload
-
-            main_harness = harness
-            parent_id = str(harness.get("parent_id") or "").strip()
-            if parent_id:
-                parent = harnesses.get(parent_id)
-                if isinstance(parent, dict):
-                    main_harness = parent
-
-            main_payload = _child_payload(main_harness, durable_auto=active_payload["auto"])
-            main_payload["auto"] = active_payload["auto"]
-            runtime_meta["main_harness"] = main_payload
-
-            if str(main_harness.get("type") or "").strip() == "project":
-                children = [
-                    item for item in harnesses.values()
-                    if isinstance(item, dict) and str(item.get("parent_id") or "").strip() == str(main_harness.get("id") or "").strip()
-                ]
-                children.sort(key=lambda item: (_queue_order(item), str(item.get("created_at") or item.get("updated_at") or ""), str(item.get("id") or "")))
-                stop_gate_child = None
-                next_runnable_child = None
-                has_open_children = False
-                for child in children:
-                    status = str(child.get("status") or "").strip().lower()
-                    phase = str(child.get("phase") or "").strip().lower()
-                    if not _is_completed(child):
-                        has_open_children = True
-                    if stop_gate_child is None and (status in {"awaiting_decision", "blocked", "failed", "interrupted"} or phase in {"awaiting_decision", "blocked", "failed", "interrupted"}):
-                        stop_gate_child = _child_payload(child)
-                        break
-                    if next_runnable_child is None and not _is_completed(child):
-                        next_runnable_child = _child_payload(child)
-                main_payload["has_open_children"] = has_open_children
-                runtime_meta["main_harness"] = main_payload
-                runtime_meta["next_runnable_child"] = next_runnable_child
-                runtime_meta["stop_gate_child"] = stop_gate_child
-            else:
-                runtime_meta["next_runnable_child"] = None
-                runtime_meta["stop_gate_child"] = None
+            service_meta = HarnessService.for_workspace(self.workspace).runtime_metadata(
+                requested_auto=bool(meta.get("workspace_harness_auto"))
+            )
         except Exception:
-            runtime_meta["has_active_harness"] = False
+            service_meta = {"has_active_harness": False}
+        if bool(service_meta.get("has_active_harness")):
+            runtime_meta.update(service_meta)
             return runtime_meta
+        if isinstance(explicit_runtime, dict) and explicit_runtime:
+            runtime_meta.update(explicit_runtime)
+            return runtime_meta
+        runtime_meta.update(service_meta)
         return runtime_meta
 
     def _decide_harness_auto_reentry(self, msg: InboundMessage) -> dict[str, Any]:
@@ -304,8 +199,26 @@ class AgentLoop:
             decision["reason"] = "auto_disabled"
             return decision
 
+        service = HarnessService.for_workspace(self.workspace)
+        try:
+            service_meta = service.runtime_metadata(requested_auto=True)
+        except Exception:
+            service_meta = {"has_active_harness": False}
+        if bool(service_meta.get("has_active_harness")):
+            service_decision = service.decide_auto_continue(
+                session_key=msg.session_key,
+                sender_id=msg.sender_id,
+                origin_sender_id=origin_sender_id,
+            )
+            decision["should_fire"] = service_decision.should_fire
+            decision["reason"] = service_decision.reason
+            decision["origin_sender_id"] = service_decision.origin_sender_id
+            return decision
+
         runtime_meta = self._extract_runtime_metadata(msg)
-        active_harness = runtime_meta.get("active_harness") if isinstance(runtime_meta, dict) else None
+        active_harness = (
+            runtime_meta.get("active_harness") if isinstance(runtime_meta, dict) else None
+        )
         if not isinstance(active_harness, dict):
             decision["reason"] = "no_active_harness"
             return decision
@@ -314,8 +227,12 @@ class AgentLoop:
             return decision
 
         main_harness = runtime_meta.get("main_harness") if isinstance(runtime_meta, dict) else None
-        stop_gate_child = runtime_meta.get("stop_gate_child") if isinstance(runtime_meta, dict) else None
-        next_runnable_child = runtime_meta.get("next_runnable_child") if isinstance(runtime_meta, dict) else None
+        stop_gate_child = (
+            runtime_meta.get("stop_gate_child") if isinstance(runtime_meta, dict) else None
+        )
+        next_runnable_child = (
+            runtime_meta.get("next_runnable_child") if isinstance(runtime_meta, dict) else None
+        )
         main_target = main_harness if isinstance(main_harness, dict) else active_harness
 
         if isinstance(stop_gate_child, dict):
@@ -342,7 +259,9 @@ class AgentLoop:
 
         main_status = str(main_target.get("status") or "").strip().lower()
         has_open_children = bool(main_target.get("has_open_children"))
-        if main_status == "completed" and not (has_open_children and isinstance(next_runnable_child, dict)):
+        if main_status == "completed" and not (
+            has_open_children and isinstance(next_runnable_child, dict)
+        ):
             decision["reason"] = "completed"
             return decision
 
@@ -374,16 +293,16 @@ class AgentLoop:
     async def _schedule_harness_auto_continue(self, msg: InboundMessage) -> None:
         meta = dict(msg.metadata or {})
         origin_sender_id = str(meta.get("_origin_sender_id") or msg.sender_id or "").strip()
+        service = HarnessService.for_workspace(self.workspace)
         follow_up = InboundMessage(
             channel=msg.channel,
             sender_id="system",
             chat_id=msg.chat_id,
             content=msg.content,
-            metadata={
-                **meta,
-                "_auto_continue": True,
-                "_origin_sender_id": origin_sender_id,
-            },
+            metadata=service.build_auto_continue_metadata(
+                meta,
+                origin_sender_id=origin_sender_id,
+            ),
             session_key_override=msg.session_key,
         )
         await self.bus.publish_inbound(follow_up)
@@ -480,7 +399,6 @@ class AgentLoop:
         if mention_user_id:
             meta["_completion_notice_mention_user_id"] = mention_user_id
         response.metadata = meta
-
 
     def __init__(
         self,
@@ -646,7 +564,13 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
@@ -813,9 +737,7 @@ class AgentLoop:
                     saw_bullet = True
                     idx = next_idx
 
-            consumed, pending, next_idx = cls._consume_prefixed_line(
-                cleaned, idx, "Current Time: "
-            )
+            consumed, pending, next_idx = cls._consume_prefixed_line(cleaned, idx, "Current Time: ")
             if pending:
                 return None, True
             if not consumed:
@@ -826,9 +748,7 @@ class AgentLoop:
             cls._LEGACY_RUNTIME_CONTEXT_PREFIX
         ):
             return None, True
-        consumed, pending, next_idx = cls._consume_prefixed_line(
-            cleaned, 0, "Current Time: "
-        )
+        consumed, pending, next_idx = cls._consume_prefixed_line(cleaned, 0, "Current Time: ")
         if pending:
             return None, True
         if consumed:
@@ -923,9 +843,13 @@ class AgentLoop:
                 return on_stream is not None
 
             async def on_stream(self, context: AgentHookContext, delta: str) -> None:
-                prev_clean = loop_self._sanitize_visible_output(self._stream_buf, streaming=True) or ""
+                prev_clean = (
+                    loop_self._sanitize_visible_output(self._stream_buf, streaming=True) or ""
+                )
                 self._stream_buf += delta
-                new_clean = loop_self._sanitize_visible_output(self._stream_buf, streaming=True) or ""
+                new_clean = (
+                    loop_self._sanitize_visible_output(self._stream_buf, streaming=True) or ""
+                )
                 incremental = new_clean[len(prev_clean) :]
                 if incremental and on_stream:
                     await on_stream(incremental)
@@ -1052,7 +976,11 @@ class AgentLoop:
                         return f"{stream_base_id}:{stream_segment}"
 
                     async def on_stream(delta: str) -> None:
-                        nonlocal stream_started_at, stream_finished_at, stream_chunk_count, stream_char_count
+                        nonlocal \
+                            stream_started_at, \
+                            stream_finished_at, \
+                            stream_chunk_count, \
+                            stream_char_count
                         if delta:
                             now = time.monotonic()
                             if stream_started_at is None:
@@ -1412,7 +1340,9 @@ class AgentLoop:
         computed_runtime = self._extract_runtime_metadata(msg)
         if computed_runtime:
             tool_metadata["workspace_runtime"] = computed_runtime
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), tool_metadata)
+        self._set_tool_context(
+            msg.channel, msg.chat_id, msg.metadata.get("message_id"), tool_metadata
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -1426,12 +1356,16 @@ class AgentLoop:
         )
         persisted_role = "assistant" if msg.sender_id == "subagent" else "user"
         persisted_turn_content = msg.content
-        self._register_inflight_turn(msg.session_key, role=persisted_role, content=persisted_turn_content)
+        self._register_inflight_turn(
+            msg.session_key, role=persisted_role, content=persisted_turn_content
+        )
         effective_on_stream = on_stream
         if on_stream is not None:
+
             async def _capture_stream(delta: str) -> None:
                 self._append_inflight_assistant_delta(msg.session_key, delta)
                 await on_stream(delta)
+
             effective_on_stream = _capture_stream
         initial_messages = self.context.build_messages(
             history=history,
@@ -1469,8 +1403,6 @@ class AgentLoop:
         )
 
         final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
-
-
 
         if final_content is None:
             final_content = AgentRunner._user_facing_error_message(
@@ -1515,12 +1447,18 @@ class AgentLoop:
             metadata=meta,
         )
 
-    @staticmethod
-    def _postprocess_workspace_agent_output(msg: InboundMessage, final_content: str) -> str:
+    def _postprocess_workspace_agent_output(self, msg: InboundMessage, final_content: str) -> str:
         """Run workspace router postprocess hook for agent-routed slash commands."""
         cmd = (msg.metadata or {}).get("workspace_agent_cmd")
         if not cmd:
             return final_content
+
+        if cmd == "harness":
+            result = HarnessService.for_workspace(self.workspace).apply_agent_update(
+                final_content,
+                session_key=msg.session_key,
+            )
+            return result.final_content
 
         router_path = Path.home() / ".nanobot" / "workspace" / "scripts" / "router.py"
         if not router_path.exists():

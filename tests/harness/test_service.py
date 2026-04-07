@@ -129,3 +129,54 @@ def test_service_renderers_use_canonical_store_views(tmp_path: Path) -> None:
     assert "cleanup" not in list_text.lower()
     assert "har_cleanup" in workflows_text
     assert "cleanup" in workflows_text.lower()
+
+
+def test_harness_auto_continue_decision_comes_from_service_not_workspace_projection(
+    tmp_path: Path,
+) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+
+    decision = service.decide_auto_continue(session_key="feishu:c1", sender_id="u1")
+
+    assert decision.reason in {"continue", "awaiting_user", "blocked", "completed"}
+
+
+def test_interrupt_updates_harness_state_without_workspace_router_subprocess(
+    tmp_path: Path,
+) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    service.interrupt_active("interrupted — waiting for redirect")
+
+    status = service.render_status()
+
+    assert "interrupted" in status.lower()
+
+
+def test_structured_harness_apply_updates_store_and_generates_closeout(tmp_path: Path) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    update = """```json
+    {"harness": {"status": "completed", "phase": "completed", "summary": "done", "verification_status": "passed", "verification_summary": "focused tests passed", "git_delivery_status": "no_commit_required", "git_delivery_summary": "analysis-only"}}
+    ```"""
+
+    result = service.apply_agent_update(update, session_key="feishu:c1")
+
+    assert result.closeout_required is True
+    assert "focused tests passed" in result.closeout_summary

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from nanobot.harness.models import HarnessRecord, HarnessSnapshot
 from nanobot.harness.store import HarnessStore
@@ -25,10 +28,26 @@ class WorkflowStartResult:
     prepared_input: str
 
 
+@dataclass(frozen=True)
+class HarnessAutoContinueDecision:
+    should_fire: bool
+    reason: str
+    origin_sender_id: str
+
+
+@dataclass(frozen=True)
+class HarnessApplyResult:
+    final_content: str
+    closeout_required: bool
+    closeout_summary: str
+
+
 @dataclass
 class HarnessService:
     workspace_root: Path
     store: HarnessStore
+
+    _JSON_BLOCK_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 
     @classmethod
     def for_workspace(cls, workspace_root: Path) -> "HarnessService":
@@ -143,6 +162,15 @@ class HarnessService:
             ]
         )
 
+    def render_status_summary(self) -> str | None:
+        snapshot = self.store.load()
+        active = self._get_active_record(snapshot)
+        if active is None:
+            return None
+        if active.summary:
+            return f"{active.status} / {active.phase} — {active.summary}"
+        return f"{active.status} / {active.phase}"
+
     def render_list(self) -> str:
         snapshot = self.store.load()
         records = [record for record in snapshot.records.values() if record.kind != "workflow"]
@@ -161,6 +189,179 @@ class HarnessService:
         return "\n".join(
             f"- {record.id}: {record.workflow.get('name') or record.title or '[unnamed workflow]'} ({record.status}/{record.phase})"
             for record in sorted(records, key=lambda item: item.id)
+        )
+
+    def runtime_metadata(self, *, requested_auto: bool = False) -> dict[str, Any]:
+        snapshot = self.store.load()
+        active = self._get_active_record(snapshot)
+        if active is None:
+            return {"has_active_harness": False}
+
+        active_payload = self._runtime_payload(active, requested_auto=requested_auto)
+        main = active
+        if active.parent_id:
+            parent = snapshot.records.get(active.parent_id)
+            if parent is not None:
+                main = parent
+
+        main_payload = self._runtime_payload(main, requested_auto=active_payload["auto"])
+        payload: dict[str, Any] = {
+            "has_active_harness": True,
+            "active_harness": active_payload,
+            "main_harness": main_payload,
+            "next_runnable_child": None,
+            "stop_gate_child": None,
+        }
+
+        if main.type != "project":
+            return payload
+
+        children = [record for record in snapshot.records.values() if record.parent_id == main.id]
+        children.sort(
+            key=lambda item: (
+                self._record_queue_order(item),
+                item.created_at or item.updated_at,
+                item.id,
+            )
+        )
+        main_payload["has_open_children"] = any(
+            not self._is_completed(record) for record in children
+        )
+        for child in children:
+            if payload["stop_gate_child"] is None and self._is_stop_gate(child):
+                payload["stop_gate_child"] = self._runtime_child_payload(child)
+                break
+            if payload["next_runnable_child"] is None and not self._is_completed(child):
+                payload["next_runnable_child"] = self._runtime_child_payload(child)
+        return payload
+
+    def decide_auto_continue(
+        self,
+        *,
+        session_key: str,
+        sender_id: str,
+        origin_sender_id: str = "",
+    ) -> HarnessAutoContinueDecision:
+        runtime_meta = self.runtime_metadata(requested_auto=True)
+        origin = origin_sender_id or sender_id
+        if not bool(runtime_meta.get("has_active_harness")):
+            return HarnessAutoContinueDecision(
+                should_fire=False,
+                reason="no_active_harness",
+                origin_sender_id=origin,
+            )
+
+        active_harness = runtime_meta.get("active_harness")
+        main_harness = runtime_meta.get("main_harness")
+        stop_gate_child = runtime_meta.get("stop_gate_child")
+        next_runnable_child = runtime_meta.get("next_runnable_child")
+        active = active_harness if isinstance(active_harness, dict) else {}
+        main = main_harness if isinstance(main_harness, dict) else active
+
+        if isinstance(stop_gate_child, dict):
+            if bool(stop_gate_child.get("awaiting_user")):
+                return HarnessAutoContinueDecision(False, "awaiting_user", origin)
+            if bool(stop_gate_child.get("blocked")):
+                return HarnessAutoContinueDecision(False, "blocked", origin)
+            stop_status = str(stop_gate_child.get("status") or "").strip().lower()
+            if stop_status in {"awaiting_decision", "failed", "interrupted"}:
+                return HarnessAutoContinueDecision(False, stop_status, origin)
+
+        if bool(main.get("awaiting_user")):
+            return HarnessAutoContinueDecision(False, "awaiting_user", origin)
+        if bool(main.get("blocked")):
+            return HarnessAutoContinueDecision(False, "blocked", origin)
+
+        main_status = str(main.get("status") or "").strip().lower()
+        has_open_children = bool(main.get("has_open_children"))
+        if main_status == "completed" and not (
+            has_open_children and isinstance(next_runnable_child, dict)
+        ):
+            return HarnessAutoContinueDecision(False, "completed", origin)
+
+        if isinstance(next_runnable_child, dict):
+            child_status = str(next_runnable_child.get("status") or "").strip().lower()
+            if child_status in {"planning", "active"}:
+                return HarnessAutoContinueDecision(True, "continue", origin)
+
+        status = str(active.get("status") or "").strip().lower()
+        if status == "completed":
+            return HarnessAutoContinueDecision(False, "completed", origin)
+        if bool(active.get("awaiting_user")):
+            return HarnessAutoContinueDecision(False, "awaiting_user", origin)
+        if bool(active.get("blocked")):
+            return HarnessAutoContinueDecision(False, "blocked", origin)
+        return HarnessAutoContinueDecision(True, "continue", origin)
+
+    def build_auto_continue_metadata(
+        self,
+        metadata: dict[str, Any] | None,
+        *,
+        origin_sender_id: str,
+    ) -> dict[str, Any]:
+        base = dict(metadata or {})
+        base["_auto_continue"] = True
+        base["_origin_sender_id"] = origin_sender_id
+        runtime_meta = self.runtime_metadata(
+            requested_auto=bool(base.get("workspace_harness_auto"))
+        )
+        if runtime_meta:
+            base["workspace_runtime"] = runtime_meta
+        return base
+
+    def interrupt_active(self, summary: str) -> bool:
+        snapshot = self.store.load()
+        active = self._get_active_record(snapshot)
+        if active is None:
+            return False
+        active.status = "interrupted"
+        active.phase = "interrupted"
+        active.summary = summary.strip() or active.summary
+        active.resume_hint = summary.strip() or active.resume_hint
+        active.updated_at = timestamp()
+        self._save_snapshot(snapshot)
+        return True
+
+    def redirect_active(self, user_input: str) -> bool:
+        snapshot = self.store.load()
+        active = self._get_active_record(snapshot)
+        if active is None or active.status != "interrupted":
+            return False
+        active.status = "active"
+        active.phase = "planning"
+        active.resume_hint = user_input.strip() or active.resume_hint
+        active.next_step = user_input.strip() or active.next_step
+        active.updated_at = timestamp()
+        self._save_snapshot(snapshot)
+        return True
+
+    def apply_agent_update(self, content: str, *, session_key: str) -> HarnessApplyResult:
+        payload = self._extract_harness_update_payload(content)
+        if not isinstance(payload, dict):
+            return HarnessApplyResult(
+                final_content=content,
+                closeout_required=False,
+                closeout_summary="",
+            )
+
+        snapshot = self.store.load()
+        active = self._get_active_record(snapshot)
+        if active is None:
+            return HarnessApplyResult(
+                final_content=content,
+                closeout_required=False,
+                closeout_summary="",
+            )
+
+        self._apply_record_update(active, payload)
+        self._save_snapshot(snapshot)
+
+        closeout_required = self._is_completed(active)
+        closeout_summary = self._build_closeout_summary(active) if closeout_required else ""
+        return HarnessApplyResult(
+            final_content=closeout_summary or content,
+            closeout_required=closeout_required,
+            closeout_summary=closeout_summary,
         )
 
     def _create_work_harness(self, snapshot: HarnessSnapshot, goal: str) -> HarnessRecord:
@@ -274,6 +475,111 @@ class HarnessService:
         if not active_id:
             return None
         return snapshot.records.get(active_id)
+
+    @staticmethod
+    def _is_completed(record: HarnessRecord) -> bool:
+        return record.status == "completed" or record.phase == "completed"
+
+    @staticmethod
+    def _is_stop_gate(record: HarnessRecord) -> bool:
+        if record.awaiting_user or record.blocked:
+            return True
+        return record.status in {
+            "awaiting_decision",
+            "blocked",
+            "failed",
+            "interrupted",
+        } or record.phase in {
+            "awaiting_decision",
+            "blocked",
+            "failed",
+            "interrupted",
+        }
+
+    @staticmethod
+    def _record_queue_order(record: HarnessRecord) -> int:
+        if record.queue_order > 0:
+            return record.queue_order
+        if record.id.startswith("har_") and record.id[4:].isdigit():
+            return int(record.id[4:])
+        return 10**9
+
+    def _runtime_payload(self, record: HarnessRecord, *, requested_auto: bool) -> dict[str, Any]:
+        return {
+            "id": record.id,
+            "type": record.type,
+            "status": record.status,
+            "phase": record.phase,
+            "awaiting_user": record.awaiting_user,
+            "blocked": record.blocked,
+            "auto": requested_auto or record.execution_policy.auto_continue,
+            "executor_mode": record.execution_policy.executor_mode,
+            "subagent_allowed": record.execution_policy.subagent_allowed,
+            "runner": record.runtime_state.runner,
+        }
+
+    def _runtime_child_payload(self, record: HarnessRecord) -> dict[str, Any]:
+        return {
+            "id": record.id,
+            "type": record.type,
+            "status": record.status,
+            "phase": record.phase,
+            "awaiting_user": record.awaiting_user,
+            "blocked": record.blocked,
+            "auto": record.execution_policy.auto_continue,
+        }
+
+    def _extract_harness_update_payload(self, content: str) -> dict[str, Any] | None:
+        match = self._JSON_BLOCK_RE.search(content or "")
+        if match is None:
+            return None
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        harness = payload.get("harness")
+        return harness if isinstance(harness, dict) else None
+
+    def _apply_record_update(self, record: HarnessRecord, payload: dict[str, Any]) -> None:
+        direct_fields = {
+            "status": "status",
+            "phase": "phase",
+            "summary": "summary",
+            "next_step": "next_step",
+            "resume_hint": "resume_hint",
+        }
+        for payload_key, attr_name in direct_fields.items():
+            value = payload.get(payload_key)
+            if value is not None:
+                setattr(record, attr_name, str(value).strip())
+        for payload_key, attr_name in {
+            "awaiting_user": "awaiting_user",
+            "blocked": "blocked",
+        }.items():
+            value = payload.get(payload_key)
+            if isinstance(value, bool):
+                setattr(record, attr_name, value)
+        if payload.get("verification_status") is not None:
+            record.verification["status"] = str(payload.get("verification_status") or "").strip()
+        if payload.get("verification_summary") is not None:
+            record.verification["summary"] = str(payload.get("verification_summary") or "").strip()
+        if payload.get("git_delivery_status") is not None:
+            record.git_delivery["status"] = str(payload.get("git_delivery_status") or "").strip()
+        if payload.get("git_delivery_summary") is not None:
+            record.git_delivery["summary"] = str(payload.get("git_delivery_summary") or "").strip()
+        record.updated_at = timestamp()
+
+    def _build_closeout_summary(self, record: HarnessRecord) -> str:
+        lines = [record.summary.strip()] if record.summary.strip() else []
+        verification_summary = str(record.verification.get("summary") or "").strip()
+        git_summary = str(record.git_delivery.get("summary") or "").strip()
+        if verification_summary:
+            lines.append(f"Verification: {verification_summary}")
+        if git_summary:
+            lines.append(f"Git: {git_summary}")
+        return "\n".join(lines).strip() or "Harness completed."
 
     def _next_queue_order(self, snapshot: HarnessSnapshot) -> int:
         if not snapshot.records:

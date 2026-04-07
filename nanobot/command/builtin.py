@@ -15,6 +15,7 @@ from nanobot.command.harness import cmd_harness
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.command.workspace_bridge import cmd_workspace_bridge
 from nanobot.config.paths import get_workspace_path
+from nanobot.harness.service import HarnessService
 from nanobot.utils.helpers import build_status_content
 
 
@@ -70,20 +71,7 @@ async def _sync_workspace_interrupt_harness(
     workspace_root: Path | None = None,
 ) -> None:
     workspace_root = workspace_root or _resolve_workspace_root()
-    router_path = workspace_root / "scripts" / "router.py"
-    python_path = workspace_root / "venv" / "bin" / "python"
-    if not router_path.exists() or not python_path.exists():
-        return
-    try:
-        subprocess.run(
-            [str(python_path), str(router_path), "--interrupt-harness", summary],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            timeout=10,
-        )
-    except Exception:
-        return
+    HarnessService.for_workspace(workspace_root).interrupt_active(summary)
 
 
 async def _read_workspace_harness_status_summary(
@@ -91,6 +79,10 @@ async def _read_workspace_harness_status_summary(
     workspace_root: Path | None = None,
 ) -> str | None:
     workspace_root = workspace_root or _resolve_workspace_root()
+    summary = HarnessService.for_workspace(workspace_root).render_status_summary()
+    if summary is not None:
+        return summary
+
     task_path = workspace_root / "TASK.md"
     if not task_path.exists():
         return None
@@ -102,26 +94,20 @@ async def _read_workspace_harness_status_summary(
     lines = [line.rstrip() for line in text.splitlines()]
     status = None
     phase = None
-    summary = None
+    task_summary = None
     for line in lines:
         if line.startswith("- status: "):
             status = line.split(": ", 1)[1].strip()
         elif line.startswith("- phase: "):
             phase = line.split(": ", 1)[1].strip()
         elif line.startswith("- summary: "):
-            summary = line.split(": ", 1)[1].strip()
+            task_summary = line.split(": ", 1)[1].strip()
     if not status:
         return None
-    status_l = status.lower()
-    phase_l = (phase or "").lower()
-    if status_l not in {"interrupted", "planning", "active", "awaiting_decision", "blocked"}:
-        return None
-    if status_l == "active" and phase_l != "executing":
-        return None
-    if status_l == "planning" and phase_l != "planning":
-        return None
-    if summary:
-        return f"{status} / {phase or '-'} — {summary}" if phase else f"{status} — {summary}"
+    if task_summary:
+        return (
+            f"{status} / {phase or '-'} — {task_summary}" if phase else f"{status} — {task_summary}"
+        )
     return f"{status} / {phase}" if phase else status
 
 

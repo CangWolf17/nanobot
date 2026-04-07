@@ -19,9 +19,11 @@ def _make_loop(*, exec_config=None):
     workspace = MagicMock()
     workspace.__truediv__ = MagicMock(return_value=MagicMock())
 
-    with patch("nanobot.agent.loop.ContextBuilder"), \
-         patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
+    with (
+        patch("nanobot.agent.loop.ContextBuilder"),
+        patch("nanobot.agent.loop.SessionManager"),
+        patch("nanobot.agent.loop.SubagentManager") as MockSubMgr,
+    ):
         MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, exec_config=exec_config)
     return loop, bus
@@ -36,7 +38,9 @@ class TestHandleStop:
 
         loop, bus = _make_loop()
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
-        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+        ctx = CommandContext(
+            msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop
+        )
         out = await cmd_interrupt(ctx)
         assert "No active task" in out.content
 
@@ -61,7 +65,9 @@ class TestHandleStop:
         loop._active_tasks["test:c1"] = [task]
 
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
-        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+        ctx = CommandContext(
+            msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop
+        )
         out = await cmd_interrupt(ctx)
 
         assert cancelled.is_set()
@@ -91,7 +97,9 @@ class TestHandleStop:
         loop._active_tasks["test:c1"] = [task]
 
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
-        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+        ctx = CommandContext(
+            msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop
+        )
         out = await cmd_interrupt(ctx)
 
         assert cancelled.is_set()
@@ -130,7 +138,9 @@ class TestHandleStop:
         }
 
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
-        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+        ctx = CommandContext(
+            msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop
+        )
         with patch("nanobot.command.builtin._sync_workspace_interrupt_harness", new=AsyncMock()):
             out = await cmd_interrupt(ctx)
 
@@ -173,14 +183,24 @@ class TestHandleStop:
             "assistant_partial": partial,
         }
 
-        interrupt_msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
-        interrupt_ctx = CommandContext(msg=interrupt_msg, session=None, key=interrupt_msg.session_key, raw="/interrupt", loop=loop)
+        interrupt_msg = InboundMessage(
+            channel="test", sender_id="u1", chat_id="c1", content="/interrupt"
+        )
+        interrupt_ctx = CommandContext(
+            msg=interrupt_msg,
+            session=None,
+            key=interrupt_msg.session_key,
+            raw="/interrupt",
+            loop=loop,
+        )
         with patch("nanobot.command.builtin._sync_workspace_interrupt_harness", new=AsyncMock()):
             await cmd_interrupt(interrupt_ctx)
 
         captured = {}
-        loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
-        loop._select_history_for_reply = MagicMock(side_effect=lambda s, preflight_ok=True: s.get_history(max_messages=0))
+        loop._maybe_run_pre_reply_consolidation = AsyncMock(return_value=True)
+        loop._select_history_for_reply = MagicMock(
+            side_effect=lambda s, preflight_ok=True: s.get_history(max_messages=0)
+        )
 
         def _build_messages(*, history, current_message, **kwargs):
             captured["history"] = history
@@ -201,15 +221,22 @@ class TestHandleStop:
         assert cancelled.is_set()
         assert response is not None
         assert response.content == "done"
-        assert any(item.get("role") == "assistant" and partial in str(item.get("content") or "") for item in captured["history"])
+        assert any(
+            item.get("role") == "assistant" and partial in str(item.get("content") or "")
+            for item in captured["history"]
+        )
 
     @pytest.mark.asyncio
-    async def test_interrupt_updates_workspace_harness_state_when_active_task_exists(self, tmp_path):
+    async def test_interrupt_updates_workspace_harness_state_when_active_task_exists(
+        self, tmp_path
+    ):
         from nanobot.bus.events import InboundMessage
         from nanobot.command.builtin import cmd_interrupt
         from nanobot.command.router import CommandContext
+        from nanobot.harness.service import HarnessService
 
         loop, _bus = _make_loop()
+        loop.workspace = tmp_path / ".nanobot" / "workspace"
         session = MagicMock()
         session.metadata = {}
         loop.sessions.get_or_create.return_value = session
@@ -225,27 +252,23 @@ class TestHandleStop:
         task = asyncio.create_task(slow_task())
         await asyncio.sleep(0)
         loop._active_tasks["test:c1"] = [task]
+        service = HarnessService.for_workspace(loop.workspace)
+        service.handle_command(
+            "/harness 修复 interrupt 的真实接线",
+            session_key="test:c1",
+            sender_id="u1",
+        )
 
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
-        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+        ctx = CommandContext(
+            msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop
+        )
 
-        with (
-            patch("nanobot.command.builtin.Path.home", return_value=tmp_path),
-            patch("nanobot.command.builtin.subprocess.run", return_value=MagicMock(stdout="updated", stderr="", returncode=0)) as mock_run,
-        ):
-            workspace_root = tmp_path / ".nanobot" / "workspace"
-            (workspace_root / "scripts").mkdir(parents=True)
-            (workspace_root / "venv" / "bin").mkdir(parents=True)
-            (workspace_root / "scripts" / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
-            (workspace_root / "venv" / "bin" / "python").write_text("#!/bin/sh\n", encoding="utf-8")
-            out = await cmd_interrupt(ctx)
+        out = await cmd_interrupt(ctx)
 
         assert cancelled.is_set()
         assert "interrupted" in out.content.lower()
-        argv = mock_run.call_args.args[0]
-        assert argv[1].endswith("router.py")
-        assert argv[2] == "--interrupt-harness"
-        assert argv[3] == "interrupted — waiting for redirect"
+        assert "interrupted" in service.render_status().lower()
 
     @pytest.mark.asyncio
     async def test_interrupt_skips_workspace_harness_update_when_no_active_task(self, tmp_path):
@@ -255,7 +278,9 @@ class TestHandleStop:
 
         loop, _bus = _make_loop()
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
-        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
+        ctx = CommandContext(
+            msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop
+        )
 
         with (
             patch("nanobot.command.builtin.Path.home", return_value=tmp_path),
@@ -295,7 +320,6 @@ class TestHandleStop:
 
         assert cancelled.is_set()
         assert "interrupt_state" not in session.metadata
-
 
     @pytest.mark.asyncio
     async def test_new_does_not_touch_workspace_harness_durable_truth(self, tmp_path):
@@ -505,6 +529,7 @@ class TestSubagentCancellation:
                 )
             captured_second_call[:] = messages
             return LLMResponse(content="done", tool_calls=[])
+
         provider.chat_with_retry = scripted_chat_with_retry
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
 
@@ -516,12 +541,15 @@ class TestSubagentCancellation:
         await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
 
         assistant_messages = [
-            msg for msg in captured_second_call
+            msg
+            for msg in captured_second_call
             if msg.get("role") == "assistant" and msg.get("tool_calls")
         ]
         assert len(assistant_messages) == 1
         assert assistant_messages[0]["reasoning_content"] == "hidden reasoning"
-        assert assistant_messages[0]["thinking_blocks"] == [{"type": "thinking", "thinking": "step"}]
+        assert assistant_messages[0]["thinking_blocks"] == [
+            {"type": "thinking", "thinking": "step"}
+        ]
 
     @pytest.mark.asyncio
     async def test_subagent_announces_error_when_tool_execution_fails(self, monkeypatch, tmp_path):
@@ -532,10 +560,12 @@ class TestSubagentCancellation:
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
-            content="thinking",
-            tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
-        ))
+        provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(
+                content="thinking",
+                tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
+            )
+        )
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
         mgr._announce_result = AsyncMock()
 
@@ -560,7 +590,9 @@ class TestSubagentCancellation:
         assert args[5] == "error"
 
     @pytest.mark.asyncio
-    async def test_spawn_context_propagates_session_key_and_subagent_inherits_strict_mode(self, tmp_path):
+    async def test_spawn_context_propagates_session_key_and_subagent_inherits_strict_mode(
+        self, tmp_path
+    ):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.agent.tools.spawn import SpawnTool
         from nanobot.agent.runner import AgentRunResult
@@ -584,12 +616,14 @@ class TestSubagentCancellation:
         )
 
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
-        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
-            final_content="done",
-            messages=[],
-            tools_used=[],
-            usage={},
-        ))
+        mgr.runner.run = AsyncMock(
+            return_value=AgentRunResult(
+                final_content="done",
+                messages=[],
+                tools_used=[],
+                usage={},
+            )
+        )
         mgr._announce_result = AsyncMock()
 
         spawn_tool = SpawnTool(manager=mgr)
@@ -607,7 +641,9 @@ class TestSubagentCancellation:
         assert mgr._session_tasks == {}
 
     @pytest.mark.asyncio
-    async def test_spawn_context_can_preserve_workspace_harness_metadata_for_subagent_completion(self, tmp_path):
+    async def test_spawn_context_can_preserve_workspace_harness_metadata_for_subagent_completion(
+        self, tmp_path
+    ):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.agent.tools.spawn import SpawnTool
         from nanobot.agent.runner import AgentRunResult
@@ -618,12 +654,14 @@ class TestSubagentCancellation:
         provider.get_default_model.return_value = "test-model"
 
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
-        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
-            final_content="done",
-            messages=[],
-            tools_used=[],
-            usage={},
-        ))
+        mgr.runner.run = AsyncMock(
+            return_value=AgentRunResult(
+                final_content="done",
+                messages=[],
+                tools_used=[],
+                usage={},
+            )
+        )
 
         spawn_tool = SpawnTool(manager=mgr)
         spawn_tool.set_context(
@@ -689,7 +727,9 @@ class TestSubagentCancellation:
         mgr.spawn.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_spawn_acquires_resource_lease_before_starting_background_task(self, monkeypatch, tmp_path):
+    async def test_spawn_acquires_resource_lease_before_starting_background_task(
+        self, monkeypatch, tmp_path
+    ):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.agent.subagent_resources import AcquireDecision, SubagentLease
         from nanobot.bus.queue import MessageBus
@@ -746,7 +786,9 @@ class TestSubagentCancellation:
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
 
         resource_manager = MagicMock()
-        resource_manager.acquire.return_value = AcquireDecision(status="rejected", reason="queue_limit")
+        resource_manager.acquire.return_value = AcquireDecision(
+            status="rejected", reason="queue_limit"
+        )
         resource_manager.release = MagicMock()
         mgr.resource_manager = resource_manager
         mgr._resolve_subagent_request = MagicMock(return_value=object())
@@ -759,7 +801,9 @@ class TestSubagentCancellation:
         mgr._run_subagent.assert_not_awaited()
         assert mgr._running_tasks == {}
 
-    def test_resolve_subagent_request_prefers_explicit_model_then_tier_then_harness_defaults(self, tmp_path):
+    def test_resolve_subagent_request_prefers_explicit_model_then_tier_then_harness_defaults(
+        self, tmp_path
+    ):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
 
@@ -793,8 +837,146 @@ class TestSubagentCancellation:
         assert request.harness_model == "standard-gpt-5.4-high-aizhiwen-top"
         assert request.harness_tier == "standard"
 
+    def test_build_subagent_prompt_injects_runtime_context_bundle(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "gpt-5.4"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        prompt = mgr._build_subagent_prompt(
+            origin={
+                "channel": "feishu",
+                "chat_id": "c1",
+                "metadata": {
+                    "workspace_runtime": {
+                        "work_mode": "build",
+                        "has_active_harness": True,
+                        "active_harness": {
+                            "id": "har_0024",
+                            "type": "feature",
+                            "status": "active",
+                            "phase": "runnable",
+                            "awaiting_user": False,
+                            "blocked": False,
+                            "auto": False,
+                        },
+                        "main_harness": {
+                            "id": "har_0002",
+                            "type": "project",
+                            "status": "active",
+                            "phase": "planning",
+                            "has_open_children": True,
+                        },
+                    }
+                },
+            }
+        )
+
+        assert "## Subagent Execution Context" in prompt
+        assert "### Project Context" in prompt
+        assert "har_0024" in prompt
+        assert "### Today's Context" in prompt
+        assert "work_mode: build" in prompt
+        assert "### Output Rules" in prompt
+        assert "recommend a concrete next step" in prompt.lower()
+        assert "### Role Framing" in prompt
+        assert "senior engineer" in prompt.lower()
+
     @pytest.mark.asyncio
-    async def test_run_subagent_rebuilds_provider_from_lease_and_uses_provider_model(self, monkeypatch, tmp_path):
+    async def test_run_subagent_injects_context_bundle_before_task_text(
+        self, monkeypatch, tmp_path
+    ):
+        from nanobot.agent.runner import AgentRunner, AgentRunResult
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "gpt-5.4"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+        mgr._announce_result = AsyncMock()
+
+        captured = {}
+
+        async def fake_run(self, spec):
+            captured["messages"] = spec.initial_messages
+            return AgentRunResult(final_content="done", messages=[], tools_used=[], usage={})
+
+        monkeypatch.setattr(AgentRunner, "run", fake_run)
+
+        await mgr._run_subagent(
+            "sub-1",
+            "Inspect scripts/subagent.py and report the wiring gap.",
+            "inject-check",
+            {
+                "channel": "feishu",
+                "chat_id": "c1",
+                "metadata": {
+                    "workspace_runtime": {
+                        "work_mode": "build",
+                        "has_active_harness": True,
+                        "active_harness": {
+                            "id": "har_0024",
+                            "type": "feature",
+                            "status": "active",
+                            "phase": "runnable",
+                            "awaiting_user": False,
+                            "blocked": False,
+                            "auto": False,
+                        },
+                    }
+                },
+            },
+            None,
+        )
+
+        user_message = captured["messages"][1]["content"]
+        assert "## Subagent Execution Context" in user_message
+        assert "### Project Context" in user_message
+        assert "har_0024" in user_message
+        assert "Inspect scripts/subagent.py and report the wiring gap." in user_message
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_keeps_manual_task_text_as_additive_override(
+        self, monkeypatch, tmp_path
+    ):
+        from nanobot.agent.runner import AgentRunner, AgentRunResult
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "gpt-5.4"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+        mgr._announce_result = AsyncMock()
+
+        captured = {}
+
+        async def fake_run(self, spec):
+            captured["messages"] = spec.initial_messages
+            return AgentRunResult(final_content="done", messages=[], tools_used=[], usage={})
+
+        monkeypatch.setattr(AgentRunner, "run", fake_run)
+
+        await mgr._run_subagent(
+            "sub-2",
+            "Extra caller note: focus only on spawn metadata passthrough.",
+            "inject-additive",
+            {"channel": "feishu", "chat_id": "c1", "metadata": {}},
+            None,
+        )
+
+        user_message = captured["messages"][1]["content"]
+        assert "## Subagent Execution Context" in user_message
+        assert "Extra caller note: focus only on spawn metadata passthrough." in user_message
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_rebuilds_provider_from_lease_and_uses_provider_model(
+        self, monkeypatch, tmp_path
+    ):
         from nanobot.agent.runner import AgentRunResult, AgentRunner
         from nanobot.agent.subagent import SubagentManager
         from nanobot.agent.subagent_resources import SubagentLease
@@ -825,17 +1007,24 @@ class TestSubagentCancellation:
             captured["model"] = spec.model
             return AgentRunResult(final_content="done", messages=[], tools_used=[], usage={})
 
-        monkeypatch.setattr(mgr, "_build_provider_for_lease", MagicMock(return_value=(child_provider, "MiniMax-M2.7")))
+        monkeypatch.setattr(
+            mgr,
+            "_build_provider_for_lease",
+            MagicMock(return_value=(child_provider, "MiniMax-M2.7")),
+        )
         monkeypatch.setattr(AgentRunner, "run", fake_run)
 
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease)
+        await mgr._run_subagent(
+            "sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease
+        )
 
         mgr._build_provider_for_lease.assert_called_once_with(lease)
         assert captured["model"] == "MiniMax-M2.7"
 
-
     @pytest.mark.asyncio
-    async def test_run_subagent_records_hard_provider_failure_and_shrinks_current_candidate_pool(self, tmp_path):
+    async def test_run_subagent_records_hard_provider_failure_and_shrinks_current_candidate_pool(
+        self, tmp_path
+    ):
         import json
 
         from nanobot.agent.runner import AgentRunResult
@@ -854,7 +1043,11 @@ class TestSubagentCancellation:
                     "route": "aizhiwen-top",
                     "provider": "custom",
                     "provider_model": "gpt-5.4",
-                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k-a", "extra_headers": {}},
+                    "connection": {
+                        "api_base": "https://aizhiwen.top/v1",
+                        "api_key": "k-a",
+                        "extra_headers": {},
+                    },
                     "agent": {"temperature": 0.3, "max_tokens": 8192},
                     "enabled": True,
                     "template": False,
@@ -867,7 +1060,11 @@ class TestSubagentCancellation:
                     "route": "tokenx",
                     "provider": "custom",
                     "provider_model": "gpt-5.4",
-                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k-t", "extra_headers": {}},
+                    "connection": {
+                        "api_base": "https://tokenx24.com/v1",
+                        "api_key": "k-t",
+                        "extra_headers": {},
+                    },
                     "agent": {"temperature": 0.3, "max_tokens": 8192},
                     "enabled": True,
                     "template": False,
@@ -876,7 +1073,10 @@ class TestSubagentCancellation:
             },
         }
         (tmp_path / "config.json").write_text(
-            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            json.dumps(
+                {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+            )
+            + "\n",
             encoding="utf-8",
         )
         (tmp_path / "model_registry.json").write_text(
@@ -894,14 +1094,16 @@ class TestSubagentCancellation:
             model="standard-gpt-5.4-high-aizhiwen-top",
         )
         mgr._announce_result = AsyncMock()
-        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
-            final_content=None,
-            messages=[],
-            tools_used=[],
-            usage={},
-            stop_reason="error",
-            error="quota exceeded",
-        ))
+        mgr.runner.run = AsyncMock(
+            return_value=AgentRunResult(
+                final_content=None,
+                messages=[],
+                tools_used=[],
+                usage={},
+                stop_reason="error",
+                error="quota exceeded",
+            )
+        )
 
         lease = SubagentLease(
             model_id="standard-gpt-5.4-high-aizhiwen-top",
@@ -910,10 +1112,17 @@ class TestSubagentCancellation:
             effort="high",
         )
 
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease)
+        await mgr._run_subagent(
+            "sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease
+        )
 
-        assert mgr.resource_manager.route_policies["aizhiwen-top"].availability == "hard_unavailable"
-        assert mgr.resource_manager.route_policies["aizhiwen-top"].unavailable_reason == "quota_exhausted"
+        assert (
+            mgr.resource_manager.route_policies["aizhiwen-top"].availability == "hard_unavailable"
+        )
+        assert (
+            mgr.resource_manager.route_policies["aizhiwen-top"].unavailable_reason
+            == "quota_exhausted"
+        )
 
         follow_up = mgr.resource_manager.acquire(mgr.resource_manager.default_request())
         assert follow_up.status == "granted"
@@ -927,7 +1136,9 @@ class TestSubagentCancellation:
         assert "updated_at" in updated["provider_status"]["aizhiwen-top"]
 
     @pytest.mark.asyncio
-    async def test_run_subagent_records_transient_provider_failure_without_shrinking_candidate_pool(self, tmp_path):
+    async def test_run_subagent_records_transient_provider_failure_without_shrinking_candidate_pool(
+        self, tmp_path
+    ):
         import json
 
         from nanobot.agent.runner import AgentRunResult
@@ -946,7 +1157,11 @@ class TestSubagentCancellation:
                     "route": "aizhiwen-top",
                     "provider": "custom",
                     "provider_model": "gpt-5.4",
-                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k-a", "extra_headers": {}},
+                    "connection": {
+                        "api_base": "https://aizhiwen.top/v1",
+                        "api_key": "k-a",
+                        "extra_headers": {},
+                    },
                     "agent": {"temperature": 0.3, "max_tokens": 8192},
                     "enabled": True,
                     "template": False,
@@ -959,7 +1174,11 @@ class TestSubagentCancellation:
                     "route": "tokenx",
                     "provider": "custom",
                     "provider_model": "gpt-5.4",
-                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k-t", "extra_headers": {}},
+                    "connection": {
+                        "api_base": "https://tokenx24.com/v1",
+                        "api_key": "k-t",
+                        "extra_headers": {},
+                    },
                     "agent": {"temperature": 0.3, "max_tokens": 8192},
                     "enabled": True,
                     "template": False,
@@ -968,7 +1187,10 @@ class TestSubagentCancellation:
             },
         }
         (tmp_path / "config.json").write_text(
-            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            json.dumps(
+                {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+            )
+            + "\n",
             encoding="utf-8",
         )
         (tmp_path / "model_registry.json").write_text(
@@ -986,14 +1208,16 @@ class TestSubagentCancellation:
             model="standard-gpt-5.4-high-aizhiwen-top",
         )
         mgr._announce_result = AsyncMock()
-        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
-            final_content=None,
-            messages=[],
-            tools_used=[],
-            usage={},
-            stop_reason="error",
-            error="HTTP 502 upstream timeout",
-        ))
+        mgr.runner.run = AsyncMock(
+            return_value=AgentRunResult(
+                final_content=None,
+                messages=[],
+                tools_used=[],
+                usage={},
+                stop_reason="error",
+                error="HTTP 502 upstream timeout",
+            )
+        )
 
         lease = SubagentLease(
             model_id="standard-gpt-5.4-high-aizhiwen-top",
@@ -1002,9 +1226,14 @@ class TestSubagentCancellation:
             effort="high",
         )
 
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease)
+        await mgr._run_subagent(
+            "sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease
+        )
 
-        assert mgr.resource_manager.route_policies["aizhiwen-top"].availability == "transient_unavailable"
+        assert (
+            mgr.resource_manager.route_policies["aizhiwen-top"].availability
+            == "transient_unavailable"
+        )
         assert mgr.resource_manager.route_policies["aizhiwen-top"].unavailable_reason == "http_502"
 
         follow_up = mgr.resource_manager.acquire(mgr.resource_manager.default_request())
@@ -1018,10 +1247,10 @@ class TestSubagentCancellation:
         assert updated["provider_status"]["aizhiwen-top"]["source"] == "runtime_error"
         assert "updated_at" in updated["provider_status"]["aizhiwen-top"]
 
-
-
     @pytest.mark.asyncio
-    async def test_run_subagent_error_uses_provider_probe_to_refresh_route_when_probe_succeeds(self, tmp_path):
+    async def test_run_subagent_error_uses_provider_probe_to_refresh_route_when_probe_succeeds(
+        self, tmp_path
+    ):
         import json
 
         from nanobot.agent.runner import AgentRunResult
@@ -1040,7 +1269,11 @@ class TestSubagentCancellation:
                     "route": "aizhiwen-top",
                     "provider": "custom",
                     "provider_model": "gpt-5.4",
-                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k-a", "extra_headers": {}},
+                    "connection": {
+                        "api_base": "https://aizhiwen.top/v1",
+                        "api_key": "k-a",
+                        "extra_headers": {},
+                    },
                     "agent": {"temperature": 0.3, "max_tokens": 8192},
                     "enabled": True,
                     "template": False,
@@ -1053,7 +1286,11 @@ class TestSubagentCancellation:
                     "route": "tokenx",
                     "provider": "custom",
                     "provider_model": "gpt-5.4",
-                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k-t", "extra_headers": {}},
+                    "connection": {
+                        "api_base": "https://tokenx24.com/v1",
+                        "api_key": "k-t",
+                        "extra_headers": {},
+                    },
                     "agent": {"temperature": 0.3, "max_tokens": 8192},
                     "enabled": True,
                     "template": False,
@@ -1062,7 +1299,10 @@ class TestSubagentCancellation:
             },
         }
         (tmp_path / "config.json").write_text(
-            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            json.dumps(
+                {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+            )
+            + "\n",
             encoding="utf-8",
         )
         (tmp_path / "model_registry.json").write_text(
@@ -1073,12 +1313,14 @@ class TestSubagentCancellation:
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "standard-gpt-5.4-high-aizhiwen-top"
-        provider_probe = MagicMock(return_value={
-            "ok": True,
-            "provider": "custom",
-            "api_base": "https://aizhiwen.top/v1",
-            "reason": "OK",
-        })
+        provider_probe = MagicMock(
+            return_value={
+                "ok": True,
+                "provider": "custom",
+                "api_base": "https://aizhiwen.top/v1",
+                "reason": "OK",
+            }
+        )
         mgr = SubagentManager(
             provider=provider,
             workspace=tmp_path,
@@ -1087,14 +1329,16 @@ class TestSubagentCancellation:
             provider_probe=provider_probe,
         )
         mgr._announce_result = AsyncMock()
-        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
-            final_content=None,
-            messages=[],
-            tools_used=[],
-            usage={},
-            stop_reason="error",
-            error="quota exceeded",
-        ))
+        mgr.runner.run = AsyncMock(
+            return_value=AgentRunResult(
+                final_content=None,
+                messages=[],
+                tools_used=[],
+                usage={},
+                stop_reason="error",
+                error="quota exceeded",
+            )
+        )
 
         lease = SubagentLease(
             model_id="standard-gpt-5.4-high-aizhiwen-top",
@@ -1103,7 +1347,9 @@ class TestSubagentCancellation:
             effort="high",
         )
 
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease)
+        await mgr._run_subagent(
+            "sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease
+        )
 
         provider_probe.assert_called_once_with(tmp_path, ref="standard-gpt-5.4-high-aizhiwen-top")
         assert mgr.resource_manager.route_policies["aizhiwen-top"].availability == "available"
@@ -1112,7 +1358,9 @@ class TestSubagentCancellation:
         assert updated["provider_status"]["aizhiwen-top"]["source"] == "monitor_refresh"
 
     @pytest.mark.asyncio
-    async def test_run_subagent_success_refreshes_current_route_status_in_manager_and_workspace(self, tmp_path):
+    async def test_run_subagent_success_refreshes_current_route_status_in_manager_and_workspace(
+        self, tmp_path
+    ):
         import json
 
         from nanobot.agent.runner import AgentRunResult
@@ -1142,7 +1390,11 @@ class TestSubagentCancellation:
                     "route": "aizhiwen-top",
                     "provider": "custom",
                     "provider_model": "gpt-5.4",
-                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k-a", "extra_headers": {}},
+                    "connection": {
+                        "api_base": "https://aizhiwen.top/v1",
+                        "api_key": "k-a",
+                        "extra_headers": {},
+                    },
                     "agent": {"temperature": 0.3, "max_tokens": 8192},
                     "enabled": True,
                     "template": False,
@@ -1155,7 +1407,11 @@ class TestSubagentCancellation:
                     "route": "tokenx",
                     "provider": "custom",
                     "provider_model": "gpt-5.4",
-                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k-t", "extra_headers": {}},
+                    "connection": {
+                        "api_base": "https://tokenx24.com/v1",
+                        "api_key": "k-t",
+                        "extra_headers": {},
+                    },
                     "agent": {"temperature": 0.3, "max_tokens": 8192},
                     "enabled": True,
                     "template": False,
@@ -1164,7 +1420,10 @@ class TestSubagentCancellation:
             },
         }
         (tmp_path / "config.json").write_text(
-            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            json.dumps(
+                {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+            )
+            + "\n",
             encoding="utf-8",
         )
         (tmp_path / "model_registry.json").write_text(
@@ -1182,12 +1441,14 @@ class TestSubagentCancellation:
             model="standard-gpt-5.4-high-aizhiwen-top",
         )
         mgr._announce_result = AsyncMock()
-        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
-            final_content="done",
-            messages=[],
-            tools_used=[],
-            usage={},
-        ))
+        mgr.runner.run = AsyncMock(
+            return_value=AgentRunResult(
+                final_content="done",
+                messages=[],
+                tools_used=[],
+                usage={},
+            )
+        )
 
         lease = SubagentLease(
             model_id="standard-gpt-5.4-high-aizhiwen-top",
@@ -1196,9 +1457,13 @@ class TestSubagentCancellation:
             effort="high",
         )
 
-        assert mgr.resource_manager.route_policies["aizhiwen-top"].availability == "hard_unavailable"
+        assert (
+            mgr.resource_manager.route_policies["aizhiwen-top"].availability == "hard_unavailable"
+        )
 
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease)
+        await mgr._run_subagent(
+            "sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, lease
+        )
 
         assert mgr.resource_manager.route_policies["aizhiwen-top"].availability == "available"
         assert mgr.resource_manager.route_policies["aizhiwen-top"].unavailable_reason == ""
@@ -1244,12 +1509,14 @@ class TestSubagentCancellation:
         mgr.resource_manager = resource_manager
         mgr._resolve_subagent_request = MagicMock(return_value=object())
         mgr._announce_result = AsyncMock()
-        mgr.runner.run = AsyncMock(return_value=AgentRunResult(
-            final_content="done",
-            messages=[],
-            tools_used=[],
-            usage={},
-        ))
+        mgr.runner.run = AsyncMock(
+            return_value=AgentRunResult(
+                final_content="done",
+                messages=[],
+                tools_used=[],
+                usage={},
+            )
+        )
 
         result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
         assert "started" in result.lower()
@@ -1302,10 +1569,12 @@ class TestSubagentCancellation:
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
-            content="thinking",
-            tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
-        ))
+        provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(
+                content="thinking",
+                tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
+            )
+        )
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
         mgr._announce_result = AsyncMock()
 
@@ -1355,10 +1624,12 @@ class TestSubagentCancellation:
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
-            content="thinking",
-            tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
-        ))
+        provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(
+                content="thinking",
+                tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
+            )
+        )
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
         mgr._announce_result = AsyncMock()
 

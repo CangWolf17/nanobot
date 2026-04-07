@@ -11,6 +11,7 @@ from nanobot.command.builtin import (
     register_builtin_commands,
 )
 from nanobot.command.router import CommandContext, CommandRouter
+from nanobot.harness.service import HarnessService
 
 
 def _make_ctx(raw: str) -> CommandContext:
@@ -145,24 +146,18 @@ def test_status_summary_helper_reads_from_explicit_workspace_root(tmp_path: Path
 
 def test_interrupt_sync_helper_uses_explicit_workspace_root(tmp_path: Path) -> None:
     workspace_root = tmp_path / "runtime-workspace"
-    router_path = workspace_root / "scripts" / "router.py"
-    python_path = workspace_root / "venv" / "bin" / "python"
-    router_path.parent.mkdir(parents=True, exist_ok=True)
-    python_path.parent.mkdir(parents=True, exist_ok=True)
-    router_path.write_text("#!/bin/sh\n", encoding="utf-8")
-    python_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    service = HarnessService.for_workspace(workspace_root)
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
 
-    with patch("nanobot.command.builtin.subprocess.run") as mock_run:
-        asyncio.run(
-            _sync_workspace_interrupt_harness(
-                "interrupted — waiting for redirect",
-                workspace_root=workspace_root,
-            )
+    asyncio.run(
+        _sync_workspace_interrupt_harness(
+            "interrupted — waiting for redirect",
+            workspace_root=workspace_root,
         )
+    )
 
-    assert mock_run.call_args.args[0] == [
-        str(python_path),
-        str(router_path),
-        "--interrupt-harness",
-        "interrupted — waiting for redirect",
-    ]
+    assert "interrupted" in service.render_status().lower()
