@@ -1,20 +1,108 @@
-from nanobot.harness.models import HarnessExecutionPolicy, HarnessRecord, HarnessRuntimeState, HarnessSnapshot
+from nanobot.harness.models import (
+    HarnessExecutionPolicy,
+    HarnessRecord,
+    HarnessRuntimeState,
+    HarnessSnapshot,
+)
 
 
-def test_snapshot_to_dict_includes_policy_and_runtime_defaults() -> None:
+def test_snapshot_to_dict_includes_canonical_store_fields() -> None:
     snapshot = HarnessSnapshot(
+        version=2,
+        updated_at="2026-04-07T10:00:00",
         active_harness_id="har_0001",
         records={
             "har_0001": HarnessRecord(
                 id="har_0001",
+                kind="workflow",
+                type="project",
                 title="Legacy harness",
+                parent_id="har_0000",
+                queue_order=3,
+                status="active",
+                phase="executing",
                 summary="keep canonical state here",
+                awaiting_user=True,
+                blocked=False,
+                next_step="continue",
+                resume_hint="resume from child",
+                verification={
+                    "status": "passed",
+                    "summary": "focused pytest passed",
+                    "artifacts": ["pytest -q"],
+                },
+                git_delivery={
+                    "status": "committed",
+                    "summary": "commit abc123",
+                },
+                pending_decisions=["approve merge"],
+                artifacts=["artifact.txt"],
+                workflow={
+                    "name": "merge",
+                    "spec_path": "/specs/merge.yaml",
+                    "spec_hash": "sha256:abc",
+                    "memory": {"phase": "review"},
+                    "return_to": "har_0000",
+                    "awaiting_confirmation": True,
+                },
+                created_at="2026-04-07T09:00:00",
+                updated_at="2026-04-07T10:00:00",
+                execution_policy=HarnessExecutionPolicy(
+                    executor_mode="auto", subagent_allowed=True
+                ),
+                runtime_state=HarnessRuntimeState(runner="subagent", subagent_status="running"),
             )
         },
     )
 
     payload = snapshot.to_dict()
 
-    assert payload["active_harness_id"] == "har_0001"
-    assert payload["records"]["har_0001"]["execution_policy"] == HarnessExecutionPolicy().__dict__
-    assert payload["records"]["har_0001"]["runtime_state"] == HarnessRuntimeState().__dict__
+    assert payload == {
+        "version": 2,
+        "updated_at": "2026-04-07T10:00:00",
+        "active_harness_id": "har_0001",
+        "records": {
+            "har_0001": {
+                "id": "har_0001",
+                "kind": "workflow",
+                "type": "project",
+                "title": "Legacy harness",
+                "parent_id": "har_0000",
+                "queue_order": 3,
+                "status": "active",
+                "phase": "executing",
+                "summary": "keep canonical state here",
+                "awaiting_user": True,
+                "blocked": False,
+                "next_step": "continue",
+                "resume_hint": "resume from child",
+                "verification": {
+                    "status": "passed",
+                    "summary": "focused pytest passed",
+                    "artifacts": ["pytest -q"],
+                },
+                "git_delivery": {
+                    "status": "committed",
+                    "summary": "commit abc123",
+                },
+                "pending_decisions": ["approve merge"],
+                "artifacts": ["artifact.txt"],
+                "workflow": {
+                    "name": "merge",
+                    "spec_path": "/specs/merge.yaml",
+                    "spec_hash": "sha256:abc",
+                    "memory": {"phase": "review"},
+                    "return_to": "har_0000",
+                    "awaiting_confirmation": True,
+                },
+                "created_at": "2026-04-07T09:00:00",
+                "updated_at": "2026-04-07T10:00:00",
+                "execution_policy": HarnessExecutionPolicy(
+                    executor_mode="auto", subagent_allowed=True
+                ).to_dict(),
+                "runtime_state": HarnessRuntimeState(
+                    runner="subagent", subagent_status="running"
+                ).to_dict(),
+            }
+        },
+    }
