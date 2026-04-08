@@ -1,5 +1,6 @@
 import json
 import re
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,11 +39,6 @@ def test_make_memory_archive_provider_non_minimax_falls_back_with_warning(monkey
 
 class _StopGatewayError(RuntimeError):
     pass
-
-
-import shutil
-
-import pytest
 
 
 @pytest.fixture

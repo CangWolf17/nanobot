@@ -245,6 +245,7 @@ class TestSendDelta:
         ch = _make_channel()
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(
@@ -272,6 +273,7 @@ class TestSendDelta:
         ch.config.streaming_completion_notice_mention_user = True
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(
@@ -302,6 +304,7 @@ class TestSendDelta:
         ch.config.streaming_completion_notice_mention_user = True
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(
@@ -333,6 +336,7 @@ class TestSendDelta:
         ch.config.streaming_completion_notice_mention_fallback_name = "Tim"
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(

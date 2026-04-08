@@ -180,7 +180,7 @@ class WebSearchTool(Tool):
             headers = {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
             async with httpx.AsyncClient(proxy=self.proxy) as client:
                 r = await client.get(
-                    f"https://s.jina.ai/",
+                    "https://s.jina.ai/",
                     params={"q": query},
                     headers=headers,
                     timeout=15.0,
@@ -234,8 +234,15 @@ class WebFetchTool(Tool):
         self.max_chars = max_chars
         self.proxy = proxy
 
-    async def execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> Any:
-        max_chars = maxChars or self.max_chars
+    async def execute(
+        self,
+        url: str,
+        extract_mode: str = "markdown",
+        max_chars: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        extract_mode = kwargs.pop("extractMode", extract_mode)
+        max_chars = kwargs.pop("maxChars", max_chars) or self.max_chars
         is_valid, error_msg = _validate_url_safe(url)
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url}, ensure_ascii=False)
@@ -260,7 +267,7 @@ class WebFetchTool(Tool):
 
         result = await self._fetch_jina(url, max_chars)
         if result is None:
-            result = await self._fetch_readability(url, extractMode, max_chars)
+            result = await self._fetch_readability(url, extract_mode, max_chars)
         return result
 
     async def _fetch_jina(self, url: str, max_chars: int) -> str | None:

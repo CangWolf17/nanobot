@@ -150,7 +150,7 @@ def test_harness_auto_continue_decision_comes_from_service_not_workspace_project
 def test_auto_continue_decision_falls_back_to_session_bound_harness(tmp_path: Path) -> None:
     service = HarnessService.for_workspace(tmp_path)
 
-    first = service.handle_command(
+    _first = service.handle_command(
         "/harness 修复 interrupt 的真实接线",
         session_key="feishu:c1",
         sender_id="u1",

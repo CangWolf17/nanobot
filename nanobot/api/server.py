@@ -102,7 +102,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
     logger.info("API request session_key={} content={}", session_key, user_content[:80])
 
-    _FALLBACK = AgentRunner._user_facing_error_message(
+    _fallback = AgentRunner._user_facing_error_message(
         "empty model response",
         retry_count=0,
         fallback="模型返回了空响应。请稍后重试，或切换模型。",
@@ -127,7 +127,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         "Empty response for session {}, using unified fallback",
                         session_key,
                     )
-                    response_text = _FALLBACK
+                    response_text = _fallback
 
             except asyncio.TimeoutError:
                 return _error_json(504, f"Request timed out after {timeout_s}s")

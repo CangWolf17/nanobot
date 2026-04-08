@@ -1,10 +1,10 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-import asyncio
 import pytest
 
-from nanobot.agent.loop import AgentLoop
 import nanobot.agent.memory as memory_module
+from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
 
@@ -258,7 +258,7 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
 @pytest.mark.asyncio
 async def test_pre_reply_consolidation_skips_when_prompt_under_budget(tmp_path) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
-    session = loop.sessions.get_or_create("cli:test")
+    _session = loop.sessions.get_or_create("cli:test")
 
     loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
     loop.memory_consolidator.is_over_budget = lambda _session, max_history_messages=0: (False, 80, "test")  # type: ignore[method-assign]

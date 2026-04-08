@@ -6,7 +6,7 @@ import asyncio
 import re
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from loguru import logger
@@ -917,7 +917,7 @@ class TelegramChannel(BaseChannel):
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
         from telegram.error import NetworkError, TimedOut
-        
+
         if isinstance(context.error, (NetworkError, TimedOut)):
             logger.warning("Telegram network issue: {}", str(context.error))
         else:

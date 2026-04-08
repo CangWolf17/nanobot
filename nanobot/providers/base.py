@@ -9,7 +9,6 @@ from typing import Any
 
 from loguru import logger
 
-
 EMPTY_MODEL_RESPONSE_ERROR = "empty model response"
 
 

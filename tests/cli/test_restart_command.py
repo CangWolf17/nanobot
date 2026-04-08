@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundMessage
 from nanobot.providers.base import LLMResponse
 
 
@@ -113,7 +113,7 @@ class TestRestartCommand:
     def test_help_falls_back_to_shared_builtin_help_text_when_workspace_help_unavailable(
         self, tmp_path
     ):
-        from nanobot.command.builtin import cmd_help, build_help_text
+        from nanobot.command.builtin import build_help_text, cmd_help
         from nanobot.command.router import CommandContext
 
         async def run() -> None:

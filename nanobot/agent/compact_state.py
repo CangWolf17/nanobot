@@ -10,7 +10,6 @@ from loguru import logger
 
 from nanobot.agent.memory import _is_tool_choice_unsupported
 
-
 _SAVE_COMPACT_STATE_TOOL = [
     {
         "type": "function",

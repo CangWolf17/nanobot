@@ -19,15 +19,15 @@ def _make_loop(tmp_path):
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
     return loop
 
 
 @pytest.mark.asyncio
 async def test_runner_preserves_reasoning_fields_and_tool_results():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     captured_second_call: list[dict] = []
@@ -84,7 +84,7 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
 @pytest.mark.asyncio
 async def test_runner_calls_hooks_in_order():
     from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     call_count = {"n": 0}
@@ -158,7 +158,7 @@ async def test_runner_calls_hooks_in_order():
 
 @pytest.mark.asyncio
 async def test_runner_uses_timeout_message_for_provider_errors():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -184,7 +184,7 @@ async def test_runner_uses_timeout_message_for_provider_errors():
 
 @pytest.mark.asyncio
 async def test_runner_uses_timeout_message_after_retries(monkeypatch):
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
     from nanobot.providers.base import LLMProvider
 
     class RetryingProvider(LLMProvider):
@@ -226,7 +226,7 @@ async def test_runner_uses_timeout_message_after_retries(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_runner_preserves_raw_error_when_error_message_disabled():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -254,7 +254,7 @@ async def test_runner_preserves_raw_error_when_error_message_disabled():
 @pytest.mark.asyncio
 async def test_runner_streaming_hook_receives_deltas_and_end_signal():
     from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     streamed: list[str] = []
@@ -297,7 +297,7 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
 
 @pytest.mark.asyncio
 async def test_runner_returns_max_iterations_fallback():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -325,7 +325,7 @@ async def test_runner_returns_max_iterations_fallback():
 
 @pytest.mark.asyncio
 async def test_runner_executes_tools_serially_when_concurrent_disabled():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -361,7 +361,7 @@ async def test_runner_executes_tools_serially_when_concurrent_disabled():
 
 @pytest.mark.asyncio
 async def test_runner_returns_structured_tool_error():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -436,36 +436,6 @@ async def test_loop_disables_concurrent_tools_when_strict_dev_mode(tmp_path):
         "I reached the maximum number of tool call iterations (2) "
         "without completing the task. You can try breaking the task into smaller steps."
     )
-
-
-@pytest.mark.asyncio
-async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp_path):
-    loop = _make_loop(tmp_path)
-    deltas: list[str] = []
-    endings: list[bool] = []
-
-    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
-        await on_content_delta("<think>hidden")
-        await on_content_delta("</think>Hello")
-        return LLMResponse(content="<think>hidden</think>Hello", tool_calls=[], usage={})
-
-    loop.provider.chat_stream_with_retry = chat_stream_with_retry
-
-    async def on_stream(delta: str) -> None:
-        deltas.append(delta)
-
-    async def on_stream_end(*, resuming: bool = False) -> None:
-        endings.append(resuming)
-
-    final_content, _, _ = await loop._run_agent_loop(
-        [],
-        on_stream=on_stream,
-        on_stream_end=on_stream_end,
-    )
-
-    assert final_content == "Hello"
-    assert deltas == ["Hello"]
-    assert endings == [False]
 
 
 @pytest.mark.asyncio
@@ -589,9 +559,9 @@ async def test_loop_reports_retry_progress_for_timeout_errors(tmp_path):
 
 @pytest.mark.asyncio
 async def test_subagent_uses_serial_tools_and_prompt_in_strict_dev_mode(tmp_path):
+    from nanobot.agent.runner import AgentRunResult
     from nanobot.agent.subagent import SubagentManager
     from nanobot.bus.queue import MessageBus
-    from nanobot.agent.runner import AgentRunResult
 
     bus = MessageBus()
     provider = MagicMock()

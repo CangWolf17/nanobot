@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from types import SimpleNamespace
 
 import pytest
 
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.api.server import handle_chat_completions
 from nanobot.bus.events import OutboundMessage

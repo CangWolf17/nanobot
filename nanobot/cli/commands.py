@@ -1,12 +1,11 @@
 """CLI commands for nanobot."""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-
 import os
 import select
 import signal
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -532,6 +531,7 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 def _warn_deprecated_config_keys(config_path: Path | None) -> None:
     """Hint users to remove obsolete keys from their config file."""
     import json
+
     from nanobot.config.loader import get_config_path
 
     path = config_path or get_config_path()
@@ -625,12 +625,12 @@ def gateway(
 ):
     """Start the nanobot gateway."""
     from nanobot.agent.loop import AgentLoop
+    from nanobot.agent.subagent_resources import probe_due_provider_routes
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
-    from nanobot.agent.subagent_resources import probe_due_provider_routes
     from nanobot.session.manager import SessionManager
 
     if verbose:

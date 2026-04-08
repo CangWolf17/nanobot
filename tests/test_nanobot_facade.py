@@ -163,6 +163,7 @@ async def test_run_custom_session_key(tmp_path):
 
 
 def test_import_from_top_level():
-    from nanobot import Nanobot as N, RunResult as R
-    assert N is Nanobot
-    assert R is RunResult
+    import nanobot as nanobot_pkg
+
+    assert nanobot_pkg.Nanobot is Nanobot
+    assert nanobot_pkg.RunResult is RunResult

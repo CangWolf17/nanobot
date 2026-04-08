@@ -28,9 +28,9 @@ _LAZY_IMPORTS = {
 if TYPE_CHECKING:
     from nanobot.providers.anthropic_provider import AnthropicProvider
     from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
+    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
     from nanobot.providers.openai_compat_provider import OpenAICompatProvider
     from nanobot.providers.openai_responses_provider import OpenAIResponsesProvider
-    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
 
 def __getattr__(name: str):
