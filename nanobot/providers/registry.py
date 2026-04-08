@@ -15,8 +15,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic.alias_generators import to_snake
-
 
 @dataclass(frozen=True)
 class ProviderSpec:
@@ -62,6 +60,9 @@ class ProviderSpec:
 
     # Provider supports cache_control on content blocks (e.g. Anthropic prompt caching)
     supports_prompt_caching: bool = False
+
+    # Provider can be used with the Responses API adapter.
+    supports_responses_api: bool = False
 
     @property
     def label(self) -> str:
@@ -193,6 +194,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         env_key="OPENAI_API_KEY",
         display_name="OpenAI",
         backend="openai_compat",
+        supports_responses_api=True,
     ),
     # OpenAI Codex: OAuth-based, dedicated provider
     ProviderSpec(
@@ -340,10 +342,15 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 # ---------------------------------------------------------------------------
 
 
+def normalize_lookup_name(name: str) -> str:
+    """Normalize provider/adapter identifiers for tolerant lookups."""
+    return "".join(ch for ch in name.strip().lower() if ch.isalnum())
+
+
 def find_by_name(name: str) -> ProviderSpec | None:
     """Find a provider spec by config field name, e.g. "dashscope"."""
-    normalized = to_snake(name.replace("-", "_"))
+    normalized = normalize_lookup_name(name)
     for spec in PROVIDERS:
-        if spec.name == normalized:
+        if normalize_lookup_name(spec.name) == normalized:
             return spec
     return None
