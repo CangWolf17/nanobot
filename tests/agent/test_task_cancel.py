@@ -22,9 +22,9 @@ def _make_loop(*, exec_config=None):
     with (
         patch("nanobot.agent.loop.ContextBuilder"),
         patch("nanobot.agent.loop.SessionManager"),
-        patch("nanobot.agent.loop.SubagentManager") as MockSubMgr,
+        patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr,
     ):
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, exec_config=exec_config)
     return loop, bus
 
@@ -592,9 +592,9 @@ class TestSubagentCancellation:
     async def test_spawn_context_propagates_session_key_and_subagent_inherits_strict_mode(
         self, tmp_path
     ):
+        from nanobot.agent.runner import AgentRunResult
         from nanobot.agent.subagent import SubagentManager
         from nanobot.agent.tools.spawn import SpawnTool
-        from nanobot.agent.runner import AgentRunResult
         from nanobot.bus.queue import MessageBus
 
         bus = MessageBus()
@@ -643,9 +643,9 @@ class TestSubagentCancellation:
     async def test_spawn_context_can_preserve_workspace_harness_metadata_for_subagent_completion(
         self, tmp_path
     ):
+        from nanobot.agent.runner import AgentRunResult
         from nanobot.agent.subagent import SubagentManager
         from nanobot.agent.tools.spawn import SpawnTool
-        from nanobot.agent.runner import AgentRunResult
         from nanobot.bus.queue import MessageBus
 
         bus = MessageBus()
@@ -976,7 +976,7 @@ class TestSubagentCancellation:
     async def test_run_subagent_rebuilds_provider_from_lease_and_uses_provider_model(
         self, monkeypatch, tmp_path
     ):
-        from nanobot.agent.runner import AgentRunResult, AgentRunner
+        from nanobot.agent.runner import AgentRunner, AgentRunResult
         from nanobot.agent.subagent import SubagentManager
         from nanobot.agent.subagent_resources import SubagentLease
         from nanobot.bus.queue import MessageBus
@@ -1019,6 +1019,136 @@ class TestSubagentCancellation:
 
         mgr._build_provider_for_lease.assert_called_once_with(lease)
         assert captured["model"] == "MiniMax-M2.7"
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_rebuilds_provider_from_v2_registry_lease(self, tmp_path):
+        import json
+
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import SubagentLease
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 2,
+            "profile_defaults": {"chat": {"ref": "standard-gpt-5.4-high-tokenx"}},
+            "routes": {
+                "tokenx": {
+                    "config_provider_ref": "custom",
+                    "adapter": "openai_compat",
+                    "api_base_override": "https://tokenx24.com/v1",
+                }
+            },
+            "models": {
+                "standard-gpt-5.4-high-tokenx": {
+                    "family": "gpt-5.4",
+                    "tier": "standard",
+                    "effort": "high",
+                    "route_ref": "tokenx",
+                    "provider_model": "gpt-5.4",
+                    "enabled": True,
+                    "template": False,
+                    "capabilities": {"tool_calls": True},
+                }
+            },
+        }
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "agents": {"defaults": {"model": "gpt-5.4"}},
+                    "providers": {"custom": {"apiKey": "k-tokenx"}},
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        parent_provider = MagicMock()
+        parent_provider.get_default_model.return_value = "parent-model"
+        mgr = SubagentManager(provider=parent_provider, workspace=tmp_path, bus=bus)
+
+        provider, model = mgr._build_provider_for_lease(
+            SubagentLease(
+                model_id="standard-gpt-5.4-high-tokenx",
+                tier="standard",
+                route="tokenx",
+                effort="high",
+            )
+        )
+
+        assert provider.get_default_model() == "gpt-5.4"
+        assert model == "gpt-5.4"
+
+    def test_build_provider_for_lease_falls_back_to_legacy_registry_after_v2_semantic_error(
+        self, tmp_path
+    ):
+        import json
+
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import SubagentLease
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 2,
+            "profile_defaults": {"chat": {"ref": "standard-gpt-5.4-high-tokenx"}},
+            "routes": {
+                "tokenx": {
+                    "config_provider_ref": "custom",
+                    "adapter": "openai_compat",
+                }
+            },
+            "models": {
+                "standard-gpt-5.4-high-tokenx": {
+                    "family": "gpt-5.4",
+                    "tier": "standard",
+                    "effort": "high",
+                    "route_ref": "tokenx",
+                    "provider_model": "v2-ignored",
+                    "enabled": True,
+                    "template": False,
+                }
+            },
+        }
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        parent_provider = MagicMock()
+        parent_provider.get_default_model.return_value = "parent-model"
+        mgr = SubagentManager(provider=parent_provider, workspace=tmp_path, bus=bus)
+        mgr.resource_manager.registry = {
+            "models": {
+                "standard-gpt-5.4-high-tokenx": {
+                    "provider": "custom",
+                    "provider_model": "legacy-gpt-5.4",
+                    "connection": {
+                        "api_base": "https://tokenx24.com/v1",
+                        "api_key": "k-legacy",
+                        "extra_headers": {},
+                    },
+                }
+            }
+        }
+
+        provider, model = mgr._build_provider_for_lease(
+            SubagentLease(
+                model_id="standard-gpt-5.4-high-tokenx",
+                tier="standard",
+                route="tokenx",
+                effort="high",
+            )
+        )
+
+        assert provider is not parent_provider
+        assert provider.get_default_model() == "legacy-gpt-5.4"
+        assert model == "legacy-gpt-5.4"
 
     @pytest.mark.asyncio
     async def test_run_subagent_records_hard_provider_failure_and_shrinks_current_candidate_pool(
@@ -1486,8 +1616,8 @@ class TestSubagentCancellation:
 
     @pytest.mark.asyncio
     async def test_spawn_releases_resource_lease_after_successful_completion(self, tmp_path):
-        from nanobot.agent.subagent import SubagentManager
         from nanobot.agent.runner import AgentRunResult
+        from nanobot.agent.subagent import SubagentManager
         from nanobot.agent.subagent_resources import AcquireDecision, SubagentLease
         from nanobot.bus.queue import MessageBus
 
