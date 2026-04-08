@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -208,7 +209,10 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
             seen["config"] = self.config
             return True
 
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda: Config())
+    monkeypatch.setattr(
+        "nanobot.config.loader.load_config",
+        lambda config_path=None: Config(),
+    )
     monkeypatch.setattr(
         "nanobot.channels.registry.discover_all",
         lambda: {"fakeplugin": _LoginPlugin},
@@ -217,6 +221,66 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
     result = runner.invoke(app, ["channels", "login", "fakeplugin", "--force"])
 
     assert result.exit_code == 0
+    assert seen["force"] is True
+
+
+def test_channels_status_uses_explicit_config_path(monkeypatch, tmp_path):
+    from nanobot.cli.commands import app
+    from nanobot.config.schema import Config
+
+    runner = CliRunner()
+    config_path = tmp_path / "channels-status-config.json"
+    seen: dict[str, object] = {}
+
+    def _load_config(config_path_arg=None):
+        seen["config_path"] = config_path_arg
+        return Config()
+
+    monkeypatch.setattr("nanobot.config.loader.load_config", _load_config)
+    monkeypatch.setattr(
+        "nanobot.channels.registry.discover_all",
+        lambda: {"fakeplugin": _FakePlugin},
+    )
+
+    result = runner.invoke(app, ["channels", "status", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert seen["config_path"] == config_path.resolve()
+
+
+def test_channels_login_uses_explicit_config_path(monkeypatch, tmp_path):
+    from nanobot.cli.commands import app
+    from nanobot.config.schema import Config
+
+    runner = CliRunner()
+    config_path = tmp_path / "channels-login-config.json"
+    seen: dict[str, object] = {}
+
+    class _LoginPlugin(_FakePlugin):
+        display_name = "Login Plugin"
+
+        async def login(self, force: bool = False) -> bool:
+            seen["force"] = force
+            seen["config"] = self.config
+            return True
+
+    def _load_config(config_path_arg=None):
+        seen["config_path"] = config_path_arg
+        return Config.model_validate({"channels": {"fakeplugin": {"enabled": True}}})
+
+    monkeypatch.setattr("nanobot.config.loader.load_config", _load_config)
+    monkeypatch.setattr(
+        "nanobot.channels.registry.discover_all",
+        lambda: {"fakeplugin": _LoginPlugin},
+    )
+
+    result = runner.invoke(
+        app,
+        ["channels", "login", "fakeplugin", "--config", str(config_path), "--force"],
+    )
+
+    assert result.exit_code == 0
+    assert seen["config_path"] == config_path.resolve()
     assert seen["force"] is True
 
 
@@ -921,4 +985,3 @@ async def test_start_all_creates_dispatch_task():
 
     # Dispatch task should have been created
     assert mgr._dispatch_task is not None
-
