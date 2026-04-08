@@ -316,6 +316,32 @@ def _load_model_state(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _runtime_models_from_registry(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    models = registry.get("models") if isinstance(registry, dict) else None
+    if not isinstance(models, dict):
+        return {}
+    if int(registry.get("version") or 0) < 2:
+        return {
+            model_id: raw for model_id, raw in models.items() if isinstance(raw, dict)
+        }
+
+    runtime_models: dict[str, dict[str, Any]] = {}
+    for model_id, raw in models.items():
+        if not isinstance(raw, dict):
+            continue
+        runtime_models[model_id] = {
+            "tier": raw.get("tier"),
+            "family": raw.get("family"),
+            "effort": raw.get("effort"),
+            "route": raw.get("route_ref"),
+            "provider_model": raw.get("provider_model"),
+            "enabled": raw.get("enabled", True),
+            "template": raw.get("template", False),
+            "aliases": list(raw.get("aliases") or []),
+        }
+    return runtime_models
+
+
 def _route_from_api_base(api_base: str, fallback: str) -> str:
     lower = str(api_base or "").strip().rstrip("/").lower()
     if not lower:
@@ -344,6 +370,46 @@ def _manager_model_from_state(state: dict[str, Any]) -> str:
         if value:
             return value
     return ""
+
+
+def _route_preferences_for_tier(
+    registry: dict[str, Any],
+    runtime_models: dict[str, dict[str, Any]],
+    *,
+    tier: str,
+    fallback: tuple[str, ...],
+) -> tuple[str, ...]:
+    if int(registry.get("version") or 0) < 2:
+        return fallback
+
+    routes: list[str] = []
+
+    def append_route(route: str | None) -> None:
+        route_clean = str(route or "").strip()
+        if route_clean and route_clean not in routes:
+            routes.append(route_clean)
+
+    profile_defaults = registry.get("profile_defaults") if isinstance(registry, dict) else None
+    if isinstance(profile_defaults, dict):
+        for profile in profile_defaults.values():
+            if not isinstance(profile, dict):
+                continue
+            ref = str(profile.get("ref") or "").strip()
+            raw = runtime_models.get(ref)
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("tier") or "").strip() != tier:
+                continue
+            append_route(raw.get("route"))
+
+    for raw in runtime_models.values():
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("tier") or "").strip() != tier:
+            continue
+        append_route(raw.get("route"))
+
+    return tuple(routes) or fallback
 
 
 def _provider_status_policy(data: dict[str, Any] | None) -> dict[str, Any]:
@@ -769,7 +835,8 @@ def build_manager_from_workspace_snapshot(
     registry = _load_json(workspace / "model_registry.json")
     if not isinstance(registry, dict):
         registry = {}
-    registry.setdefault("models", {})
+    runtime_models = _runtime_models_from_registry(registry)
+    registry["models"] = runtime_models
     _config = _load_json(workspace / "config.json")
     state = _load_model_state(workspace / "model_state.json")
     transient_ttl_seconds = _provider_status_transient_ttl_seconds(registry)
@@ -787,6 +854,14 @@ def build_manager_from_workspace_snapshot(
                 continue
             base = route_policies.get(route_clean, RoutePolicy())
             route_policies[route_clean] = _merge_route_policy(base, override if isinstance(override, dict) else None)
+
+    runtime_route_names = {
+        str(raw.get("route") or "").strip()
+        for raw in runtime_models.values()
+        if isinstance(raw, dict) and str(raw.get("route") or "").strip()
+    }
+    for route in runtime_route_names:
+        route_policies.setdefault(route, RoutePolicy())
 
     persisted_status = registry.get("provider_status") if isinstance(registry, dict) else None
     if isinstance(persisted_status, dict):
@@ -823,13 +898,23 @@ def build_manager_from_workspace_snapshot(
     tier_policies = {
         "standard": TierPolicy(
             default_effort="high",
-            route_preferences=("aizhiwen-top", "tokenx", "weclawai"),
+            route_preferences=_route_preferences_for_tier(
+                registry,
+                runtime_models,
+                tier="standard",
+                fallback=("aizhiwen-top", "tokenx", "weclawai"),
+            ),
             allow_queue=True,
             queue_limit=10,
         ),
         "lite": TierPolicy(
             default_effort="high",
-            route_preferences=("minimax",),
+            route_preferences=_route_preferences_for_tier(
+                registry,
+                runtime_models,
+                tier="lite",
+                fallback=("minimax",),
+            ),
             allow_queue=True,
             queue_limit=5,
         ),

@@ -307,6 +307,83 @@ def test_build_manager_from_workspace_snapshot_uses_workspace_truth(tmp_path):
 
 
 
+def test_build_manager_snapshot_reads_v2_route_names_and_profile_defaults(tmp_path):
+    from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
+
+    registry = {
+        "version": 2,
+        "profile_defaults": {
+            "chat": {"ref": "standard-gpt-5.4-high-tokenx"},
+            "archive": {"ref": "archive-gpt-4.1-mini"},
+        },
+        "routes": {
+            "tokenx": {"config_provider_ref": "custom", "adapter": "openai_compat"},
+            "responses": {"config_provider_ref": "openai", "adapter": "openai_responses"},
+        },
+        "models": {
+            "standard-gpt-5.4-high-tokenx": {
+                "family": "gpt-5.4",
+                "tier": "standard",
+                "effort": "high",
+                "route_ref": "tokenx",
+                "provider_model": "gpt-5.4",
+                "enabled": True,
+                "template": False,
+            },
+            "archive-gpt-4.1-mini": {
+                "family": "gpt-4.1",
+                "tier": "lite",
+                "effort": "high",
+                "route_ref": "responses",
+                "provider_model": "gpt-4.1-mini",
+                "enabled": True,
+                "template": False,
+            },
+        },
+    }
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+
+    assert "tokenx" in manager.route_policies
+    assert "responses" in manager.route_policies
+
+    decision = manager.acquire(manager.default_request(tier="lite"))
+    assert decision.status == "granted"
+    assert decision.lease is not None
+    assert decision.lease.route == "responses"
+
+
+
+def test_build_manager_snapshot_keeps_legacy_registry_path_working(tmp_path):
+    from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(_registry(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    decision = manager.acquire(manager.default_request())
+
+    assert decision.status == "granted"
+    assert decision.lease is not None
+    assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
+
+
+
 def test_build_manager_snapshot_prefers_current_model_from_model_state(tmp_path):
     from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
 
