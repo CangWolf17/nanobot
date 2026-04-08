@@ -159,11 +159,12 @@ class SubagentManager:
             ))
             tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
-            
-            system_prompt = self._build_subagent_prompt()
+
+            system_prompt = self._build_subagent_prompt(origin=origin)
+            task_payload = self._build_subagent_task_payload(task=task, origin=origin)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
+                {"role": "user", "content": task_payload},
             ]
 
             class _SubagentHook(AgentHook):
@@ -308,12 +309,13 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             lines.append(f"- {result.error}")
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
     
-    def _build_subagent_prompt(self) -> str:
+    def _build_subagent_prompt(self, *, origin: dict[str, Any] | None = None) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder
         from nanobot.agent.skills import SkillsLoader
 
-        time_ctx = ContextBuilder._build_runtime_context(None, None)
+        runtime_meta = self._runtime_metadata_from_origin(origin)
+        time_ctx = ContextBuilder._build_runtime_context(None, None, runtime_metadata=runtime_meta)
         parts = [f"""# Subagent
 
 {time_ctx}
@@ -326,6 +328,10 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
 ## Workspace
 {self.workspace}"""]
 
+        injected = self._build_subagent_execution_context(origin)
+        if injected:
+            parts.append(injected)
+
         skills_summary = SkillsLoader(self.workspace).build_skills_summary()
         if skills_summary:
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
@@ -335,6 +341,64 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
             parts.append(dev_block)
 
         return "\n\n".join(parts)
+
+    def _build_subagent_task_payload(self, *, task: str, origin: dict[str, Any] | None = None) -> str:
+        injected = self._build_subagent_execution_context(origin)
+        task_text = str(task or "").strip()
+        if injected and task_text:
+            return f"{injected}\n\n## Assigned Task\n{task_text}"
+        if injected:
+            return injected
+        return task_text
+
+    @staticmethod
+    def _runtime_metadata_from_origin(origin: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(origin, dict):
+            return {}
+        metadata = origin.get("metadata")
+        if not isinstance(metadata, dict):
+            return {}
+        runtime_meta = metadata.get("workspace_runtime")
+        return dict(runtime_meta) if isinstance(runtime_meta, dict) else {}
+
+    def _build_subagent_execution_context(self, origin: dict[str, Any] | None = None) -> str:
+        runtime_meta = self._runtime_metadata_from_origin(origin)
+        lines: list[str] = ["## Subagent Execution Context"]
+
+        lines.extend([
+            "### Project Context",
+            f"- workspace: {self.workspace}",
+        ])
+        active = runtime_meta.get("active_harness") if isinstance(runtime_meta.get("active_harness"), dict) else None
+        main = runtime_meta.get("main_harness") if isinstance(runtime_meta.get("main_harness"), dict) else None
+        if isinstance(active, dict):
+            lines.append(f"- active_harness_id: {str(active.get('id') or '').strip()}")
+            lines.append(f"- active_harness_type: {str(active.get('type') or '').strip()}")
+            lines.append(f"- active_harness_status: {str(active.get('status') or '').strip()}")
+            lines.append(f"- active_harness_phase: {str(active.get('phase') or '').strip()}")
+        if isinstance(main, dict):
+            lines.append(f"- main_harness_id: {str(main.get('id') or '').strip()}")
+            lines.append(f"- main_harness_type: {str(main.get('type') or '').strip()}")
+            lines.append(f"- main_harness_status: {str(main.get('status') or '').strip()}")
+            lines.append(f"- main_harness_phase: {str(main.get('phase') or '').strip()}")
+
+        lines.extend([
+            "",
+            "### Today's Context",
+            f"- work_mode: {str(runtime_meta.get('work_mode') or '').strip() or 'unknown'}",
+            f"- has_active_harness: {'true' if bool(runtime_meta.get('has_active_harness')) else 'false'}",
+            "- use the active/main harness metadata above as the current execution truth when present",
+            "",
+            "### Output Rules",
+            "- be specific about files, functions, APIs, and verification",
+            "- recommend a concrete next step instead of listing vague options",
+            "- keep manual task notes additive; do not discard the assigned task text",
+            "",
+            "### Role Framing",
+            "- operate like a senior engineer / operator finishing a bounded subtask for the main agent",
+            "- prefer direct execution and crisp reporting over generic assistant chatter",
+        ])
+        return "\n".join(lines)
 
     def _resolve_subagent_request(
         self,

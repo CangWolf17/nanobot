@@ -61,6 +61,28 @@ class TestMemoryConsolidationTypeHandling:
     """Test that consolidation handles various argument types correctly."""
 
     @pytest.mark.asyncio
+    async def test_memory_consolidation_prompt_includes_runtime_context_exclusion_instruction(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(
+            return_value=_make_tool_response(
+                history_entry="[2026-01-01] User discussed testing.",
+                memory_update="# Memory\nUser likes testing.",
+            )
+        )
+        messages = _make_messages(message_count=60)
+
+        result = await store.consolidate(messages, provider, "test-model")
+
+        assert result is True
+        chat_messages = provider.chat_with_retry.await_args.kwargs["messages"]
+        system_prompt = chat_messages[0]["content"]
+        user_prompt = chat_messages[1]["content"]
+        assert "Do not copy or surface runtime context / metadata blocks into the saved memory or history entry." in system_prompt
+        assert "If the conversation contains runtime context or metadata blocks, treat them as auxiliary information and ignore them unless they materially change the user's real task or durable facts." in user_prompt
+        assert "At the end of both `history_entry` and `memory_update`, include the note: `Runtime context is auxiliary metadata and may be unrelated to the actual problem.`" in user_prompt
+
+    @pytest.mark.asyncio
     async def test_string_arguments_work(self, tmp_path: Path) -> None:
         """Normal case: LLM returns string arguments."""
         store = MemoryStore(tmp_path)

@@ -158,10 +158,65 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         return "\n".join(lines)
 
     @staticmethod
+    def _format_runtime_metadata_scalar(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+
+    @classmethod
+    def _is_meaningful_runtime_metadata_value(cls, value: Any) -> bool:
+        if isinstance(value, bool):
+            return True
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, dict):
+            return any(cls._is_meaningful_runtime_metadata_value(item) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(cls._is_meaningful_runtime_metadata_value(item) for item in value)
+        return True
+
+    @classmethod
+    def _render_runtime_metadata_lines(cls, payload: dict[str, Any], indent: int = 0) -> list[str]:
+        lines: list[str] = []
+        prefix = " " * indent
+        for key, value in payload.items():
+            if not cls._is_meaningful_runtime_metadata_value(value):
+                continue
+            if isinstance(value, dict):
+                nested = cls._render_runtime_metadata_lines(value, indent + 2)
+                if not nested:
+                    continue
+                lines.append(f"{prefix}{key}:")
+                lines.extend(nested)
+                continue
+            if isinstance(value, (list, tuple, set)):
+                cleaned = [item for item in value if cls._is_meaningful_runtime_metadata_value(item)]
+                if not cleaned:
+                    continue
+                lines.append(f"{prefix}{key}:")
+                for item in cleaned:
+                    if isinstance(item, dict):
+                        nested = cls._render_runtime_metadata_lines(item, indent + 4)
+                        if not nested:
+                            continue
+                        lines.append(f"{prefix}  -")
+                        lines.extend(nested)
+                    else:
+                        lines.append(
+                            f"{prefix}  - {cls._format_runtime_metadata_scalar(item)}"
+                        )
+                continue
+            lines.append(f"{prefix}{key}: {cls._format_runtime_metadata_scalar(value)}")
+        return lines
+
+    @staticmethod
     def _build_runtime_context(
         channel: str | None,
         chat_id: str | None,
         timezone: str | None = None,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> str:
         """Build runtime metadata block injected before the user message.
 
@@ -182,6 +237,9 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             lines.append(f"Channel: {channel}")
         if chat_id:
             lines.append(f"Chat ID: `{chat_id}`")
+        rendered_runtime = ContextBuilder._render_runtime_metadata_lines(runtime_metadata or {})
+        if rendered_runtime:
+            lines.extend(["Runtime Metadata:", *rendered_runtime])
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:
@@ -207,9 +265,10 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         current_role: str = "user",
         workspace_work_mode: str | None = None,
         compact_state: str | None = None,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
+        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, runtime_metadata)
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message

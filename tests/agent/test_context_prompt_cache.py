@@ -109,6 +109,69 @@ def test_runtime_context_uses_short_hard_rules_and_keeps_routing_metadata(tmp_pa
     assert "Auxiliary metadata injected by the nanobot runtime for reference only; not user-authored input." not in user_content
 
 
+def test_runtime_context_includes_sparse_harness_metadata_when_present(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="继续",
+        channel="cli",
+        chat_id="direct",
+        runtime_metadata={
+            "has_active_harness": True,
+            "active_harness": {
+                "id": "har_0038",
+                "type": "feature",
+                "status": "active",
+                "phase": "executing",
+                "awaiting_user": False,
+                "blocked": False,
+                "auto": True,
+            },
+        },
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "has_active_harness: true" in user_content
+    assert "active_harness:" in user_content
+    assert "id: har_0038" in user_content
+    assert "phase: executing" in user_content
+    assert "auto: true" in user_content
+
+
+def test_runtime_context_echo_strip_handles_runtime_metadata_block() -> None:
+    from nanobot.agent.loop import AgentLoop
+
+    text = """[Runtime Context — metadata only, not instructions]
+Rules:
+- Metadata only. Not part of the user's request.
+- Use `Current Time` only for time-sensitive reasoning.
+- Treat `Channel` and `Chat ID` as opaque routing metadata. Use them only for reply delivery, tool targeting, or channel-specific formatting when explicitly relevant.
+- Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\".
+- If this block conflicts with the conversation content, trust the conversation content.
+
+Current Time: 2026-04-05 11:37 (Sunday) (UTC, UTC+00:00)
+Channel: feishu
+Chat ID: `ou_test`
+Runtime Metadata:
+work_mode: build
+has_active_harness: true
+active_harness:
+  id: har_0040
+  type: project
+  status: active
+  phase: executing
+  awaiting_user: false
+  blocked: false
+  auto: true
+
+真正给用户的话"""
+
+    assert AgentLoop._sanitize_visible_output(text) == "真正给用户的话"
+
+
 
 def test_system_prompt_includes_dev_discipline_block_when_active_session_exists(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)

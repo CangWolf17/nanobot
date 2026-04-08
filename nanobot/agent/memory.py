@@ -127,6 +127,10 @@ class MemoryStore:
         current_memory = self.read_long_term()
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 
+If the conversation contains runtime context or metadata blocks, treat them as auxiliary information and ignore them unless they materially change the user's real task or durable facts.
+Do not quote or reproduce such blocks in `history_entry` or `memory_update`.
+At the end of both `history_entry` and `memory_update`, include the note: `Runtime context is auxiliary metadata and may be unrelated to the actual problem.`
+
 ## Current Long-term Memory
 {current_memory or "(empty)"}
 
@@ -136,7 +140,7 @@ class MemoryStore:
         chat_messages = [
             {
                 "role": "system",
-                "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
+                "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation. Do not copy or surface runtime context / metadata blocks into the saved memory or history entry.",
             },
             {"role": "user", "content": prompt},
         ]

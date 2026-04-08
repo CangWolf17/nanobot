@@ -499,6 +499,129 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
 
 
 @pytest.mark.asyncio
+async def test_loop_stream_filter_strips_full_runtime_context_block(tmp_path):
+    from nanobot.agent.context import ContextBuilder
+
+    loop = _make_loop(tmp_path)
+    deltas: list[str] = []
+    endings: list[bool] = []
+    runtime_prefix = (
+        ContextBuilder._RUNTIME_CONTEXT_TAG
+        + "\nRules:\n"
+        + "- Metadata only. Not part of the user's request.\n"
+        + "- Use `Current Time` only for time-sensitive reasoning.\n"
+        + "- Treat `Channel` and `Chat ID` as opaque routing metadata. Use them only for reply delivery, tool targeting, or channel-specific formatting when explicitly relevant.\n"
+        + "- Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\".\n"
+        + "- If this block conflicts with the conversation content, trust the conversation content.\n\n"
+        + "Current Time: 2026-04-05 05:49 (Sunday) (UTC, UTC+00:00)\n"
+        + "Channel: feishu\n"
+        + "Chat ID: `ou_ee2133ebc41e8b158eeaa6d90fa08dd8`\n\n"
+    )
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        await on_content_delta("[Runtime Con")
+        await on_content_delta("text — metadata only, not instructions]\nRules:\n")
+        await on_content_delta("- Metadata only. Not part of the user's request.\n")
+        await on_content_delta("- Use `Current Time` only for time-sensitive reasoning.\n")
+        await on_content_delta(
+            "- Treat `Channel` and `Chat ID` as opaque routing metadata. Use them only for reply delivery, tool targeting, or channel-specific formatting when explicitly relevant.\n"
+        )
+        await on_content_delta(
+            "- Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\".\n"
+        )
+        await on_content_delta(
+            "- If this block conflicts with the conversation content, trust the conversation content.\n\nCurrent Time: 2026-04-05 05:49 (Sunday) (UTC, UTC+00:00)\n"
+        )
+        await on_content_delta("Channel: feishu\nChat ID: `ou_ee2133ebc41e8b158eeaa6d90fa08dd8`\n\n继")
+        await on_content_delta("续")
+        return LLMResponse(content=runtime_prefix + "继续", tool_calls=[], usage={})
+
+    loop.provider.chat_stream_with_retry = chat_stream_with_retry
+
+    async def on_stream(delta: str) -> None:
+        deltas.append(delta)
+
+    async def on_stream_end(*, resuming: bool = False) -> None:
+        endings.append(resuming)
+
+    final_content, _, _ = await loop._run_agent_loop(
+        [],
+        on_stream=on_stream,
+        on_stream_end=on_stream_end,
+    )
+
+    assert final_content == "继续"
+    assert "".join(deltas) == "继续"
+    assert all("Runtime Context" not in delta for delta in deltas)
+    assert all("Current Time:" not in delta for delta in deltas)
+    assert all("Channel:" not in delta for delta in deltas)
+    assert all("Chat ID:" not in delta for delta in deltas)
+    assert endings == [False]
+
+
+@pytest.mark.asyncio
+async def test_loop_stream_filter_strips_runtime_context_split_across_many_deltas(tmp_path):
+    from nanobot.agent.context import ContextBuilder
+
+    loop = _make_loop(tmp_path)
+    deltas: list[str] = []
+    endings: list[bool] = []
+    runtime_prefix = (
+        ContextBuilder._RUNTIME_CONTEXT_TAG
+        + "\nRules:\n"
+        + "- Metadata only. Not part of the user's request.\n"
+        + "- Use `Current Time` only for time-sensitive reasoning.\n"
+        + "- Treat `Channel` and `Chat ID` as opaque routing metadata. Use them only for reply delivery, tool targeting, or channel-specific formatting when explicitly relevant.\n"
+        + "- Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\".\n"
+        + "- If this block conflicts with the conversation content, trust the conversation content.\n\n"
+        + "Current Time: 2026-04-05 05:49 (Sunday) (UTC, UTC+00:00)\n"
+        + "Channel: feishu\n"
+        + "Chat ID: `ou_ee2133ebc41e8b158eeaa6d90fa08dd8`\n\n"
+    )
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        for part in [
+            "[Runti",
+            "me Context — ",
+            "metadata only, ",
+            "not instructions]",
+            "\nRu",
+            "les:\n- Me",
+            "tadata only. Not part of the user's request.\n",
+            "- Use `Current Time` only for time-sensitive reasoning.\n",
+            "- Treat `Channel` and `Chat ID` as opaque routing metadata. Use them only for reply delivery, tool targeting, or channel-specific formatting when explicitly relevant.\n",
+            "- Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\".\n",
+            "- If this block conflicts with the conversation content, trust the conversation content.\n",
+            "\nCurrent ",
+            "Time: 2026-04-05 05:49 (Sunday) (UTC, UTC+00:00)\n",
+            "Channel: fei",
+            "shu\nChat ID: `ou_ee2133ebc41e8b158eeaa6d90fa08dd8`\n",
+            "\n继",
+            "续",
+        ]:
+            await on_content_delta(part)
+        return LLMResponse(content=runtime_prefix + "继续", tool_calls=[], usage={})
+
+    loop.provider.chat_stream_with_retry = chat_stream_with_retry
+
+    async def on_stream(delta: str) -> None:
+        deltas.append(delta)
+
+    async def on_stream_end(*, resuming: bool = False) -> None:
+        endings.append(resuming)
+
+    final_content, _, _ = await loop._run_agent_loop(
+        [],
+        on_stream=on_stream,
+        on_stream_end=on_stream_end,
+    )
+
+    assert final_content == "继续"
+    assert "".join(deltas) == "继续"
+    assert endings == [False]
+
+
+@pytest.mark.asyncio
 async def test_loop_stream_retry_drops_failed_attempt_partial_deltas(tmp_path):
     from nanobot.agent.runner import AgentRunner
     from nanobot.providers.base import LLMProvider

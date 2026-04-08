@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -82,6 +83,24 @@ async def test_compact_state_sync_is_incremental() -> None:
     assert "u2" in prompt and "a2" in prompt
     assert "u1" not in prompt and "a1" not in prompt
     assert session.metadata["compact_state_offset"] == 4
+
+
+@pytest.mark.asyncio
+async def test_compact_state_prompt_includes_runtime_context_exclusion_instruction() -> None:
+    session = _session_with_messages()
+    provider = AsyncMock()
+    provider.chat_with_retry = AsyncMock(return_value=_compact_response("## Current Task\nResume work"))
+    manager = CompactStateManager(provider=provider, model="test-model")
+
+    synced = await manager.sync_session(session)
+
+    assert synced is True
+    messages = provider.chat_with_retry.await_args.kwargs["messages"]
+    system_prompt = messages[0]["content"]
+    user_prompt = messages[1]["content"]
+    assert "Do not copy or surface runtime context / metadata blocks into the saved state or visible result." in system_prompt
+    assert "If archived content contains runtime context or metadata blocks, ignore them unless they materially change the task state." in user_prompt
+    assert "At the very end of the compact_state, append: `Note: runtime context is auxiliary metadata and may be unrelated to the actual problem.`" in user_prompt
 
 
 def test_context_builder_includes_compact_state_separately_from_memory(tmp_path: Path) -> None:

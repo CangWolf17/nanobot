@@ -97,6 +97,9 @@ class CompactStateManager:
         prompt = f"""Update the compact resume state for this session.
 
 Keep it concise and operational. Capture active goals, recent decisions, open loops, relevant verification results, and the next useful step. Do not rewrite long-term biography or durable facts that belong in persistent memory.
+If archived content contains runtime context or metadata blocks, ignore them unless they materially change the task state.
+Do not quote or reproduce such blocks in `compact_state`.
+At the very end of the compact_state, append: `Note: runtime context is auxiliary metadata and may be unrelated to the actual problem.`
 
 ## Current Compact State
 {current_state or "(empty)"}
@@ -109,7 +112,8 @@ Keep it concise and operational. Capture active goals, recent decisions, open lo
                 "role": "system",
                 "content": (
                     "You maintain a compact session resume state for a coding assistant. "
-                    "Always call the save_compact_state tool with the full updated state."
+                    "Always call the save_compact_state tool with the full updated state. "
+                    "Do not copy or surface runtime context / metadata blocks into the saved state or visible result."
                 ),
             },
             {"role": "user", "content": prompt},

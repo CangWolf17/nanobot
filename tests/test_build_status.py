@@ -57,3 +57,34 @@ def test_status_100_percent_cached():
         context_tokens_estimate=3000,
     )
     assert "100% cached" in content
+
+
+def test_status_prefers_harness_summary_when_present():
+    content = build_status_content(
+        version="0.1.0",
+        model="glm-4-plus",
+        start_time=1000000.0,
+        last_usage={"prompt_tokens": 1000, "completion_tokens": 100},
+        context_window_tokens=128000,
+        session_msg_count=5,
+        context_tokens_estimate=3000,
+        interrupt_summary="session interrupt summary",
+        harness_summary="harness interrupted / awaiting redirect",
+    )
+    assert "Interrupt: harness interrupted / awaiting redirect" in content
+    assert "session interrupt summary" not in content
+
+
+def test_status_falls_back_to_session_interrupt_summary_when_harness_summary_missing():
+    content = build_status_content(
+        version="0.1.0",
+        model="glm-4-plus",
+        start_time=1000000.0,
+        last_usage={"prompt_tokens": 1000, "completion_tokens": 100},
+        context_window_tokens=128000,
+        session_msg_count=5,
+        context_tokens_estimate=3000,
+        interrupt_summary="interrupted — waiting for redirect",
+        harness_summary=None,
+    )
+    assert "Interrupt: interrupted — waiting for redirect" in content
