@@ -1084,6 +1084,150 @@ class TestSubagentCancellation:
         assert provider.get_default_model() == "gpt-5.4"
         assert model == "gpt-5.4"
 
+    def test_build_provider_for_lease_rebuilds_provider_from_workspace_snapshot_after_v2_semantic_error(
+        self, tmp_path
+    ):
+        import json
+
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import (
+            SubagentLease,
+            build_manager_from_workspace_snapshot,
+        )
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 2,
+            "profile_defaults": {"chat": {"ref": "standard-gpt-5.4-high-tokenx"}},
+            "routes": {
+                "tokenx": {
+                    "config_provider_ref": "custom",
+                    "adapter": "openai_compat",
+                    "api_base_override": "https://tokenx24.com/v1",
+                }
+            },
+            "models": {
+                "standard-gpt-5.4-high-tokenx": {
+                    "family": "gpt-5.4",
+                    "tier": "standard",
+                    "effort": "high",
+                    "route_ref": "tokenx",
+                    "provider_model": "gpt-5.4",
+                    "enabled": True,
+                    "template": False,
+                }
+            },
+        }
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "agents": {"defaults": {"model": "gpt-5.4"}},
+                    "providers": {"custom": {"apiKey": "k-tokenx"}},
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        parent_provider = MagicMock()
+        parent_provider.get_default_model.return_value = "parent-model"
+        resource_manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+        mgr = SubagentManager(
+            provider=parent_provider,
+            workspace=tmp_path,
+            bus=bus,
+            resource_manager=resource_manager,
+        )
+
+        provider, model = mgr._build_provider_for_lease(
+            SubagentLease(
+                model_id="standard-gpt-5.4-high-tokenx",
+                tier="standard",
+                route="tokenx",
+                effort="high",
+            )
+        )
+
+        assert provider is not parent_provider
+        assert provider.get_default_model() == "gpt-5.4"
+        assert model == "gpt-5.4"
+
+    def test_build_provider_for_lease_preserves_openai_responses_adapter_after_v2_semantic_error(
+        self, tmp_path
+    ):
+        import json
+
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
+        from nanobot.bus.queue import MessageBus
+        from nanobot.providers.openai_responses_provider import OpenAIResponsesProvider
+
+        registry = {
+            "version": 2,
+            "profile_defaults": {"chat": {"ref": "standard-gpt-4.1-mini-high-responses"}},
+            "routes": {
+                "responses": {
+                    "config_provider_ref": "openai",
+                    "adapter": "openai_responses",
+                }
+            },
+            "models": {
+                "standard-gpt-4.1-mini-high-responses": {
+                    "family": "gpt-4.1",
+                    "tier": "standard",
+                    "effort": "high",
+                    "route_ref": "responses",
+                    "provider_model": "gpt-4.1-mini",
+                    "enabled": True,
+                    "template": False,
+                    "capabilities": {"chat": True},
+                }
+            },
+        }
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "agents": {"defaults": {"model": "gpt-4.1-mini"}},
+                    "providers": {"openai": {"apiKey": "sk-openai"}},
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        parent_provider = MagicMock()
+        parent_provider.get_default_model.return_value = "parent-model"
+        resource_manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+        mgr = SubagentManager(
+            provider=parent_provider,
+            workspace=tmp_path,
+            bus=bus,
+            resource_manager=resource_manager,
+        )
+
+        decision = resource_manager.acquire(
+            resource_manager.default_request(model="standard-gpt-4.1-mini-high-responses")
+        )
+        assert decision.status == "granted"
+        assert decision.lease is not None
+
+        provider, model = mgr._build_provider_for_lease(decision.lease)
+
+        assert isinstance(provider, OpenAIResponsesProvider)
+        assert model == "gpt-4.1-mini"
+
     def test_build_provider_for_lease_falls_back_to_legacy_registry_after_v2_semantic_error(
         self, tmp_path
     ):

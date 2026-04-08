@@ -36,7 +36,110 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig, WebSearchConfig
+from nanobot.model_registry.schema import ResolvedModelSpec
 from nanobot.providers.base import LLMProvider
+
+
+def _workspace_legacy_model_record(
+    workspace_registry: dict[str, Any], model_id: str
+) -> dict[str, Any] | None:
+    models = workspace_registry.get("models")
+    raw = models.get(model_id) if isinstance(models, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    if isinstance(raw.get("provider"), str) and isinstance(raw.get("connection"), dict):
+        return raw
+
+    route_ref = str(raw.get("route_ref") or raw.get("route") or "").strip()
+    routes = workspace_registry.get("routes")
+    route = routes.get(route_ref) if isinstance(routes, dict) else None
+    if not isinstance(route, dict):
+        return None
+
+    runtime_defaults = raw.get("runtime_defaults")
+    agent: dict[str, Any] = {}
+    if isinstance(raw.get("agent"), dict):
+        agent = dict(raw.get("agent"))
+    elif isinstance(runtime_defaults, dict):
+        if runtime_defaults.get("temperature") is not None:
+            agent["temperature"] = runtime_defaults.get("temperature")
+        if runtime_defaults.get("max_tokens") is not None:
+            agent["max_tokens"] = runtime_defaults.get("max_tokens")
+        if runtime_defaults.get("reasoning_effort") is not None:
+            agent["reasoning_effort"] = runtime_defaults.get("reasoning_effort")
+
+    extra_headers = route.get("extra_headers_override")
+    if not isinstance(extra_headers, dict):
+        extra_headers = {}
+
+    return {
+        "provider": str(route.get("config_provider_ref") or raw.get("provider") or "custom").strip()
+        or "custom",
+        "provider_model": str(raw.get("provider_model") or model_id).strip() or model_id,
+        "connection": {
+            "api_base": str(route.get("api_base_override") or "").strip(),
+            "api_key": "",
+            "extra_headers": extra_headers,
+        },
+        "agent": agent,
+        "effort": str(raw.get("effort") or "").strip().lower() or None,
+    }
+
+
+def _workspace_v2_resolved_model_spec(
+    workspace_registry: dict[str, Any], model_id: str
+) -> ResolvedModelSpec | None:
+    from nanobot.providers.registry import normalize_lookup_name
+
+    models = workspace_registry.get("models")
+    raw = models.get(model_id) if isinstance(models, dict) else None
+    if not isinstance(raw, dict):
+        return None
+
+    route_ref = str(raw.get("route_ref") or raw.get("route") or "").strip()
+    routes = workspace_registry.get("routes")
+    route = routes.get(route_ref) if isinstance(routes, dict) else None
+    if not isinstance(route, dict):
+        return None
+
+    adapter = str(route.get("adapter") or "").strip()
+    if not adapter:
+        return None
+
+    protocol = str(raw.get("protocol") or "").strip()
+    if not protocol:
+        normalized_adapter = normalize_lookup_name(adapter)
+        protocol = "responses" if normalized_adapter in {"openairesponses", "openaicodex"} else "chat_completions"
+
+    extra_headers = route.get("extra_headers_override")
+    if not isinstance(extra_headers, dict):
+        extra_headers = {}
+
+    runtime_defaults = raw.get("runtime_defaults")
+    if not isinstance(runtime_defaults, dict):
+        runtime_defaults = {}
+
+    capabilities = raw.get("capabilities")
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+
+    return ResolvedModelSpec(
+        profile="chat",
+        model_id=model_id,
+        family=str(raw.get("family") or "").strip(),
+        tier=str(raw.get("tier") or "").strip(),
+        effort=str(raw.get("effort") or "").strip(),
+        route_name=route_ref,
+        config_provider_ref=str(route.get("config_provider_ref") or raw.get("provider") or "custom").strip()
+        or "custom",
+        adapter=adapter,
+        protocol=protocol,
+        provider_model=str(raw.get("provider_model") or model_id).strip() or model_id,
+        api_base=str(route.get("api_base_override") or "").strip() or None,
+        extra_headers=extra_headers,
+        capabilities=capabilities,
+        runtime_defaults=runtime_defaults,
+    )
 
 
 class SubagentManager:
@@ -477,8 +580,29 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
         if lease.model_id == self.model:
             return self.provider, self.model
 
-        registry_models = self.resource_manager.registry.get("models", {}) if self.resource_manager is not None else {}
-        raw = registry_models.get(lease.model_id, {}) if isinstance(registry_models, dict) else {}
+        workspace_registry = None
+        if self.resource_manager is not None and isinstance(self.resource_manager.registry, dict):
+            workspace_registry = self.resource_manager.registry.get("_workspace_registry")
+            if not isinstance(workspace_registry, dict):
+                workspace_registry = self.resource_manager.registry
+
+        if isinstance(workspace_registry, dict) and int(workspace_registry.get("version") or 0) >= 2:
+            spec = _workspace_v2_resolved_model_spec(workspace_registry, lease.model_id)
+            if spec is not None:
+                try:
+                    from nanobot.config.loader import load_config
+                    from nanobot.model_registry.provider_factory import build_provider_from_spec
+
+                    config = load_config(self.workspace / "config.json")
+                    return build_provider_from_spec(spec, config)
+                except (FileNotFoundError, ValueError):
+                    pass
+
+        raw = (
+            _workspace_legacy_model_record(workspace_registry, lease.model_id)
+            if isinstance(workspace_registry, dict)
+            else None
+        )
         if not isinstance(raw, dict) or not raw:
             return self.provider, lease.model_id
         connection = raw.get("connection", {}) if isinstance(raw, dict) else {}
@@ -488,28 +612,34 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
         api_base = str(connection.get("api_base") or "").strip() or None
         api_key = str(connection.get("api_key") or "").strip()
         extra_headers = connection.get("extra_headers") if isinstance(connection.get("extra_headers"), dict) else None
-
-        if not api_base and not api_key and provider_name == "custom":
-            return self.provider, provider_model
-
         config = load_config(self.workspace / "config.json")
-        config.agents.defaults.model = provider_model
-        config.agents.defaults.provider = provider_name
-        reasoning_effort = str(raw.get("effort") or "").strip().lower() or None
-        config.agents.defaults.reasoning_effort = reasoning_effort
-        if isinstance(agent, dict):
-            if agent.get("temperature") is not None:
-                config.agents.defaults.temperature = float(agent.get("temperature"))
-            if agent.get("max_tokens") is not None:
-                config.agents.defaults.max_tokens = int(agent.get("max_tokens"))
         provider_cfg = getattr(config.providers, provider_name, None)
         if provider_cfg is None:
             provider_cfg = getattr(config.providers, "custom")
             provider_name = "custom"
             config.agents.defaults.provider = provider_name
-        provider_cfg.api_base = api_base
-        provider_cfg.api_key = api_key
-        provider_cfg.extra_headers = extra_headers
+
+        if not api_base and not api_key and provider_name == "custom" and not getattr(provider_cfg, "api_key", ""):
+            return self.provider, provider_model
+
+        config.agents.defaults.model = provider_model
+        config.agents.defaults.provider = provider_name
+        reasoning_effort = str(raw.get("effort") or "").strip().lower() or None
+        if reasoning_effort:
+            config.agents.defaults.reasoning_effort = reasoning_effort
+        if isinstance(agent, dict):
+            if agent.get("temperature") is not None:
+                config.agents.defaults.temperature = float(agent.get("temperature"))
+            if agent.get("max_tokens") is not None:
+                config.agents.defaults.max_tokens = int(agent.get("max_tokens"))
+        if api_base:
+            provider_cfg.api_base = api_base
+        if api_key:
+            provider_cfg.api_key = api_key
+        if isinstance(extra_headers, dict):
+            merged_headers = dict(getattr(provider_cfg, "extra_headers", None) or {})
+            merged_headers.update(extra_headers)
+            provider_cfg.extra_headers = merged_headers
         provider = _make_provider(config)
         return provider, provider_model
 

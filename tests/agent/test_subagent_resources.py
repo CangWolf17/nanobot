@@ -408,6 +408,31 @@ def test_build_manager_snapshot_prefers_current_model_from_model_state(tmp_path)
 
 
 
+def test_build_manager_snapshot_ignores_stale_current_model_in_model_state(tmp_path):
+    from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(_registry(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_state.json").write_text(
+        json.dumps({"current_model": "stale-corrupt-model"}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    request = manager.default_request()
+
+    assert request.manager_model == "gpt-5.4"
+    assert request.manager_tier == "standard"
+    assert "stale-corrupt-model" not in manager.registry["models"]
+
+
+
 def test_build_manager_snapshot_defaults_lite_to_minimax_archive_route(tmp_path):
     from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
 

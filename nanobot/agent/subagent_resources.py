@@ -372,6 +372,34 @@ def _manager_model_from_state(state: dict[str, Any]) -> str:
     return ""
 
 
+def _runtime_model_is_selectable(raw: dict[str, Any] | None) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    return bool(raw.get("enabled", True)) and not bool(raw.get("template", False))
+
+
+def _resolve_selectable_runtime_model_ref(
+    runtime_models: dict[str, dict[str, Any]], ref: str
+) -> str:
+    candidate = str(ref or "").strip()
+    if not candidate:
+        return ""
+    raw = runtime_models.get(candidate)
+    if _runtime_model_is_selectable(raw):
+        return candidate
+    folded = candidate.casefold()
+    for model_id, raw in runtime_models.items():
+        if model_id.casefold() == folded and _runtime_model_is_selectable(raw):
+            return model_id
+        aliases = raw.get("aliases") if isinstance(raw, dict) else None
+        if not isinstance(aliases, list):
+            continue
+        if any(isinstance(alias, str) and alias.casefold() == folded for alias in aliases):
+            if _runtime_model_is_selectable(raw):
+                return model_id
+    return ""
+
+
 def _route_preferences_for_tier(
     registry: dict[str, Any],
     runtime_models: dict[str, dict[str, Any]],
@@ -835,7 +863,9 @@ def build_manager_from_workspace_snapshot(
     registry = _load_json(workspace / "model_registry.json")
     if not isinstance(registry, dict):
         registry = {}
+    workspace_registry = dict(registry)
     runtime_models = _runtime_models_from_registry(registry)
+    registry["_workspace_registry"] = workspace_registry
     registry["models"] = runtime_models
     _config = _load_json(workspace / "config.json")
     state = _load_model_state(workspace / "model_state.json")
@@ -929,7 +959,12 @@ def build_manager_from_workspace_snapshot(
             tier_policies[tier_clean] = _merge_tier_policy(base, override if isinstance(override, dict) else None)
 
     subagent_defaults = registry.get("subagent_defaults", {}) if isinstance(registry, dict) else {}
-    manager_model = _manager_model_from_state(state)
+    manager_model = ""
+    manager_model_from_state = False
+    state_model = _manager_model_from_state(state)
+    if state_model:
+        manager_model = _resolve_selectable_runtime_model_ref(runtime_models, state_model)
+        manager_model_from_state = bool(manager_model)
     if not manager_model:
         manager_model = str((subagent_defaults or {}).get("model") or "").strip()
     if not manager_model:
@@ -937,7 +972,7 @@ def build_manager_from_workspace_snapshot(
     manager_tier = _infer_manager_tier_from_ref(manager_model)
 
     models = registry.get("models") if isinstance(registry, dict) else None
-    if isinstance(models, dict) and manager_model and manager_model not in models:
+    if isinstance(models, dict) and manager_model and manager_model not in models and not manager_model_from_state:
         route = _route_from_api_base(
             str((_config.get("providers") or {}).get("custom", {}).get("apiBase") or ""),
             "custom",
