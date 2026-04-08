@@ -329,3 +329,18 @@ def test_structured_harness_apply_falls_back_to_session_bound_harness(tmp_path: 
 
     assert refreshed.records[first.active_harness_id].status == "completed"
     assert refreshed.records[second.active_harness_id].status == "active"
+
+def test_service_projection_status_reports_store_path_and_last_sync(tmp_path: Path) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    service.sync_projections()
+
+    status = service.get_projection_status()
+
+    assert status["store_path"].endswith("harnesses/store.json")
+    assert status["last_sync"]

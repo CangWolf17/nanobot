@@ -153,3 +153,23 @@ def test_migrate_and_sync_rejects_existing_directory_without_workspace_markers(
 
     with pytest.raises(NotADirectoryError):
         migrate_and_sync(not_a_workspace)
+
+
+def test_projection_sync_marks_projection_files_as_projection_only(tmp_path: Path) -> None:
+    service = HarnessService.for_workspace(tmp_path)
+
+    result = service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+
+    service.sync_projections()
+
+    root_task = (tmp_path / "TASK.md").read_text(encoding="utf-8").lower()
+    harness_task = (
+        tmp_path / "harnesses" / result.active_harness_id / "TASK.md"
+    ).read_text(encoding="utf-8").lower()
+
+    assert "projection-only" in root_task
+    assert "projection-only" in harness_task

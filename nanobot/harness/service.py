@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -422,6 +423,21 @@ class HarnessService:
 
     def sync_projections(self) -> None:
         sync_workspace_projections(self.workspace_root, self.store.load())
+
+    def get_projection_status(self) -> dict[str, str]:
+        store_path = self.store.store_path
+        root_task_path = self.workspace_root / "TASK.md"
+        source_path = root_task_path if root_task_path.exists() else store_path
+        last_sync = ""
+        if source_path.exists():
+            last_sync = datetime.fromtimestamp(
+                source_path.stat().st_mtime, tz=timezone.utc
+            ).replace(microsecond=0).isoformat()
+        return {
+            "store_path": str(store_path),
+            "root_task_path": str(root_task_path),
+            "last_sync": last_sync,
+        }
 
     def _resolve_apply_target(
         self,

@@ -31,7 +31,7 @@ def sync_workspace_projections(workspace_root: Path, snapshot: HarnessSnapshot) 
 
 
 def _render_root_task(workspace_root: Path, active: HarnessRecord | None) -> str:
-    lines = ["# Active Harness Task", ""]
+    lines = ["# Active Harness Task", "", "> projection-only readout derived from harnesses/store.json", ""]
     if active is None:
         lines.append("No active harness.")
         return "\n".join(lines) + "\n"
@@ -90,6 +90,8 @@ def _render_harness(record: HarnessRecord) -> str:
 def _render_harness_task(workspace_root: Path, record: HarnessRecord, *, active_id: str) -> str:
     lines = [
         f"# Harness Task {record.id}",
+        "",
+        "> projection-only readout derived from harnesses/store.json",
         "",
         f"- id: {record.id}",
         f"- path: {workspace_root / 'harnesses' / record.id}",
