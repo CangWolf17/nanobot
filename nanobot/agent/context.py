@@ -6,8 +6,6 @@ import platform
 from pathlib import Path
 from typing import Any
 
-from nanobot.utils.helpers import current_time_str
-
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.policy.dev_discipline import (
     format_dev_discipline_block,
@@ -15,7 +13,7 @@ from nanobot.agent.policy.dev_discipline import (
     load_runtime_protocol,
 )
 from nanobot.agent.skills import SkillsLoader
-from nanobot.utils.helpers import build_assistant_message, detect_image_mime
+from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
 
 
 class ContextBuilder:
@@ -162,6 +160,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         channel: str | None,
         chat_id: str | None,
         timezone: str | None = None,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> str:
         """Build runtime metadata block injected before the user message.
 
@@ -182,7 +181,50 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             lines.append(f"Channel: {channel}")
         if chat_id:
             lines.append(f"Chat ID: `{chat_id}`")
+        if runtime_metadata:
+            lines.append("Runtime Metadata:")
+            lines.extend(ContextBuilder._format_runtime_metadata_lines(runtime_metadata))
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
+
+    @staticmethod
+    def _stringify_runtime_metadata_value(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
+            return "null"
+        return str(value)
+
+    @classmethod
+    def _format_runtime_metadata_lines(
+        cls,
+        payload: dict[str, Any],
+        *,
+        indent: int = 0,
+    ) -> list[str]:
+        prefix = "  " * indent
+        lines: list[str] = []
+
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                lines.append(f"{prefix}{key}:")
+                lines.extend(cls._format_runtime_metadata_lines(value, indent=indent + 1))
+            elif isinstance(value, list):
+                if not value:
+                    lines.append(f"{prefix}{key}: []")
+                    continue
+                lines.append(f"{prefix}{key}:")
+                child_prefix = "  " * (indent + 1)
+                for item in value:
+                    if isinstance(item, dict):
+                        lines.append(f"{child_prefix}-")
+                        lines.extend(cls._format_runtime_metadata_lines(item, indent=indent + 2))
+                    else:
+                        lines.append(
+                            f"{child_prefix}- {cls._stringify_runtime_metadata_value(item)}"
+                        )
+            else:
+                lines.append(f"{prefix}{key}: {cls._stringify_runtime_metadata_value(value)}")
+        return lines
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -207,9 +249,15 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         current_role: str = "user",
         workspace_work_mode: str | None = None,
         compact_state: str | None = None,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
+        runtime_ctx = self._build_runtime_context(
+            channel,
+            chat_id,
+            self.timezone,
+            runtime_metadata=runtime_metadata,
+        )
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message

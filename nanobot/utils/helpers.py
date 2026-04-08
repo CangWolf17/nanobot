@@ -245,6 +245,8 @@ def build_status_content(
     context_window_tokens: int,
     session_msg_count: int,
     context_tokens_estimate: int,
+    interrupt_summary: str | None = None,
+    harness_summary: str | None = None,
 ) -> str:
     """Build a human-readable runtime status snapshot."""
     uptime_s = int(time.time() - start_time)
@@ -264,12 +266,14 @@ def build_status_content(
     ctx_pct = int((context_tokens_estimate / ctx_total) * 100) if ctx_total > 0 else 0
     ctx_used_str = f"{context_tokens_estimate // 1000}k" if context_tokens_estimate >= 1000 else str(context_tokens_estimate)
     ctx_total_str = f"{ctx_total // 1024}k" if ctx_total > 0 else "n/a"
+    interrupt_line = str(harness_summary or interrupt_summary or "").strip()
     return "\n".join([
         f"\U0001f408 nanobot v{version}",
         f"\U0001f9e0 Model: {model}",
         tokens_line,
         f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
         f"\U0001f4ac Session: {session_msg_count} messages",
+        *( [f"\u2757 Interrupt: {interrupt_line}"] if interrupt_line else [] ),
         f"\u23f1 Uptime: {uptime}",
     ])
 

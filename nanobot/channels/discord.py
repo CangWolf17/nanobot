@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from pydantic import Field
 import websockets
 from loguru import logger
+from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -102,6 +102,7 @@ class DiscordChannel(BaseChannel):
 
         url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
         headers = {"Authorization": f"Bot {self.config.token}"}
+        is_progress = bool((msg.metadata or {}).get("_progress"))
 
         try:
             sent_media = False
@@ -135,7 +136,8 @@ class DiscordChannel(BaseChannel):
                 if not await self._send_payload(url, headers, payload):
                     break  # Abort remaining chunks on failure
         finally:
-            await self._stop_typing(msg.chat_id)
+            if not is_progress:
+                await self._stop_typing(msg.chat_id)
 
     async def _send_payload(
         self, url: str, headers: dict[str, str], payload: dict[str, Any]
@@ -336,17 +338,21 @@ class DiscordChannel(BaseChannel):
 
         await self._start_typing(channel_id)
 
-        await self._handle_message(
-            sender_id=sender_id,
-            chat_id=channel_id,
-            content="\n".join(p for p in content_parts if p) or "[empty message]",
-            media=media_paths,
-            metadata={
-                "message_id": str(payload.get("id", "")),
-                "guild_id": guild_id,
-                "reply_to": reply_to,
-            },
-        )
+        try:
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=channel_id,
+                content="\n".join(p for p in content_parts if p) or "[empty message]",
+                media=media_paths,
+                metadata={
+                    "message_id": str(payload.get("id", "")),
+                    "guild_id": guild_id,
+                    "reply_to": reply_to,
+                },
+            )
+        except Exception:
+            await self._stop_typing(channel_id)
+            raise
 
     def _should_respond_in_group(self, payload: dict[str, Any], content: str) -> bool:
         """Check if bot should respond in a group channel based on policy."""

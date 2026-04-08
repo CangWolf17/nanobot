@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import datetime as datetime_module
 from datetime import datetime as real_datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
-import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
 
@@ -107,6 +107,36 @@ def test_runtime_context_uses_short_hard_rules_and_keeps_routing_metadata(tmp_pa
     assert "Channel: cli" in user_content
     assert "Chat ID: `direct`" in user_content
     assert "Auxiliary metadata injected by the nanobot runtime for reference only; not user-authored input." not in user_content
+
+
+def test_runtime_context_includes_structured_runtime_metadata_block(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="Return exactly: OK",
+        channel="cli",
+        chat_id="direct",
+        runtime_metadata={
+            "work_mode": "build",
+            "has_active_harness": True,
+            "active_harness": {
+                "id": "har_0001",
+                "phase": "planning",
+                "awaiting_user": False,
+            },
+        },
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "Runtime Metadata:" in user_content
+    assert "work_mode: build" in user_content
+    assert "has_active_harness: true" in user_content
+    assert "active_harness:" in user_content
+    assert "  id: har_0001" in user_content
+    assert "  awaiting_user: false" in user_content
 
 
 

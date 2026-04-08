@@ -1,140 +1,100 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from types import SimpleNamespace
+import json
 
 import pytest
-discord = pytest.importorskip("discord")
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.discord import DiscordBotClient, DiscordChannel, DiscordConfig
-from nanobot.command.builtin import build_help_text
+from nanobot.channels.discord import DISCORD_API_BASE, DiscordChannel, DiscordConfig
 
 
-# Minimal Discord client test double used to control startup/readiness behavior.
-class _FakeDiscordClient:
-    instances: list["_FakeDiscordClient"] = []
-    start_error: Exception | None = None
+class _FakeResponse:
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        json_data: dict | None = None,
+        content: bytes = b"",
+        error: Exception | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._json_data = json_data or {}
+        self.content = content
+        self._error = error
 
-    def __init__(self, owner, *, intents) -> None:
-        self.owner = owner
-        self.intents = intents
+    def json(self) -> dict:
+        return self._json_data
+
+    def raise_for_status(self) -> None:
+        if self._error is not None:
+            raise self._error
+        if self.status_code >= 400 and self.status_code != 429:
+            raise RuntimeError(f"http {self.status_code}")
+
+
+class _FakeHttpClient:
+    def __init__(
+        self,
+        *,
+        post_responses: list[_FakeResponse | Exception] | None = None,
+        get_responses: list[_FakeResponse | Exception] | None = None,
+    ) -> None:
+        self.post_calls: list[dict] = []
+        self.get_calls: list[str] = []
+        self._post_responses = list(post_responses or [])
+        self._get_responses = list(get_responses or [])
         self.closed = False
-        self.ready = True
-        self.channels: dict[int, object] = {}
-        self.user = SimpleNamespace(id=999)
-        self.__class__.instances.append(self)
 
-    async def start(self, token: str) -> None:
-        self.token = token
-        if self.__class__.start_error is not None:
-            raise self.__class__.start_error
+    async def post(self, url: str, **kwargs):
+        self.post_calls.append({"url": url, **kwargs})
+        if self._post_responses:
+            response = self._post_responses.pop(0)
+        else:
+            response = _FakeResponse()
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def get(self, url: str):
+        self.get_calls.append(url)
+        if self._get_responses:
+            response = self._get_responses.pop(0)
+        else:
+            response = _FakeResponse()
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _BlockingTypingHttpClient:
+    def __init__(self) -> None:
+        self.post_calls: list[dict] = []
+        self.started = asyncio.Event()
+
+    async def post(self, url: str, **kwargs):
+        self.post_calls.append({"url": url, **kwargs})
+        self.started.set()
+        await asyncio.Future()
+
+
+class _FakeWebSocket:
+    def __init__(self) -> None:
+        self.closed = False
+        self.sent: list[str] = []
 
     async def close(self) -> None:
         self.closed = True
 
-    def is_closed(self) -> bool:
-        return self.closed
-
-    def is_ready(self) -> bool:
-        return self.ready
-
-    def get_channel(self, channel_id: int):
-        return self.channels.get(channel_id)
-
-    async def send_outbound(self, msg: OutboundMessage) -> None:
-        channel = self.get_channel(int(msg.chat_id))
-        if channel is None:
-            return
-        await channel.send(content=msg.content)
+    async def send(self, payload: str) -> None:
+        self.sent.append(payload)
 
 
-class _FakeAttachment:
-    # Attachment double that can simulate successful or failing save() calls.
-    def __init__(self, attachment_id: int, filename: str, *, size: int = 1, fail: bool = False) -> None:
-        self.id = attachment_id
-        self.filename = filename
-        self.size = size
-        self._fail = fail
-
-    async def save(self, path: str | Path) -> None:
-        if self._fail:
-            raise RuntimeError("save failed")
-        Path(path).write_bytes(b"attachment")
-
-
-class _FakePartialMessage:
-    # Lightweight stand-in for Discord partial message references used in replies.
-    def __init__(self, message_id: int) -> None:
-        self.id = message_id
-
-
-class _FakeChannel:
-    # Channel double that records outbound payloads and typing activity.
-    def __init__(self, channel_id: int = 123) -> None:
-        self.id = channel_id
-        self.sent_payloads: list[dict] = []
-        self.trigger_typing_calls = 0
-        self.typing_enter_hook = None
-
-    async def send(self, **kwargs) -> None:
-        payload = dict(kwargs)
-        if "file" in payload:
-            payload["file_name"] = payload["file"].filename
-            del payload["file"]
-        self.sent_payloads.append(payload)
-
-    def get_partial_message(self, message_id: int) -> _FakePartialMessage:
-        return _FakePartialMessage(message_id)
-
-    def typing(self):
-        channel = self
-
-        class _TypingContext:
-            async def __aenter__(self):
-                channel.trigger_typing_calls += 1
-                if channel.typing_enter_hook is not None:
-                    await channel.typing_enter_hook()
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-        return _TypingContext()
-
-
-class _FakeInteractionResponse:
-    def __init__(self) -> None:
-        self.messages: list[dict] = []
-        self._done = False
-
-    async def send_message(self, content: str, *, ephemeral: bool = False) -> None:
-        self.messages.append({"content": content, "ephemeral": ephemeral})
-        self._done = True
-
-    def is_done(self) -> bool:
-        return self._done
-
-
-def _make_interaction(
-    *,
-    user_id: int = 123,
-    channel_id: int | None = 456,
-    guild_id: int | None = None,
-    interaction_id: int = 999,
-):
-    return SimpleNamespace(
-        user=SimpleNamespace(id=user_id),
-        channel_id=channel_id,
-        guild_id=guild_id,
-        id=interaction_id,
-        command=SimpleNamespace(qualified_name="new"),
-        response=_FakeInteractionResponse(),
-    )
-
-
-def _make_message(
+def _make_payload(
     *,
     author_id: int = 123,
     author_bot: bool = False,
@@ -142,479 +102,92 @@ def _make_message(
     message_id: int = 789,
     content: str = "hello",
     guild_id: int | None = None,
-    mentions: list[object] | None = None,
-    attachments: list[object] | None = None,
+    mentions: list[dict] | None = None,
+    attachments: list[dict] | None = None,
     reply_to: int | None = None,
-):
-    # Factory for incoming Discord message objects with optional guild/reply/attachments.
-    guild = SimpleNamespace(id=guild_id) if guild_id is not None else None
-    reference = SimpleNamespace(message_id=reply_to) if reply_to is not None else None
-    return SimpleNamespace(
-        author=SimpleNamespace(id=author_id, bot=author_bot),
-        channel=_FakeChannel(channel_id),
-        content=content,
-        guild=guild,
-        mentions=mentions or [],
-        attachments=attachments or [],
-        reference=reference,
-        id=message_id,
-    )
+) -> dict:
+    payload = {
+        "author": {"id": author_id, "bot": author_bot},
+        "channel_id": str(channel_id),
+        "content": content,
+        "id": str(message_id),
+        "mentions": mentions or [],
+        "attachments": attachments or [],
+    }
+    if guild_id is not None:
+        payload["guild_id"] = str(guild_id)
+    if reply_to is not None:
+        payload["referenced_message"] = {"id": str(reply_to)}
+    return payload
 
 
 @pytest.mark.asyncio
 async def test_start_returns_when_token_missing() -> None:
-    # If no token is configured, startup should no-op and leave channel stopped.
     channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
 
     await channel.start()
 
     assert channel.is_running is False
-    assert channel._client is None
+    assert channel._http is None
 
 
 @pytest.mark.asyncio
-async def test_start_returns_when_discord_dependency_missing(monkeypatch) -> None:
+async def test_stop_cleans_up_runtime_state() -> None:
     channel = DiscordChannel(
         DiscordConfig(enabled=True, token="token", allow_from=["*"]),
         MessageBus(),
     )
-    monkeypatch.setattr("nanobot.channels.discord.DISCORD_AVAILABLE", False)
+    http = _FakeHttpClient()
+    ws = _FakeWebSocket()
+    heartbeat = asyncio.create_task(asyncio.sleep(60))
+    typing_task = asyncio.create_task(asyncio.sleep(60))
 
-    await channel.start()
-
-    assert channel.is_running is False
-    assert channel._client is None
-
-
-@pytest.mark.asyncio
-async def test_start_handles_client_construction_failure(monkeypatch) -> None:
-    # Construction errors from the Discord client should be swallowed and keep state clean.
-    channel = DiscordChannel(
-        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
-        MessageBus(),
-    )
-
-    def _boom(owner, *, intents):
-        raise RuntimeError("bad client")
-
-    monkeypatch.setattr("nanobot.channels.discord.DiscordBotClient", _boom)
-
-    await channel.start()
-
-    assert channel.is_running is False
-    assert channel._client is None
-
-
-@pytest.mark.asyncio
-async def test_start_handles_client_start_failure(monkeypatch) -> None:
-    # If client.start fails, the partially created client should be closed and detached.
-    channel = DiscordChannel(
-        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
-        MessageBus(),
-    )
-
-    _FakeDiscordClient.instances.clear()
-    _FakeDiscordClient.start_error = RuntimeError("connect failed")
-    monkeypatch.setattr("nanobot.channels.discord.DiscordBotClient", _FakeDiscordClient)
-
-    await channel.start()
-
-    assert channel.is_running is False
-    assert channel._client is None
-    assert _FakeDiscordClient.instances[0].intents.value == channel.config.intents
-    assert _FakeDiscordClient.instances[0].closed is True
-
-    _FakeDiscordClient.start_error = None
-
-
-@pytest.mark.asyncio
-async def test_stop_is_safe_after_partial_start(monkeypatch) -> None:
-    # stop() should close/discard the client even when startup was only partially completed.
-    channel = DiscordChannel(
-        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
-        MessageBus(),
-    )
-    client = _FakeDiscordClient(channel, intents=None)
-    channel._client = client
     channel._running = True
+    channel._http = http
+    channel._ws = ws
+    channel._heartbeat_task = heartbeat
+    channel._typing_tasks["123"] = typing_task
 
     await channel.stop()
-
-    assert channel.is_running is False
-    assert client.closed is True
-    assert channel._client is None
-
-
-@pytest.mark.asyncio
-async def test_on_message_ignores_bot_messages() -> None:
-    # Incoming bot-authored messages must be ignored to prevent feedback loops.
-    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-    handled: list[dict] = []
-    channel._handle_message = lambda **kwargs: handled.append(kwargs)  # type: ignore[method-assign]
-
-    await channel._on_message(_make_message(author_bot=True))
-
-    assert handled == []
-
-    # If inbound handling raises, typing should be stopped for that channel.
-    async def fail_handle(**kwargs) -> None:
-        raise RuntimeError("boom")
-
-    channel._handle_message = fail_handle  # type: ignore[method-assign]
-
-    with pytest.raises(RuntimeError, match="boom"):
-        await channel._on_message(_make_message(author_id=123, channel_id=456))
-
-    assert channel._typing_tasks == {}
-
-
-@pytest.mark.asyncio
-async def test_on_message_accepts_allowlisted_dm() -> None:
-    # Allowed direct messages should be forwarded with normalized metadata.
-    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["123"]), MessageBus())
-    handled: list[dict] = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle  # type: ignore[method-assign]
-
-    await channel._on_message(_make_message(author_id=123, channel_id=456, message_id=789))
-
-    assert len(handled) == 1
-    assert handled[0]["chat_id"] == "456"
-    assert handled[0]["metadata"] == {"message_id": "789", "guild_id": None, "reply_to": None}
-
-
-@pytest.mark.asyncio
-async def test_on_message_ignores_unmentioned_guild_message() -> None:
-    # With mention-only group policy, guild messages without a bot mention are dropped.
-    channel = DiscordChannel(
-        DiscordConfig(enabled=True, allow_from=["*"], group_policy="mention"),
-        MessageBus(),
-    )
-    channel._bot_user_id = "999"
-    handled: list[dict] = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle  # type: ignore[method-assign]
-
-    await channel._on_message(_make_message(guild_id=1, content="hello everyone"))
-
-    assert handled == []
-
-
-@pytest.mark.asyncio
-async def test_on_message_accepts_mentioned_guild_message() -> None:
-    # Mentioned guild messages should be accepted and preserve reply threading metadata.
-    channel = DiscordChannel(
-        DiscordConfig(enabled=True, allow_from=["*"], group_policy="mention"),
-        MessageBus(),
-    )
-    channel._bot_user_id = "999"
-    handled: list[dict] = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle  # type: ignore[method-assign]
-
-    await channel._on_message(
-        _make_message(
-            guild_id=1,
-            content="<@999> hello",
-            mentions=[SimpleNamespace(id=999)],
-            reply_to=321,
-        )
-    )
-
-    assert len(handled) == 1
-    assert handled[0]["metadata"]["reply_to"] == "321"
-
-
-@pytest.mark.asyncio
-async def test_on_message_downloads_attachments(tmp_path, monkeypatch) -> None:
-    # Attachment downloads should be saved and referenced in forwarded content/media.
-    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-    handled: list[dict] = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle  # type: ignore[method-assign]
-    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
-
-    await channel._on_message(
-        _make_message(
-            attachments=[_FakeAttachment(12, "photo.png")],
-            content="see file",
-        )
-    )
-
-    assert len(handled) == 1
-    assert handled[0]["media"] == [str(tmp_path / "12_photo.png")]
-    assert "[attachment:" in handled[0]["content"]
-
-
-@pytest.mark.asyncio
-async def test_on_message_marks_failed_attachment_download(tmp_path, monkeypatch) -> None:
-    # Failed attachment downloads should emit a readable placeholder and no media path.
-    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-    handled: list[dict] = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle  # type: ignore[method-assign]
-    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
-
-    await channel._on_message(
-        _make_message(
-            attachments=[_FakeAttachment(12, "photo.png", fail=True)],
-            content="",
-        )
-    )
-
-    assert len(handled) == 1
-    assert handled[0]["media"] == []
-    assert handled[0]["content"] == "[attachment: photo.png - download failed]"
-
-
-@pytest.mark.asyncio
-async def test_send_warns_when_client_not_ready() -> None:
-    # Sending without a running/ready client should be a safe no-op.
-    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-
-    await channel.send(OutboundMessage(channel="discord", chat_id="123", content="hello"))
-
-    assert channel._typing_tasks == {}
-
-
-@pytest.mark.asyncio
-async def test_send_skips_when_channel_not_cached() -> None:
-    # Outbound sends should be skipped when the destination channel is not resolvable.
-    owner = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-    client = DiscordBotClient(owner, intents=discord.Intents.none())
-    fetch_calls: list[int] = []
-
-    async def fetch_channel(channel_id: int):
-        fetch_calls.append(channel_id)
-        raise RuntimeError("not found")
-
-    client.fetch_channel = fetch_channel  # type: ignore[method-assign]
-
-    await client.send_outbound(OutboundMessage(channel="discord", chat_id="123", content="hello"))
-
-    assert client.get_channel(123) is None
-    assert fetch_calls == [123]
-
-
-@pytest.mark.asyncio
-async def test_send_fetches_channel_when_not_cached() -> None:
-    owner = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-    client = DiscordBotClient(owner, intents=discord.Intents.none())
-    target = _FakeChannel(channel_id=123)
-
-    async def fetch_channel(channel_id: int):
-        return target if channel_id == 123 else None
-
-    client.fetch_channel = fetch_channel  # type: ignore[method-assign]
-
-    await client.send_outbound(OutboundMessage(channel="discord", chat_id="123", content="hello"))
-
-    assert target.sent_payloads == [{"content": "hello"}]
-
-
-@pytest.mark.asyncio
-async def test_slash_new_forwards_when_user_is_allowlisted() -> None:
-    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["123"]), MessageBus())
-    handled: list[dict] = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle  # type: ignore[method-assign]
-    client = DiscordBotClient(channel, intents=discord.Intents.none())
-    interaction = _make_interaction(user_id=123, channel_id=456, interaction_id=321)
-
-    new_cmd = client.tree.get_command("new")
-    assert new_cmd is not None
-    await new_cmd.callback(interaction)
-
-    assert interaction.response.messages == [
-        {"content": "Processing /new...", "ephemeral": True}
-    ]
-    assert len(handled) == 1
-    assert handled[0]["content"] == "/new"
-    assert handled[0]["sender_id"] == "123"
-    assert handled[0]["chat_id"] == "456"
-    assert handled[0]["metadata"]["interaction_id"] == "321"
-    assert handled[0]["metadata"]["is_slash_command"] is True
-
-
-@pytest.mark.asyncio
-async def test_slash_new_is_blocked_for_disallowed_user() -> None:
-    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["999"]), MessageBus())
-    handled: list[dict] = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle  # type: ignore[method-assign]
-    client = DiscordBotClient(channel, intents=discord.Intents.none())
-    interaction = _make_interaction(user_id=123, channel_id=456)
-
-    new_cmd = client.tree.get_command("new")
-    assert new_cmd is not None
-    await new_cmd.callback(interaction)
-
-    assert interaction.response.messages == [
-        {"content": "You are not allowed to use this bot.", "ephemeral": True}
-    ]
-    assert handled == []
-
-
-@pytest.mark.parametrize("slash_name", ["stop", "restart", "status"])
-@pytest.mark.asyncio
-async def test_slash_commands_forward_via_handle_message(slash_name: str) -> None:
-    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-    handled: list[dict] = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle  # type: ignore[method-assign]
-    client = DiscordBotClient(channel, intents=discord.Intents.none())
-    interaction = _make_interaction()
-    interaction.command.qualified_name = slash_name
-
-    cmd = client.tree.get_command(slash_name)
-    assert cmd is not None
-    await cmd.callback(interaction)
-
-    assert interaction.response.messages == [
-        {"content": f"Processing /{slash_name}...", "ephemeral": True}
-    ]
-    assert len(handled) == 1
-    assert handled[0]["content"] == f"/{slash_name}"
-    assert handled[0]["metadata"]["is_slash_command"] is True
-
-
-@pytest.mark.asyncio
-async def test_slash_help_returns_ephemeral_help_text() -> None:
-    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-    handled: list[dict] = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle  # type: ignore[method-assign]
-    client = DiscordBotClient(channel, intents=discord.Intents.none())
-    interaction = _make_interaction()
-    interaction.command.qualified_name = "help"
-
-    help_cmd = client.tree.get_command("help")
-    assert help_cmd is not None
-    await help_cmd.callback(interaction)
-
-    assert interaction.response.messages == [
-        {"content": build_help_text(), "ephemeral": True}
-    ]
-    assert handled == []
-
-
-@pytest.mark.asyncio
-async def test_client_send_outbound_chunks_text_replies_and_uploads_files(tmp_path) -> None:
-    # Outbound payloads should upload files, attach reply references, and chunk long text.
-    owner = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-    client = DiscordBotClient(owner, intents=discord.Intents.none())
-    target = _FakeChannel(channel_id=123)
-    client.get_channel = lambda channel_id: target if channel_id == 123 else None  # type: ignore[method-assign]
-
-    file_path = tmp_path / "demo.txt"
-    file_path.write_text("hi")
-
-    await client.send_outbound(
-        OutboundMessage(
-            channel="discord",
-            chat_id="123",
-            content="a" * 2100,
-            reply_to="55",
-            media=[str(file_path)],
-        )
-    )
-
-    assert len(target.sent_payloads) == 3
-    assert target.sent_payloads[0]["file_name"] == "demo.txt"
-    assert target.sent_payloads[0]["reference"].id == 55
-    assert target.sent_payloads[1]["content"] == "a" * 2000
-    assert target.sent_payloads[2]["content"] == "a" * 100
-
-
-@pytest.mark.asyncio
-async def test_client_send_outbound_reports_failed_attachments_when_no_text(tmp_path) -> None:
-    # If all attachment sends fail and no text exists, emit a failure placeholder message.
-    owner = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-    client = DiscordBotClient(owner, intents=discord.Intents.none())
-    target = _FakeChannel(channel_id=123)
-    client.get_channel = lambda channel_id: target if channel_id == 123 else None  # type: ignore[method-assign]
-
-    missing_file = tmp_path / "missing.txt"
-
-    await client.send_outbound(
-        OutboundMessage(
-            channel="discord",
-            chat_id="123",
-            content="",
-            media=[str(missing_file)],
-        )
-    )
-
-    assert target.sent_payloads == [{"content": "[attachment: missing.txt - send failed]"}]
-
-
-@pytest.mark.asyncio
-async def test_send_stops_typing_after_send() -> None:
-    # Active typing indicators should be cancelled/cleared after a successful send.
-    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
-    client = _FakeDiscordClient(channel, intents=None)
-    channel._client = client
-    channel._running = True
-
-    start = asyncio.Event()
-    release = asyncio.Event()
-
-    async def slow_typing() -> None:
-        start.set()
-        await release.wait()
-
-    typing_channel = _FakeChannel(channel_id=123)
-    typing_channel.typing_enter_hook = slow_typing
-
-    await channel._start_typing(typing_channel)
-    await start.wait()
-
-    await channel.send(OutboundMessage(channel="discord", chat_id="123", content="hello"))
-    release.set()
     await asyncio.sleep(0)
 
+    assert channel.is_running is False
+    assert channel._heartbeat_task is None
+    assert heartbeat.cancelled() is True
+    assert typing_task.cancelled() is True
+    assert channel._typing_tasks == {}
+    assert ws.closed is True
+    assert http.closed is True
+    assert channel._ws is None
+    assert channel._http is None
+
+
+@pytest.mark.asyncio
+async def test_send_returns_when_http_not_initialized() -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+
+    await channel.send(OutboundMessage(channel="discord", chat_id="123", content="hello"))
+
     assert channel._typing_tasks == {}
 
-    # Progress messages should keep typing active until a final (non-progress) send.
-    start = asyncio.Event()
-    release = asyncio.Event()
 
-    async def slow_typing_progress() -> None:
-        start.set()
-        await release.wait()
+@pytest.mark.asyncio
+async def test_send_stops_typing_after_final_send_but_keeps_progress_typing() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
+        MessageBus(),
+    )
+    http = _BlockingTypingHttpClient()
+    channel._running = True
+    channel._http = http
 
-    typing_channel = _FakeChannel(channel_id=123)
-    typing_channel.typing_enter_hook = slow_typing_progress
+    async def fake_send_payload(url: str, headers: dict[str, str], payload: dict) -> bool:
+        return True
 
-    await channel._start_typing(typing_channel)
-    await start.wait()
+    channel._send_payload = fake_send_payload  # type: ignore[method-assign]
+
+    await channel._start_typing("123")
+    await http.started.wait()
 
     await channel.send(
         OutboundMessage(
@@ -628,49 +201,341 @@ async def test_send_stops_typing_after_send() -> None:
     assert "123" in channel._typing_tasks
 
     await channel.send(OutboundMessage(channel="discord", chat_id="123", content="final"))
-    release.set()
     await asyncio.sleep(0)
 
     assert channel._typing_tasks == {}
 
 
 @pytest.mark.asyncio
-async def test_start_typing_uses_typing_context_when_trigger_typing_missing() -> None:
+async def test_send_uses_reply_payload_for_text_only_message() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
+        MessageBus(),
+    )
+    http = _FakeHttpClient(post_responses=[_FakeResponse()])
+    channel._http = http
+
+    await channel.send(
+        OutboundMessage(
+            channel="discord",
+            chat_id="123",
+            content="hello",
+            reply_to="55",
+        )
+    )
+
+    assert http.post_calls == [
+        {
+            "url": f"{DISCORD_API_BASE}/channels/123/messages",
+            "headers": {"Authorization": "Bot token"},
+            "json": {
+                "content": "hello",
+                "message_reference": {"message_id": "55"},
+                "allowed_mentions": {"replied_user": False},
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_emits_attachment_failure_placeholder_when_no_text(tmp_path) -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
+        MessageBus(),
+    )
+    http = _FakeHttpClient(post_responses=[_FakeResponse()])
+    channel._http = http
+
+    await channel.send(
+        OutboundMessage(
+            channel="discord",
+            chat_id="123",
+            content="",
+            media=[str(tmp_path / "missing.txt")],
+        )
+    )
+
+    assert http.post_calls == [
+        {
+            "url": f"{DISCORD_API_BASE}/channels/123/messages",
+            "headers": {"Authorization": "Bot token"},
+            "json": {"content": "[attachment: missing.txt - send failed]"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_payload_retries_after_rate_limit(monkeypatch) -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
+        MessageBus(),
+    )
+    http = _FakeHttpClient(
+        post_responses=[
+            _FakeResponse(status_code=429, json_data={"retry_after": 0.0}),
+            _FakeResponse(),
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("nanobot.channels.discord.asyncio.sleep", fake_sleep)
+    channel._http = http
+
+    sent = await channel._send_payload(
+        f"{DISCORD_API_BASE}/channels/123/messages",
+        {"Authorization": "Bot token"},
+        {"content": "hello"},
+    )
+
+    assert sent is True
+    assert len(http.post_calls) == 2
+    assert sleeps == [0.0]
+
+
+@pytest.mark.asyncio
+async def test_send_file_includes_reply_payload_json(tmp_path) -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
+        MessageBus(),
+    )
+    http = _FakeHttpClient(post_responses=[_FakeResponse()])
+    file_path = tmp_path / "demo.txt"
+    file_path.write_text("hi")
+    channel._http = http
+
+    sent = await channel._send_file(
+        f"{DISCORD_API_BASE}/channels/123/messages",
+        {"Authorization": "Bot token"},
+        str(file_path),
+        reply_to="55",
+    )
+
+    assert sent is True
+    assert len(http.post_calls) == 1
+    assert http.post_calls[0]["files"]["files[0]"][0] == "demo.txt"
+    assert json.loads(http.post_calls[0]["data"]["payload_json"]) == {
+        "message_reference": {"message_id": "55"},
+        "allowed_mentions": {"replied_user": False},
+    }
+
+
+@pytest.mark.asyncio
+async def test_handle_message_create_ignores_bot_messages() -> None:
     channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    handled: list[dict] = []
+    channel._handle_message = lambda **kwargs: handled.append(kwargs)  # type: ignore[method-assign]
+
+    await channel._handle_message_create(_make_payload(author_bot=True))
+
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_handle_message_create_accepts_allowlisted_dm() -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["123"]), MessageBus())
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    channel._start_typing = lambda _channel_id: asyncio.sleep(0)  # type: ignore[method-assign]
+
+    await channel._handle_message_create(_make_payload(author_id=123, channel_id=456, message_id=789))
+
+    assert handled == [
+        {
+            "sender_id": "123",
+            "chat_id": "456",
+            "content": "hello",
+            "media": [],
+            "metadata": {"message_id": "789", "guild_id": None, "reply_to": None},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_message_create_ignores_unmentioned_guild_message() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], group_policy="mention"),
+        MessageBus(),
+    )
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._bot_user_id = "999"
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    channel._start_typing = lambda _channel_id: asyncio.sleep(0)  # type: ignore[method-assign]
+
+    await channel._handle_message_create(_make_payload(guild_id=1, content="hello everyone"))
+
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_handle_message_create_accepts_mentioned_guild_message() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], group_policy="mention"),
+        MessageBus(),
+    )
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._bot_user_id = "999"
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    channel._start_typing = lambda _channel_id: asyncio.sleep(0)  # type: ignore[method-assign]
+
+    await channel._handle_message_create(
+        _make_payload(
+            guild_id=1,
+            content="<@999> hello",
+            mentions=[{"id": "999"}],
+            reply_to=321,
+        )
+    )
+
+    assert handled[0]["metadata"]["reply_to"] == "321"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_create_downloads_attachments(tmp_path, monkeypatch) -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    handled: list[dict] = []
+    http = _FakeHttpClient(get_responses=[_FakeResponse(content=b"attachment")])
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    channel._start_typing = lambda _channel_id: asyncio.sleep(0)  # type: ignore[method-assign]
+    channel._http = http
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    await channel._handle_message_create(
+        _make_payload(
+            attachments=[
+                {
+                    "id": "12",
+                    "filename": "photo.png",
+                    "size": 1,
+                    "url": "https://example.invalid/photo.png",
+                }
+            ],
+            content="see file",
+        )
+    )
+
+    assert handled[0]["media"] == [str(tmp_path / "12_photo.png")]
+    assert "[attachment:" in handled[0]["content"]
+    assert http.get_calls == ["https://example.invalid/photo.png"]
+
+
+@pytest.mark.asyncio
+async def test_handle_message_create_marks_failed_attachment_download(
+    tmp_path, monkeypatch
+) -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    handled: list[dict] = []
+    http = _FakeHttpClient(get_responses=[RuntimeError("boom")])
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    channel._start_typing = lambda _channel_id: asyncio.sleep(0)  # type: ignore[method-assign]
+    channel._http = http
+    monkeypatch.setattr("nanobot.channels.discord.get_media_dir", lambda _name: tmp_path)
+
+    await channel._handle_message_create(
+        _make_payload(
+            attachments=[
+                {
+                    "id": "12",
+                    "filename": "photo.png",
+                    "size": 1,
+                    "url": "https://example.invalid/photo.png",
+                }
+            ],
+            content="",
+        )
+    )
+
+    assert handled[0]["media"] == []
+    assert handled[0]["content"] == "[attachment: photo.png - download failed]"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_create_stops_typing_on_handler_error() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
+        MessageBus(),
+    )
+    http = _BlockingTypingHttpClient()
     channel._running = True
+    channel._http = http
 
-    entered = asyncio.Event()
-    release = asyncio.Event()
+    async def fail_handle(**kwargs) -> None:
+        await http.started.wait()
+        raise RuntimeError("boom")
 
-    class _TypingCtx:
-        async def __aenter__(self):
-            entered.set()
+    channel._handle_message = fail_handle  # type: ignore[method-assign]
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
+    with pytest.raises(RuntimeError, match="boom"):
+        await channel._handle_message_create(_make_payload(author_id=123, channel_id=456))
 
-    class _NoTriggerChannel:
-        def __init__(self, channel_id: int = 123) -> None:
-            self.id = channel_id
+    await asyncio.sleep(0)
+    assert channel._typing_tasks == {}
 
-        def typing(self):
-            async def _waiter():
-                await release.wait()
-            # Hold the loop so task remains active until explicitly stopped.
-            class _Ctx(_TypingCtx):
-                async def __aenter__(self):
-                    await super().__aenter__()
-                    await _waiter()
-            return _Ctx()
 
-    typing_channel = _NoTriggerChannel(channel_id=123)
-    await channel._start_typing(typing_channel)  # type: ignore[arg-type]
-    await entered.wait()
+@pytest.mark.asyncio
+async def test_start_typing_posts_until_stopped() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
+        MessageBus(),
+    )
+    http = _BlockingTypingHttpClient()
+    channel._running = True
+    channel._http = http
+
+    await channel._start_typing("123")
+    await http.started.wait()
 
     assert "123" in channel._typing_tasks
+    assert http.post_calls[0]["url"] == f"{DISCORD_API_BASE}/channels/123/typing"
 
     await channel._stop_typing("123")
-    release.set()
     await asyncio.sleep(0)
 
     assert channel._typing_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_identify_sends_expected_gateway_payload() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, token="token", allow_from=["*"], intents=42),
+        MessageBus(),
+    )
+    ws = _FakeWebSocket()
+    channel._ws = ws
+
+    await channel._identify()
+
+    assert json.loads(ws.sent[0]) == {
+        "op": 2,
+        "d": {
+            "token": "token",
+            "intents": 42,
+            "properties": {
+                "os": "nanobot",
+                "browser": "nanobot",
+                "device": "nanobot",
+            },
+        },
+    }

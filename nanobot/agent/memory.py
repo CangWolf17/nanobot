@@ -364,7 +364,12 @@ class MemoryConsolidator:
 
     def prompt_budget(self) -> int:
         """Prompt token budget for the main conversation path."""
-        return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+        max_completion_tokens = (
+            self.max_completion_tokens
+            if isinstance(self.max_completion_tokens, int) and not isinstance(self.max_completion_tokens, bool)
+            else 4096
+        )
+        return self.context_window_tokens - max_completion_tokens - self._SAFETY_BUFFER
 
     def target_prompt_tokens(self) -> int:
         """Target prompt size after consolidation."""
