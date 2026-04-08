@@ -311,6 +311,11 @@ def _load_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _load_model_state(path: Path) -> dict[str, Any]:
+    data = _load_json(path)
+    return data if isinstance(data, dict) else {}
+
+
 def _route_from_api_base(api_base: str, fallback: str) -> str:
     lower = str(api_base or "").strip().rstrip("/").lower()
     if not lower:
@@ -331,6 +336,14 @@ def _infer_manager_tier_from_ref(ref: str) -> str:
     if text.startswith("lite-"):
         return "lite"
     return "standard"
+
+
+def _manager_model_from_state(state: dict[str, Any]) -> str:
+    for key in ("current_model", "last_known_good_model", "last_effective_model"):
+        value = str(state.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _provider_status_policy(data: dict[str, Any] | None) -> dict[str, Any]:
@@ -758,6 +771,7 @@ def build_manager_from_workspace_snapshot(
         registry = {}
     registry.setdefault("models", {})
     _config = _load_json(workspace / "config.json")
+    state = _load_model_state(workspace / "model_state.json")
     transient_ttl_seconds = _provider_status_transient_ttl_seconds(registry)
 
     route_policies = {
@@ -830,7 +844,9 @@ def build_manager_from_workspace_snapshot(
             tier_policies[tier_clean] = _merge_tier_policy(base, override if isinstance(override, dict) else None)
 
     subagent_defaults = registry.get("subagent_defaults", {}) if isinstance(registry, dict) else {}
-    manager_model = str((subagent_defaults or {}).get("model") or "").strip()
+    manager_model = _manager_model_from_state(state)
+    if not manager_model:
+        manager_model = str((subagent_defaults or {}).get("model") or "").strip()
     if not manager_model:
         manager_model = str(fallback_model or "").strip()
     manager_tier = _infer_manager_tier_from_ref(manager_model)

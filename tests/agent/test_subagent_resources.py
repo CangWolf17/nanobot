@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
-
 
 def _registry() -> dict:
     return {
@@ -310,6 +307,30 @@ def test_build_manager_from_workspace_snapshot_uses_workspace_truth(tmp_path):
 
 
 
+def test_build_manager_snapshot_prefers_current_model_from_model_state(tmp_path):
+    from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(_registry(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_state.json").write_text(
+        json.dumps({"current_model": "standard-gpt-5.4-xhigh-tokenx"}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    request = manager.default_request()
+
+    assert request.manager_model == "standard-gpt-5.4-xhigh-tokenx"
+    assert request.manager_tier == "standard"
+
+
+
 def test_build_manager_snapshot_defaults_lite_to_minimax_archive_route(tmp_path):
     from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
 
@@ -401,7 +422,10 @@ def test_build_manager_snapshot_uses_registry_policy_overrides_instead_of_hardco
 
 
 def test_record_provider_failure_persists_hard_status_and_future_snapshot_skips_route(tmp_path):
-    from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot, record_provider_failure
+    from nanobot.agent.subagent_resources import (
+        build_manager_from_workspace_snapshot,
+        record_provider_failure,
+    )
 
     (tmp_path / "config.json").write_text(
         json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
@@ -437,7 +461,10 @@ def test_record_provider_failure_persists_hard_status_and_future_snapshot_skips_
 
 
 def test_record_provider_failure_persists_transient_status_without_shrinking_candidate_pool(tmp_path):
-    from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot, record_provider_failure
+    from nanobot.agent.subagent_resources import (
+        build_manager_from_workspace_snapshot,
+        record_provider_failure,
+    )
 
     (tmp_path / "config.json").write_text(
         json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
@@ -508,7 +535,10 @@ def test_build_manager_snapshot_ignores_stale_transient_provider_status(tmp_path
 
 
 def test_refresh_provider_status_restores_route_for_future_snapshot(tmp_path):
-    from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot, refresh_provider_status
+    from nanobot.agent.subagent_resources import (
+        build_manager_from_workspace_snapshot,
+        refresh_provider_status,
+    )
 
     registry = _registry()
     registry["provider_status"] = {
