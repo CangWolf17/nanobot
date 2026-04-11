@@ -2,11 +2,24 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
+
+import httpx
+
+from nanobot.agent.subagent_types import get_subagent_type_spec
+
+_ANTHROPIC_DEFAULT_API_BASE = "https://api.anthropic.com"
+_OPENAI_DEFAULT_API_BASE = "https://api.openai.com/v1"
+_GITHUB_COPILOT_DEFAULT_API_BASE = "https://api.githubcopilot.com"
+_ANTHROPIC_VERSION = "2023-06-01"
+_AZURE_OPENAI_API_VERSION = "2024-10-21"
+_WORKSPACE_FALLBACK_BACKENDS = {"openai_codex"}
 
 
 @dataclass(frozen=True)
@@ -50,6 +63,27 @@ class SubagentRequest:
     task_kind: str | None = None
     session_key: str | None = None
     harness_id: str | None = None
+    candidate_chain: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RuntimeSubagentSpawnRequest:
+    name: str | None = None
+    subagent_type: str | None = None
+    model: str | None = None
+    preferred_route: str | None = None
+    compatibility_tier: str | None = None
+
+
+@dataclass(frozen=True)
+class SubagentResolution:
+    requested_name: str | None
+    requested_type: str | None
+    requested_model: str | None
+    preferred_route: str | None
+    candidate_chain: tuple[str, ...]
+    resolved_model_id: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -65,6 +99,8 @@ class AcquireDecision:
     status: str
     reason: str = ""
     lease: SubagentLease | None = None
+    queue_route: str = ""
+    queue_tier: str = ""
 
 
 class SubagentResourceManager:
@@ -75,7 +111,7 @@ class SubagentResourceManager:
         tier_policies: dict[str, TierPolicy],
         route_policies: dict[str, RoutePolicy],
         route_states: dict[str, RouteState] | None = None,
-        defaults: dict[str, str] | None = None,
+        defaults: dict[str, Any] | None = None,
     ) -> None:
         self.registry = registry if isinstance(registry, dict) else {"models": {}}
         self.tier_policies = dict(tier_policies or {})
@@ -93,6 +129,9 @@ class SubagentResourceManager:
 
     def acquire(self, request: SubagentRequest) -> AcquireDecision:
         candidates = self._resolve_candidates(request)
+        return self.acquire_candidates(candidates)
+
+    def acquire_candidates(self, candidates: list[str] | tuple[str, ...]) -> AcquireDecision:
         if not candidates:
             return AcquireDecision(status="rejected", reason="no_candidate")
 
@@ -100,6 +139,16 @@ class SubagentResourceManager:
         for model_id in candidates:
             raw = self._model_record(model_id)
             if raw is None:
+                if isinstance(model_id, str) and model_id.strip():
+                    return AcquireDecision(
+                        status="granted",
+                        lease=SubagentLease(
+                            model_id=model_id.strip(),
+                            tier="direct",
+                            route="",
+                            effort="",
+                        ),
+                    )
                 continue
             route = str(raw.get("route") or "").strip()
             tier = str(raw.get("tier") or "").strip()
@@ -107,8 +156,8 @@ class SubagentResourceManager:
             policy = self.route_policies.get(route, RoutePolicy())
             state = self.route_states.setdefault(route, RouteState())
 
-            if policy.availability == "hard_unavailable":
-                last_unavailable_reason = policy.unavailable_reason or "hard_unavailable"
+            if policy.availability in {"hard_unavailable", "manual_outage"}:
+                last_unavailable_reason = policy.unavailable_reason or policy.availability
                 continue
 
             if self._reserved_quota_exhausted(policy, state):
@@ -132,7 +181,12 @@ class SubagentResourceManager:
             tier_policy = self.tier_policies.get(tier, TierPolicy())
             if tier_policy.allow_queue and state.waiting < int(tier_policy.queue_limit or 0):
                 state.waiting += 1
-                return AcquireDecision(status="queued", reason="queue_wait")
+                return AcquireDecision(
+                    status="queued",
+                    reason="queue_wait",
+                    queue_route=route,
+                    queue_tier=tier,
+                )
 
             if tier_policy.allow_queue and state.waiting >= int(tier_policy.queue_limit or 0):
                 return AcquireDecision(status="rejected", reason="queue_limit")
@@ -150,7 +204,18 @@ class SubagentResourceManager:
         if state.inflight > 0:
             state.inflight -= 1
 
+    def release_waiting_route(self, route: str | None) -> None:
+        route_clean = self._clean(route)
+        if not route_clean:
+            return
+        state = self.route_states.setdefault(route_clean, RouteState())
+        if state.waiting > 0:
+            state.waiting -= 1
+
     def _resolve_candidates(self, request: SubagentRequest) -> list[str]:
+        if request.candidate_chain:
+            return [str(item).strip() for item in request.candidate_chain if str(item).strip()]
+
         explicit_model = self._clean(request.model)
         if explicit_model:
             resolved = self.resolve_model_ref(explicit_model)
@@ -166,11 +231,14 @@ class SubagentResourceManager:
             if tier_candidates:
                 return tier_candidates
 
-        default_model = self._clean(request.harness_model) or self._clean(request.manager_model)
-        if not default_model:
-            return []
-        resolved = self.resolve_model_ref(default_model)
-        return [resolved] if resolved else [default_model]
+        fallback_candidates: list[str] = []
+        for candidate in (request.harness_model, request.manager_model):
+            default_model = self._clean(candidate)
+            if not default_model:
+                continue
+            resolved = self.resolve_model_ref(default_model)
+            fallback_candidates.append(resolved if resolved else default_model)
+        return fallback_candidates
 
     def _tier_candidates(self, tier: str) -> list[str]:
         policy = self.tier_policies.get(tier, TierPolicy())
@@ -215,6 +283,169 @@ class SubagentResourceManager:
             fallback.append((route_index, rank, model_id))
         fallback.sort()
         return [model_id for _, _, model_id in fallback]
+
+    def list_type_candidates(
+        self,
+        *,
+        family: str,
+        effort: str,
+        preferred_route: str | None = None,
+    ) -> list[str]:
+        models = self.registry.get("models", {}) if isinstance(self.registry, dict) else {}
+        if not isinstance(models, dict):
+            return []
+
+        preferred = self._clean(preferred_route)
+        healthy: list[tuple[int, str]] = []
+        transient: list[tuple[int, str]] = []
+        unhealthy: list[tuple[int, str]] = []
+        for model_id, raw in models.items():
+            if not isinstance(raw, dict):
+                continue
+            if not bool(raw.get("enabled", True)) or bool(raw.get("template", False)):
+                continue
+            if self._clean(raw.get("family")) != self._clean(family):
+                continue
+            if self._clean(raw.get("effort")).lower() != self._clean(effort).lower():
+                continue
+            route = self._clean(raw.get("route"))
+            policy = self.route_policies.get(route, RoutePolicy())
+            route_rank = self._route_preference_rank(route, preferred_route=preferred)
+            if policy.availability in {"hard_unavailable", "manual_outage"}:
+                unhealthy.append((route_rank, model_id))
+            elif policy.availability == "transient_unavailable":
+                transient.append((route_rank, model_id))
+            else:
+                healthy.append((route_rank, model_id))
+
+        healthy.sort()
+        transient.sort()
+        unhealthy.sort()
+        return [model_id for _, model_id in healthy + transient + unhealthy]
+
+    def has_eligible_candidates(self, candidates: list[str] | tuple[str, ...]) -> bool:
+        for model_id in candidates:
+            if not isinstance(model_id, str) or not model_id.strip():
+                continue
+            raw = self._model_record(model_id)
+            if not isinstance(raw, dict):
+                continue
+            route = str(raw.get("route") or "").strip()
+            if not route:
+                continue
+            policy = self.route_policies.get(route, RoutePolicy())
+            availability = str(policy.availability or "available").strip()
+            if availability not in {"hard_unavailable", "manual_outage"}:
+                return True
+        return False
+
+    def resolve_spawn_request(
+        self,
+        request: RuntimeSubagentSpawnRequest,
+        *,
+        fallback_model: str | None = None,
+    ) -> SubagentResolution:
+        requested_name = self._clean(request.name) or None
+        requested_type = self._clean(request.subagent_type) or None
+        requested_model = self._clean(request.model) or None
+        preferred_route = self._clean(request.preferred_route) or None
+        compatibility_tier = self._clean(request.compatibility_tier) or None
+
+        if requested_model:
+            resolved_model = self.resolve_model_ref(requested_model) or requested_model
+            return SubagentResolution(
+                requested_name=requested_name,
+                requested_type=requested_type,
+                requested_model=requested_model,
+                preferred_route=preferred_route,
+                candidate_chain=(resolved_model,),
+                resolved_model_id=resolved_model,
+                reason="explicit_model",
+            )
+
+        if requested_type:
+            spec = get_subagent_type_spec(requested_type)
+            candidates = self.list_type_candidates(
+                family=spec.family,
+                effort=spec.effort,
+                preferred_route=preferred_route,
+            )
+            if not candidates:
+                raise ValueError(
+                    f"no candidates for subagent type {requested_type} ({spec.family}/{spec.effort})"
+                )
+            return SubagentResolution(
+                requested_name=requested_name,
+                requested_type=requested_type,
+                requested_model=requested_model,
+                preferred_route=preferred_route,
+                candidate_chain=tuple(candidates),
+                resolved_model_id=candidates[0],
+                reason=f"builtin_type:{spec.name}",
+            )
+
+        if compatibility_tier:
+            if compatibility_tier == "standard":
+                worker_spec = get_subagent_type_spec("worker")
+                worker_candidates = self.list_type_candidates(
+                    family=worker_spec.family,
+                    effort=worker_spec.effort,
+                    preferred_route=preferred_route,
+                )
+                if worker_candidates and self.has_eligible_candidates(worker_candidates):
+                    return SubagentResolution(
+                        requested_name=requested_name,
+                        requested_type="worker",
+                        requested_model=requested_model,
+                        preferred_route=preferred_route,
+                        candidate_chain=tuple(worker_candidates),
+                        resolved_model_id=worker_candidates[0],
+                        reason="compatibility_tier:standard->worker",
+                    )
+            manager_request = self.default_request(tier=compatibility_tier)
+            candidates = self._resolve_candidates(manager_request)
+            if not candidates:
+                raise ValueError(f"no candidates for compatibility tier: {compatibility_tier}")
+            return SubagentResolution(
+                requested_name=requested_name,
+                requested_type=None,
+                requested_model=requested_model,
+                preferred_route=preferred_route,
+                candidate_chain=tuple(candidates),
+                resolved_model_id=candidates[0],
+                reason=f"compatibility_tier:{compatibility_tier}",
+            )
+
+        if fallback_model:
+            resolved_model = self.resolve_model_ref(fallback_model) or str(fallback_model).strip()
+            if resolved_model:
+                return SubagentResolution(
+                    requested_name=requested_name,
+                    requested_type=requested_type,
+                    requested_model=requested_model,
+                    preferred_route=preferred_route,
+                    candidate_chain=(resolved_model,),
+                    resolved_model_id=resolved_model,
+                    reason="manager_fallback_model",
+                )
+
+        raise ValueError("spawn requires `type` or `model`")
+
+    def _route_preference_rank(self, route: str, *, preferred_route: str | None = None) -> int:
+        route_clean = self._clean(route)
+        preferred = self._clean(preferred_route)
+        if preferred and route_clean == preferred:
+            return -1
+        routes: list[str] = []
+        for policy in self.tier_policies.values():
+            for item in policy.route_preferences:
+                cleaned = self._clean(item)
+                if cleaned and cleaned not in routes:
+                    routes.append(cleaned)
+        try:
+            return routes.index(route_clean)
+        except ValueError:
+            return len(routes) + 100
 
     def _reserved_quota_exhausted(self, policy: RoutePolicy, state: RouteState) -> bool:
         limit = int(policy.window_request_limit or 0)
@@ -525,6 +756,37 @@ def refresh_provider_status(
 
 
 
+def _known_provider_routes(workspace: Path) -> set[str]:
+    registry = _load_json(workspace / "model_registry.json")
+    routes = {"aizhiwen-top", "tokenx", "weclawai", "minimax"}
+
+    models = registry.get("models") if isinstance(registry, dict) else None
+    if isinstance(models, dict):
+        for raw in models.values():
+            if not isinstance(raw, dict):
+                continue
+            route = str(raw.get("route") or "").strip()
+            if route:
+                routes.add(route)
+
+    provider_status = registry.get("provider_status") if isinstance(registry, dict) else None
+    if isinstance(provider_status, dict):
+        for route in provider_status:
+            route_clean = str(route or "").strip()
+            if route_clean:
+                routes.add(route_clean)
+
+    provider_policies = registry.get("provider_policies") if isinstance(registry, dict) else None
+    if isinstance(provider_policies, dict):
+        for route in provider_policies:
+            route_clean = str(route or "").strip()
+            if route_clean:
+                routes.add(route_clean)
+
+    return routes
+
+
+
 def apply_provider_probe_result(
     *,
     workspace: Path,
@@ -535,9 +797,8 @@ def apply_provider_probe_result(
         return None
     api_base = str(probe.get("api_base") or "").strip()
     provider = str(probe.get("provider") or "").strip() or "custom"
-    route = _route_from_api_base(api_base, provider)
-    known_routes = {"aizhiwen-top", "tokenx", "weclawai", "minimax"}
-    if route not in known_routes:
+    route = str(probe.get("route") or "").strip() or _route_from_api_base(api_base, provider)
+    if route not in _known_provider_routes(workspace):
         return None
     if bool(probe.get("ok")):
         refresh_provider_status(workspace=workspace, route=route, updated_at=updated_at)
@@ -553,7 +814,430 @@ def apply_provider_probe_result(
 
 
 
-def run_workspace_quick_provider_probe(workspace: Path, *, ref: str) -> dict[str, Any] | None:
+def _resolve_registry_model_ref(registry: dict[str, Any], ref: str) -> str | None:
+    candidate = str(ref or "").strip()
+    if not candidate:
+        return None
+    models = registry.get("models", {}) if isinstance(registry, dict) else {}
+    if not isinstance(models, dict):
+        return None
+    if candidate in models:
+        return candidate
+    folded = candidate.casefold()
+    for model_id, raw in models.items():
+        if model_id.casefold() == folded:
+            return model_id
+        aliases = raw.get("aliases") if isinstance(raw, dict) else None
+        if isinstance(aliases, list):
+            for alias in aliases:
+                if isinstance(alias, str) and alias.casefold() == folded:
+                    return model_id
+    return None
+
+
+
+def _connection_api_key(connection: dict[str, Any]) -> str:
+    if not isinstance(connection, dict):
+        return ""
+    api_key = str(connection.get("api_key") or "").strip()
+    if api_key:
+        return api_key
+    env_name = str(connection.get("api_key_env") or "").strip()
+    if not env_name:
+        return ""
+    return str(os.environ.get(env_name) or "").strip()
+
+
+
+def _probe_reasoning_effort(raw: dict[str, Any]) -> str | None:
+    effort = str(raw.get("effort") or "").strip().lower()
+    family = str(raw.get("family") or "").strip().lower()
+    if effort not in {"low", "medium", "high", "xhigh"}:
+        return None
+    if family == "gpt-5.4" and effort == "xhigh":
+        return "high"
+    return effort
+
+
+
+def _response_error_reason(response: Any) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or error.get("code") or "").strip()
+            if message:
+                return message
+        message = str(payload.get("message") or "").strip()
+        if message:
+            return message
+    text = str(getattr(response, "text", "") or "").strip()
+    if text:
+        return text[:500]
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    return f"HTTP {status_code}" if status_code else "probe_failed"
+
+
+
+def _runtime_probe_backend(raw: dict[str, Any]) -> str:
+    from nanobot.providers.registry import find_by_name
+
+    explicit = str(raw.get("probe_backend") or raw.get("adapter") or raw.get("backend") or "").strip()
+    if explicit:
+        return explicit
+    provider_name = str(raw.get("provider") or "custom").strip() or "custom"
+    spec = find_by_name(provider_name)
+    return spec.backend if spec is not None else "openai_compat"
+
+
+
+def _build_openai_compat_probe_request(
+    *,
+    provider_name: str,
+    provider_model: str,
+    api_base: str,
+    api_key: str,
+    extra_headers: dict[str, Any],
+    raw: dict[str, Any],
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    headers: dict[str, str] = {"content-type": "application/json"}
+    if api_key:
+        headers["authorization"] = f"Bearer {api_key}"
+    for key, value in extra_headers.items():
+        key_clean = str(key or "").strip()
+        value_clean = str(value or "").strip()
+        if key_clean:
+            headers[key_clean] = value_clean
+
+    payload: dict[str, Any] = {
+        "model": provider_model,
+        "messages": [{"role": "user", "content": "reply with OK only"}],
+        "max_tokens": 8,
+        "temperature": 0,
+    }
+    reasoning_effort = _probe_reasoning_effort(raw)
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    return api_base.rstrip("/") + "/chat/completions", headers, payload
+
+
+
+def _build_azure_openai_probe_request(
+    *,
+    provider_model: str,
+    api_base: str,
+    api_key: str,
+    raw: dict[str, Any],
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    base_url = api_base if api_base.endswith("/") else api_base + "/"
+    url = urljoin(base_url, f"openai/deployments/{provider_model}/chat/completions")
+    url = f"{url}?api-version={_AZURE_OPENAI_API_VERSION}"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["api-key"] = api_key
+    payload: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "reply with OK only"}],
+        "max_completion_tokens": 8,
+    }
+    reasoning_effort = _probe_reasoning_effort(raw)
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    return url, headers, payload
+
+
+
+def _build_anthropic_probe_request(
+    *,
+    provider_model: str,
+    api_base: str,
+    api_key: str,
+    extra_headers: dict[str, Any],
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    model_name = provider_model.split("/", 1)[1] if provider_model.startswith("anthropic/") else provider_model
+    base = api_base.rstrip("/")
+    if base.endswith("/v1"):
+        url = base + "/messages"
+    elif base.endswith("/v1/messages"):
+        url = base
+    else:
+        url = base + "/v1/messages"
+
+    headers = {
+        "content-type": "application/json",
+        "anthropic-version": _ANTHROPIC_VERSION,
+    }
+    if api_key:
+        headers["x-api-key"] = api_key
+    for key, value in extra_headers.items():
+        key_clean = str(key or "").strip()
+        value_clean = str(value or "").strip()
+        if key_clean:
+            headers[key_clean] = value_clean
+
+    payload: dict[str, Any] = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "reply with OK only"}],
+        "max_tokens": 8,
+    }
+    return url, headers, payload
+
+
+
+def _build_github_copilot_probe_request(
+    *,
+    provider_model: str,
+    api_base: str,
+    extra_headers: dict[str, Any],
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    from nanobot.providers.github_copilot_provider import (
+        EDITOR_PLUGIN_VERSION,
+        EDITOR_VERSION,
+        USER_AGENT,
+    )
+
+    access_token = _fetch_github_copilot_access_token()
+    headers: dict[str, str] = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {access_token}",
+        "Editor-Version": EDITOR_VERSION,
+        "Editor-Plugin-Version": EDITOR_PLUGIN_VERSION,
+        "User-Agent": USER_AGENT,
+    }
+    for key, value in extra_headers.items():
+        key_clean = str(key or "").strip()
+        value_clean = str(value or "").strip()
+        if key_clean:
+            headers[key_clean] = value_clean
+
+    payload: dict[str, Any] = {
+        "model": provider_model,
+        "messages": [{"role": "user", "content": "reply with OK only"}],
+        "max_tokens": 8,
+        "temperature": 0,
+    }
+    return api_base.rstrip("/") + "/chat/completions", headers, payload
+
+
+
+def _fetch_github_copilot_access_token() -> str:
+    from nanobot.providers.github_copilot_provider import (
+        DEFAULT_COPILOT_TOKEN_URL,
+        _copilot_headers,
+        _load_github_token,
+    )
+
+    github_token = _load_github_token()
+    if github_token is None or not str(github_token.access or "").strip():
+        raise RuntimeError(
+            "GitHub Copilot is not logged in. Run: nanobot provider login github-copilot"
+        )
+
+    response = httpx.get(
+        DEFAULT_COPILOT_TOKEN_URL,
+        headers=_copilot_headers(str(github_token.access)),
+        timeout=20.0,
+        follow_redirects=True,
+    )
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if not 200 <= status_code < 300:
+        raise RuntimeError(_response_error_reason(response))
+    payload = response.json()
+    token = str(payload.get("token") or "").strip() if isinstance(payload, dict) else ""
+    if not token:
+        raise RuntimeError("GitHub Copilot token exchange returned no token.")
+    return token
+
+
+
+def _build_runtime_probe_request(
+    *,
+    resolved: str,
+    raw: dict[str, Any],
+) -> tuple[str, dict[str, str], dict[str, Any], str, str, str] | None:
+    backend = _runtime_probe_backend(raw)
+    connection = raw.get("connection") if isinstance(raw.get("connection"), dict) else {}
+    api_base = str(connection.get("api_base") or "").strip()
+    api_key = _connection_api_key(connection)
+    provider_name = str(raw.get("provider") or "custom").strip() or "custom"
+    provider_model = str(raw.get("provider_model") or resolved).strip() or resolved
+    extra_headers = connection.get("extra_headers") if isinstance(connection.get("extra_headers"), dict) else {}
+    route = str(raw.get("route") or "").strip() or _route_from_api_base(api_base, provider_name)
+
+    if backend == "openai_compat":
+        if not api_base:
+            return None
+        url, headers, payload = _build_openai_compat_probe_request(
+            provider_name=provider_name,
+            provider_model=provider_model,
+            api_base=api_base,
+            api_key=api_key,
+            extra_headers=extra_headers,
+            raw=raw,
+        )
+        return url, headers, payload, provider_name, api_base, route
+
+    if backend == "azure_openai":
+        if not api_base:
+            return None
+        url, headers, payload = _build_azure_openai_probe_request(
+            provider_model=provider_model,
+            api_base=api_base,
+            api_key=api_key,
+            raw=raw,
+        )
+        return url, headers, payload, provider_name, api_base, route
+
+    if backend == "anthropic":
+        api_base = api_base or _ANTHROPIC_DEFAULT_API_BASE
+        url, headers, payload = _build_anthropic_probe_request(
+            provider_model=provider_model,
+            api_base=api_base,
+            api_key=api_key,
+            extra_headers=extra_headers,
+        )
+        return url, headers, payload, provider_name, api_base, route
+
+    if backend == "github_copilot":
+        api_base = api_base or _GITHUB_COPILOT_DEFAULT_API_BASE
+        url, headers, payload = _build_github_copilot_probe_request(
+            provider_model=provider_model,
+            api_base=api_base,
+            extra_headers=extra_headers,
+        )
+        return url, headers, payload, provider_name, api_base, route
+
+    return None
+
+
+
+def _resolve_runtime_probe_target(
+    workspace: Path,
+    *,
+    ref: str,
+) -> tuple[str, dict[str, Any]] | None:
+    registry = _load_json(workspace / "model_registry.json")
+    resolved = _resolve_registry_model_ref(registry, ref)
+    if resolved:
+        models = registry.get("models") if isinstance(registry, dict) else None
+        raw = models.get(resolved, {}) if isinstance(models, dict) else {}
+        if isinstance(raw, dict) and raw:
+            return resolved, raw
+    return None
+
+
+
+def run_runtime_quick_provider_probe(
+    workspace: Path,
+    *,
+    ref: str,
+    request_runner: Any | None = None,
+) -> dict[str, Any] | None:
+    target = _resolve_runtime_probe_target(workspace, ref=ref)
+    if target is None:
+        return None
+    resolved, raw = target
+
+    request = _build_runtime_probe_request(resolved=resolved, raw=raw)
+    if request is None:
+        return None
+    url, headers, payload, provider_name, api_base, route = request
+
+    runner = request_runner or (
+        lambda *, url, headers, payload, timeout: httpx.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+    )
+    try:
+        response = runner(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout=60.0,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "provider": provider_name,
+            "api_base": api_base,
+            "route": route,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if 200 <= status_code < 300:
+        return {
+            "ok": True,
+            "provider": provider_name,
+            "api_base": api_base,
+            "route": route,
+            "reason": "OK",
+        }
+
+    return {
+        "ok": False,
+        "provider": provider_name,
+        "api_base": api_base,
+        "route": route,
+        "reason": _response_error_reason(response),
+    }
+
+
+
+def _runtime_probe_strategy(
+    workspace: Path,
+    *,
+    ref: str,
+) -> tuple[str, str]:
+    target = _resolve_runtime_probe_target(workspace, ref=ref)
+    if target is None:
+        return "workspace_fallback", "no_runtime_target"
+    _resolved, raw = target
+    backend = _runtime_probe_backend(raw)
+    if backend in {"openai_compat", "azure_openai", "anthropic", "github_copilot"}:
+        return "runtime", f"runtime_backend:{backend}"
+    if backend in _WORKSPACE_FALLBACK_BACKENDS:
+        return "workspace_fallback", f"legacy_workspace_fallback:{backend}"
+    return "unsupported", f"unsupported_runtime_backend:{backend}"
+
+
+
+def run_default_provider_probe(workspace: Path, *, ref: str) -> dict[str, Any] | None:
+    strategy, reason = _runtime_probe_strategy(workspace, ref=ref)
+    if strategy == "runtime":
+        probe = run_runtime_quick_provider_probe(workspace, ref=ref)
+    elif strategy == "workspace_fallback":
+        probe = run_legacy_workspace_provider_probe(workspace, ref=ref)
+    else:
+        return {
+            "ok": False,
+            "provider": "",
+            "api_base": "",
+            "route": "",
+            "reason": reason,
+            "strategy": strategy,
+        }
+    if isinstance(probe, dict):
+        probe = dict(probe)
+        probe.setdefault("strategy", strategy)
+        probe.setdefault("reason", reason if not probe.get("reason") else probe.get("reason"))
+    return probe
+
+
+
+def run_legacy_workspace_provider_probe(workspace: Path, *, ref: str) -> dict[str, Any] | None:
+    """Legacy compatibility probe via workspace scripts/model_runtime.py.
+
+    This is intentionally not the primary runtime path.
+    Prefer registry-backed runtime-native probing whenever the runtime can resolve
+    a real model record. This fallback only exists to preserve old workspace-local
+    compatibility paths such as `openai_codex` and truly unresolved legacy refs.
+    """
     script_path = workspace / "scripts" / "model_runtime.py"
     if not script_path.exists():
         return None
@@ -597,6 +1281,16 @@ def run_workspace_quick_provider_probe(workspace: Path, *, ref: str) -> dict[str
         for key in list(sys.modules.keys()):
             if key in tracked_keys and key not in original_module_keys:
                 sys.modules.pop(key, None)
+
+
+
+def run_workspace_quick_provider_probe(workspace: Path, *, ref: str) -> dict[str, Any] | None:
+    """Compatibility alias for legacy callers.
+
+    New code should call `run_legacy_workspace_provider_probe()` directly so the
+    compatibility-only status stays obvious.
+    """
+    return run_legacy_workspace_provider_probe(workspace, ref=ref)
 
 
 
@@ -658,7 +1352,7 @@ def probe_provider_route_status(
     ref = _probe_ref_for_route(registry, route_clean)
     if not ref:
         return {"status": "skipped", "reason": "no_probe_ref", "route": route_clean}
-    runner = probe_runner or run_workspace_quick_provider_probe
+    runner = probe_runner or run_default_provider_probe
     probe = runner(workspace, ref=ref)
     applied_route = apply_provider_probe_result(
         workspace=workspace,
@@ -834,30 +1528,8 @@ def build_manager_from_workspace_snapshot(
     if not manager_model:
         manager_model = str(fallback_model or "").strip()
     manager_tier = _infer_manager_tier_from_ref(manager_model)
-
-    models = registry.get("models") if isinstance(registry, dict) else None
-    if isinstance(models, dict) and manager_model and manager_model not in models:
-        route = _route_from_api_base(
-            str((_config.get("providers") or {}).get("custom", {}).get("apiBase") or ""),
-            "custom",
-        )
-        models[manager_model] = {
-            "tier": manager_tier,
-            "family": manager_model,
-            "effort": "high",
-            "route": route,
-            "provider": "custom",
-            "provider_model": manager_model,
-            "connection": {
-                "api_base": str((_config.get("providers") or {}).get("custom", {}).get("apiBase") or "").strip(),
-                "api_key": str((_config.get("providers") or {}).get("custom", {}).get("apiKey") or "").strip(),
-                "extra_headers": (_config.get("providers") or {}).get("custom", {}).get("extraHeaders") or {},
-            },
-            "agent": {},
-            "enabled": True,
-            "template": False,
-            "aliases": [],
-        }
+    task_budget = int((subagent_defaults or {}).get("task_budget") or 0)
+    level_limit = int((subagent_defaults or {}).get("level_limit") or 0)
 
     return SubagentResourceManager(
         registry=registry,
@@ -867,5 +1539,7 @@ def build_manager_from_workspace_snapshot(
         defaults={
             "manager_model": manager_model,
             "manager_tier": manager_tier,
+            "task_budget": task_budget,
+            "level_limit": level_limit,
         },
     )

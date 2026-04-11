@@ -2,6 +2,7 @@
 
 from typing import TYPE_CHECKING, Any
 
+from nanobot.agent.subagent_types import list_builtin_subagent_types
 from nanobot.agent.tools.base import Tool
 
 if TYPE_CHECKING:
@@ -18,6 +19,9 @@ class SpawnTool(Tool):
         "workspace_work_mode",
         "_origin_sender_id",
         "_completion_notice_mention_user_id",
+    }
+    _NESTED_RUNTIME_META_KEYS = {
+        "subagent_runtime",
     }
 
     def __init__(self, manager: "SubagentManager"):
@@ -41,6 +45,9 @@ class SpawnTool(Tool):
                     filtered[key] = metadata[key]
             if isinstance(metadata.get("workspace_runtime"), dict):
                 filtered["workspace_runtime"] = metadata["workspace_runtime"]
+            for key in self._NESTED_RUNTIME_META_KEYS:
+                if isinstance(metadata.get(key), dict):
+                    filtered[key] = metadata[key]
         self._metadata = filtered
 
     @property
@@ -50,9 +57,11 @@ class SpawnTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Spawn a subagent to handle a task in the background. "
-            "Use this for complex or time-consuming tasks that can run independently. "
-            "The subagent will complete the task and report back when done. "
+            "Spawn a background subagent for a bounded task. "
+            "Preferred call shapes: (task + type) or (task + model). "
+            "Use type=worker for implementation/execution and type=explorer for reconnaissance/search. "
+            "Do not omit both type and model. "
+            "label/tier are deprecated compatibility inputs only. "
             "For deliverables or existing projects, inspect the workspace first "
             "and use a dedicated subdirectory when helpful."
         )
@@ -66,18 +75,27 @@ class SpawnTool(Tool):
                     "type": "string",
                     "description": "The task for the subagent to complete",
                 },
+                "name": {
+                    "type": "string",
+                    "description": "Optional short identifier for the subagent. Prefer `name` over deprecated `label`.",
+                },
+                "type": {
+                    "type": "string",
+                    "enum": list(list_builtin_subagent_types()),
+                    "description": "Built-in runtime subagent type. Prefer this for default behavior: worker=execution/implementation, explorer=exploration/recon.",
+                },
                 "label": {
                     "type": "string",
-                    "description": "Optional short label for the task (for display)",
+                    "description": "Deprecated compatibility alias of `name`. Avoid in new calls.",
                 },
                 "tier": {
                     "type": "string",
                     "enum": ["lite", "standard"],
-                    "description": "Optional subagent tier. lite=read/summarize style tasks; standard=full independent subtask.",
+                    "description": "Deprecated compatibility hint only. Use `type` or `model` for new calls.",
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional explicit model ref. Overrides tier/default routing when provided.",
+                    "description": "Optional explicit registry model ref. Overrides built-in type/default routing when provided.",
                 },
             },
             "required": ["task"],
@@ -86,6 +104,8 @@ class SpawnTool(Tool):
     async def execute(
         self,
         task: str,
+        name: str | None = None,
+        type: str | None = None,
         label: str | None = None,
         tier: str | None = None,
         model: str | None = None,
@@ -106,6 +126,8 @@ class SpawnTool(Tool):
                 )
         return await self._manager.spawn(
             task=task,
+            name=name,
+            subagent_type=type,
             label=label,
             tier=tier,
             model=model,

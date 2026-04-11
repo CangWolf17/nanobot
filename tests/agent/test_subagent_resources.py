@@ -82,6 +82,74 @@ def _registry() -> dict:
                 "enabled": True,
                 "template": False,
             },
+            "standard-gpt-5.4-mini-medium-aizhiwen-top": {
+                "tier": "standard",
+                "family": "gpt-5.4-mini",
+                "effort": "medium",
+                "route": "aizhiwen-top",
+                "provider": "custom",
+                "provider_model": "gpt-5.4-mini",
+                "connection": {
+                    "api_base": "https://aizhiwen.top/v1",
+                    "api_key": "k-aizhiwen",
+                    "extra_headers": {},
+                },
+                "agent": {"temperature": 0.3, "max_tokens": 8192},
+                "enabled": True,
+                "template": False,
+                "aliases": ["gpt-5.4-mini-medium-aizhiwen-top"],
+            },
+            "standard-gpt-5.4-mini-xhigh-aizhiwen-top": {
+                "tier": "standard",
+                "family": "gpt-5.4-mini",
+                "effort": "xhigh",
+                "route": "aizhiwen-top",
+                "provider": "custom",
+                "provider_model": "gpt-5.4-mini",
+                "connection": {
+                    "api_base": "https://aizhiwen.top/v1",
+                    "api_key": "k-aizhiwen",
+                    "extra_headers": {},
+                },
+                "agent": {"temperature": 0.3, "max_tokens": 8192},
+                "enabled": True,
+                "template": False,
+                "aliases": ["gpt-5.4-mini-xhigh-aizhiwen-top"],
+            },
+            "standard-gpt-5.4-mini-medium-tokenx": {
+                "tier": "standard",
+                "family": "gpt-5.4-mini",
+                "effort": "medium",
+                "route": "tokenx",
+                "provider": "custom",
+                "provider_model": "gpt-5.4-mini",
+                "connection": {
+                    "api_base": "https://tokenx24.com/v1",
+                    "api_key": "k-tokenx",
+                    "extra_headers": {},
+                },
+                "agent": {"temperature": 0.3, "max_tokens": 8192},
+                "enabled": True,
+                "template": False,
+                "aliases": ["gpt-5.4-mini-medium-tokenx"],
+            },
+            "standard-gpt-5.4-mini-xhigh-tokenx": {
+                "tier": "standard",
+                "family": "gpt-5.4-mini",
+                "effort": "xhigh",
+                "route": "tokenx",
+                "provider": "custom",
+                "provider_model": "gpt-5.4-mini",
+                "connection": {
+                    "api_base": "https://tokenx24.com/v1",
+                    "api_key": "k-tokenx",
+                    "extra_headers": {},
+                },
+                "agent": {"temperature": 0.3, "max_tokens": 8192},
+                "enabled": True,
+                "template": False,
+                "aliases": ["gpt-5.4-mini-xhigh-tokenx", "gpt-5.4-mini"],
+            },
             "lite-minimax-m2.7-high-minimax": {
                 "tier": "lite",
                 "family": "minimax-m2.7",
@@ -149,7 +217,67 @@ def _manager():
 
 
 
-def test_explicit_model_overrides_harness_and_manager_defaults():
+
+def test_list_type_candidates_prefers_main_route_then_healthy_fallbacks():
+    from nanobot.agent.subagent_resources import RoutePolicy
+
+    manager = _manager()
+    manager.route_policies["tokenx"] = RoutePolicy(max_concurrency=3)
+
+    candidates = manager.list_type_candidates(
+        family="gpt-5.4-mini",
+        effort="xhigh",
+        preferred_route="tokenx",
+    )
+
+    assert candidates[0] == "standard-gpt-5.4-mini-xhigh-tokenx"
+    assert candidates[1] == "standard-gpt-5.4-mini-xhigh-aizhiwen-top"
+
+
+
+def test_list_type_candidates_pushes_transient_route_behind_healthy_route():
+    from nanobot.agent.subagent_resources import RoutePolicy
+
+    manager = _manager()
+    manager.route_policies["tokenx"] = RoutePolicy(
+        max_concurrency=3,
+        availability="transient_unavailable",
+        unavailable_reason="http_502",
+    )
+
+    candidates = manager.list_type_candidates(
+        family="gpt-5.4-mini",
+        effort="xhigh",
+        preferred_route="tokenx",
+    )
+
+    assert candidates[0] == "standard-gpt-5.4-mini-xhigh-aizhiwen-top"
+    assert candidates[1] == "standard-gpt-5.4-mini-xhigh-tokenx"
+
+
+
+def test_acquire_candidates_skips_manual_outage_routes():
+    from nanobot.agent.subagent_resources import RoutePolicy
+
+    manager = _manager()
+    manager.route_policies["tokenx"] = RoutePolicy(
+        max_concurrency=3,
+        availability="manual_outage",
+        unavailable_reason="manual_outage",
+    )
+
+    decision = manager.acquire_candidates(
+        [
+            "standard-gpt-5.4-mini-xhigh-tokenx",
+            "standard-gpt-5.4-mini-xhigh-aizhiwen-top",
+        ]
+    )
+
+    assert decision.status == "granted"
+    assert decision.lease is not None
+    assert decision.lease.model_id == "standard-gpt-5.4-mini-xhigh-aizhiwen-top"
+
+
     from nanobot.agent.subagent_resources import SubagentRequest
 
     manager = _manager()
@@ -252,6 +380,19 @@ def test_classify_provider_failure_distinguishes_transient_from_hard_unavailable
     assert transient.reason == "http_502"
     assert hard.availability == "hard_unavailable"
     assert hard.reason == "quota_exhausted"
+
+
+
+def test_acquire_candidates_grants_direct_fallback_for_unregistered_model():
+    manager = _manager()
+
+    decision = manager.acquire_candidates(["test-model"])
+
+    assert decision.status == "granted"
+    assert decision.lease is not None
+    assert decision.lease.model_id == "test-model"
+    assert decision.lease.route == ""
+    assert decision.lease.tier == "direct"
 
 
 
@@ -703,8 +844,379 @@ def test_apply_provider_probe_result_records_failure_from_api_base(tmp_path):
 
 
 
-def test_run_workspace_quick_provider_probe_loads_workspace_model_runtime(tmp_path):
-    from nanobot.agent.subagent_resources import run_workspace_quick_provider_probe
+def test_apply_provider_probe_result_prefers_explicit_route_from_probe(tmp_path):
+    from nanobot.agent.subagent_resources import apply_provider_probe_result
+
+    registry = _registry()
+    registry["models"]["azure-gpt5-prod"] = {
+        "tier": "standard",
+        "family": "gpt-5",
+        "effort": "high",
+        "route": "azure-prod",
+        "provider": "azure_openai",
+        "provider_model": "gpt-5-prod",
+        "connection": {
+            "api_base": "https://example.openai.azure.com",
+            "api_key": "k-azure",
+            "extra_headers": {},
+        },
+        "agent": {"temperature": 0.1, "max_tokens": 8192},
+        "enabled": True,
+        "template": False,
+    }
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    route = apply_provider_probe_result(
+        workspace=tmp_path,
+        probe={
+            "ok": True,
+            "provider": "azure_openai",
+            "api_base": "https://example.openai.azure.com",
+            "route": "azure-prod",
+            "reason": "OK",
+        },
+        updated_at="2026-04-06T10:00:00+00:00",
+    )
+
+    assert route == "azure-prod"
+    updated = json.loads((tmp_path / "model_registry.json").read_text(encoding="utf-8"))
+    assert updated["provider_status"]["azure-prod"]["availability"] == "available"
+
+
+
+def test_run_runtime_quick_provider_probe_uses_registry_model_record_without_workspace_scripts(tmp_path):
+    from nanobot.agent.subagent_resources import run_runtime_quick_provider_probe
+
+    registry = _registry()
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"choices":[{"message":{"content":"OK"}}]}'
+
+        def json(self):
+            return {"choices": [{"message": {"content": "OK"}}]}
+
+    def _request(**kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    probe = run_runtime_quick_provider_probe(
+        tmp_path,
+        ref="standard-gpt-5.4-high-aizhiwen-top",
+        request_runner=_request,
+    )
+
+    assert probe is not None
+    assert probe["ok"] is True
+    assert probe["api_base"] == "https://aizhiwen.top/v1"
+    assert captured["url"] == "https://aizhiwen.top/v1/chat/completions"
+    assert captured["payload"]["model"] == "gpt-5.4"
+    assert captured["payload"]["reasoning_effort"] == "high"
+
+
+
+def test_run_runtime_quick_provider_probe_uses_registry_azure_model_record(tmp_path):
+    from nanobot.agent.subagent_resources import run_runtime_quick_provider_probe
+
+    registry = {
+        "version": 1,
+        "models": {
+            "azure-gpt5-prod": {
+                "tier": "standard",
+                "family": "gpt-5",
+                "effort": "high",
+                "route": "azure-prod",
+                "provider": "azure_openai",
+                "provider_model": "gpt-5-prod",
+                "connection": {
+                    "api_base": "https://example.openai.azure.com",
+                    "api_key": "k-azure",
+                    "extra_headers": {},
+                },
+                "agent": {},
+                "enabled": True,
+                "template": False,
+            }
+        },
+    }
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"choices":[{"message":{"content":"OK"}}]}'
+
+        def json(self):
+            return {"choices": [{"message": {"content": "OK"}}]}
+
+    def _request(**kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    probe = run_runtime_quick_provider_probe(
+        tmp_path,
+        ref="azure-gpt5-prod",
+        request_runner=_request,
+    )
+
+    assert probe is not None
+    assert probe["ok"] is True
+    assert probe["route"] == "azure-prod"
+    assert captured["url"] == (
+        "https://example.openai.azure.com/openai/deployments/gpt-5-prod/chat/completions?api-version=2024-10-21"
+    )
+    assert captured["headers"]["api-key"] == "k-azure"
+    assert captured["payload"]["max_completion_tokens"] == 8
+    assert captured["payload"]["reasoning_effort"] == "high"
+
+
+
+def test_run_runtime_quick_provider_probe_uses_registry_anthropic_model_record(tmp_path):
+    from nanobot.agent.subagent_resources import run_runtime_quick_provider_probe
+
+    registry = {
+        "version": 1,
+        "models": {
+            "anthropic-claude-sonnet": {
+                "tier": "standard",
+                "family": "claude-sonnet",
+                "effort": "high",
+                "route": "anthropic-main",
+                "provider": "anthropic",
+                "provider_model": "anthropic/claude-sonnet-4-5",
+                "connection": {
+                    "api_base": "https://api.anthropic.com",
+                    "api_key": "k-anthropic",
+                    "extra_headers": {"x-test": "1"},
+                },
+                "agent": {},
+                "enabled": True,
+                "template": False,
+            }
+        },
+    }
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"content":[{"type":"text","text":"OK"}]}'
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "OK"}]}
+
+    def _request(**kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    probe = run_runtime_quick_provider_probe(
+        tmp_path,
+        ref="anthropic-claude-sonnet",
+        request_runner=_request,
+    )
+
+    assert probe is not None
+    assert probe["ok"] is True
+    assert probe["route"] == "anthropic-main"
+    assert captured["url"] == "https://api.anthropic.com/v1/messages"
+    assert captured["headers"]["x-api-key"] == "k-anthropic"
+    assert captured["headers"]["anthropic-version"] == "2023-06-01"
+    assert captured["headers"]["x-test"] == "1"
+    assert captured["payload"]["model"] == "claude-sonnet-4-5"
+    assert captured["payload"]["max_tokens"] == 8
+
+
+
+def test_run_default_provider_probe_returns_workspace_fallback_when_no_runtime_target_exists(tmp_path, monkeypatch):
+    from nanobot.agent import subagent_resources as sr
+
+    registry = _registry()
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        sr,
+        "run_runtime_quick_provider_probe",
+        lambda *args, **kwargs: {
+            "ok": False,
+            "provider": "custom",
+            "api_base": "https://aizhiwen.top/v1",
+            "route": "aizhiwen-top",
+            "reason": "quota exceeded",
+        },
+    )
+    monkeypatch.setattr(
+        sr,
+        "run_legacy_workspace_provider_probe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("workspace fallback should not run")),
+    )
+
+    probe = sr.run_default_provider_probe(tmp_path, ref="standard-gpt-5.4-high-aizhiwen-top")
+
+    assert probe is not None
+    assert probe["ok"] is False
+    assert probe["reason"] == "quota exceeded"
+
+
+
+def test_run_default_provider_probe_does_not_fallback_when_runtime_probe_returns_failure_result(tmp_path, monkeypatch):
+    from nanobot.agent import subagent_resources as sr
+
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "model_runtime.py").write_text(
+        "def quick_health_check(**kwargs):\n"
+        "    return {\n"
+        "        'ok': True,\n"
+        "        'provider': 'custom',\n"
+        "        'api_base': 'https://tokenx24.com/v1',\n"
+        "        'reason': 'fallback-ok',\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sr, "run_runtime_quick_provider_probe", lambda *args, **kwargs: None)
+
+    probe = sr.run_default_provider_probe(tmp_path, ref="gpt-5.4")
+
+    assert probe is not None
+    assert probe["ok"] is True
+    assert probe["strategy"] == "workspace_fallback"
+    assert probe["reason"] == "fallback-ok"
+
+
+
+def test_run_default_provider_probe_falls_back_when_runtime_backend_is_unsupported(tmp_path, monkeypatch):
+    from nanobot.agent import subagent_resources as sr
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "agents": {"defaults": {"model": "openai-codex/gpt-5.1-codex"}},
+                "providers": {},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "model_runtime.py").write_text(
+        "def quick_health_check(**kwargs):\n"
+        "    return {\n"
+        "        'ok': True,\n"
+        "        'provider': 'openai_codex',\n"
+        "        'api_base': 'https://chatgpt.com/backend-api',\n"
+        "        'reason': 'fallback-ok',\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        sr,
+        "run_runtime_quick_provider_probe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("runtime probe should not run for unsupported backend")),
+    )
+
+    probe = sr.run_default_provider_probe(tmp_path, ref="openai-codex/gpt-5.1-codex")
+
+    assert probe is not None
+    assert probe["ok"] is True
+    assert probe["provider"] == "openai_codex"
+    assert probe["reason"] == "fallback-ok"
+    assert probe["strategy"] == "workspace_fallback"
+
+
+
+def test_run_default_provider_probe_falls_back_to_workspace_model_runtime(tmp_path, monkeypatch):
+    from nanobot.agent import subagent_resources as sr
+
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "model_runtime.py").write_text(
+        "def quick_health_check(**kwargs):\n"
+        "    return {\n"
+        "        'ok': True,\n"
+        "        'provider': 'custom',\n"
+        "        'api_base': 'https://tokenx24.com/v1',\n"
+        "        'reason': 'fallback-ok',\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sr, "run_runtime_quick_provider_probe", lambda *args, **kwargs: None)
+
+    probe = sr.run_default_provider_probe(tmp_path, ref="gpt-5.4")
+
+    assert probe is not None
+    assert probe["ok"] is True
+    assert probe["reason"] == "fallback-ok"
+
+
+
+def test_probe_provider_route_status_prefers_runtime_native_probe_by_default(tmp_path, monkeypatch):
+    from nanobot.agent import subagent_resources as sr
+
+    registry = _registry()
+    registry["provider_status_policy"] = {"probe_interval_seconds": 0}
+    (tmp_path / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    called: list[str] = []
+
+    def _runtime_probe(workspace, *, ref):
+        called.append(ref)
+        return {
+            "ok": True,
+            "provider": "custom",
+            "api_base": "https://aizhiwen.top/v1",
+            "reason": "OK",
+        }
+
+    monkeypatch.setattr(sr, "run_runtime_quick_provider_probe", _runtime_probe)
+    monkeypatch.setattr(
+        sr,
+        "run_legacy_workspace_provider_probe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("workspace fallback should not run")),
+    )
+
+    result = sr.probe_provider_route_status(
+        workspace=tmp_path,
+        route="aizhiwen-top",
+        now="2026-04-06T10:00:00+00:00",
+    )
+
+    assert result["status"] == "updated"
+    assert called == ["standard-gpt-5.4-high-aizhiwen-top"]
+
+
+
+def test_run_legacy_workspace_provider_probe_loads_workspace_model_runtime(tmp_path):
+    from nanobot.agent.subagent_resources import run_legacy_workspace_provider_probe
 
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -720,7 +1232,7 @@ def test_run_workspace_quick_provider_probe_loads_workspace_model_runtime(tmp_pa
         encoding="utf-8",
     )
 
-    probe = run_workspace_quick_provider_probe(tmp_path, ref="gpt-5.4")
+    probe = run_legacy_workspace_provider_probe(tmp_path, ref="gpt-5.4")
 
     assert probe is not None
     assert probe["ok"] is True
@@ -730,8 +1242,8 @@ def test_run_workspace_quick_provider_probe_loads_workspace_model_runtime(tmp_pa
 
 
 
-def test_run_workspace_quick_provider_probe_supports_model_runtime_sibling_imports(tmp_path):
-    from nanobot.agent.subagent_resources import run_workspace_quick_provider_probe
+def test_run_legacy_workspace_provider_probe_supports_model_runtime_sibling_imports(tmp_path):
+    from nanobot.agent.subagent_resources import run_legacy_workspace_provider_probe
 
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -755,7 +1267,7 @@ def test_run_workspace_quick_provider_probe_supports_model_runtime_sibling_impor
         encoding="utf-8",
     )
 
-    probe = run_workspace_quick_provider_probe(tmp_path, ref="gpt-5.4")
+    probe = run_legacy_workspace_provider_probe(tmp_path, ref="gpt-5.4")
 
     assert probe is not None
     assert probe["ok"] is True
@@ -765,8 +1277,8 @@ def test_run_workspace_quick_provider_probe_supports_model_runtime_sibling_impor
 
 
 
-def test_run_workspace_quick_provider_probe_does_not_reuse_sibling_module_from_previous_workspace(tmp_path):
-    from nanobot.agent.subagent_resources import run_workspace_quick_provider_probe
+def test_run_legacy_workspace_provider_probe_does_not_reuse_sibling_module_from_previous_workspace(tmp_path):
+    from nanobot.agent.subagent_resources import run_legacy_workspace_provider_probe
 
     ws1 = tmp_path / "ws1"
     ws2 = tmp_path / "ws2"
@@ -793,8 +1305,8 @@ def test_run_workspace_quick_provider_probe_does_not_reuse_sibling_module_from_p
             encoding="utf-8",
         )
 
-    first = run_workspace_quick_provider_probe(ws1, ref="gpt-5.4")
-    second = run_workspace_quick_provider_probe(ws2, ref="gpt-5.4")
+    first = run_legacy_workspace_provider_probe(ws1, ref="gpt-5.4")
+    second = run_legacy_workspace_provider_probe(ws2, ref="gpt-5.4")
 
     assert first is not None
     assert second is not None

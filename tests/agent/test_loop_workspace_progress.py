@@ -576,7 +576,7 @@ def test_workspace_harness_runtime_metadata_includes_subagent_policy_fields(tmp_
         '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
     )
     (tmp_path / "harnesses" / "index.json").write_text(
-        '{"harnesses":{"har_0001":{"id":"har_0001","type":"feature","status":"active","phase":"executing","awaiting_user":false,"blocked":false,"auto":true,"executor_mode":"auto","subagent_allowed":true,"runner":"subagent"}}}',
+        '{"harnesses":{"har_0001":{"id":"har_0001","type":"feature","status":"active","phase":"executing","awaiting_user":false,"blocked":false,"auto":true,"executor_mode":"auto","delegation_level":"required","risk_level":"sensitive","subagent_allowed":true,"subagent_profile":"orchestrator","runner":"subagent"}}}',
         encoding="utf-8",
     )
     msg = InboundMessage(
@@ -591,7 +591,10 @@ def test_workspace_harness_runtime_metadata_includes_subagent_policy_fields(tmp_
 
     assert runtime_meta["has_active_harness"] is True
     assert runtime_meta["active_harness"]["executor_mode"] == "auto"
+    assert runtime_meta["active_harness"]["delegation_level"] == "required"
+    assert runtime_meta["active_harness"]["risk_level"] == "sensitive"
     assert runtime_meta["active_harness"]["subagent_allowed"] is True
+    assert runtime_meta["active_harness"]["subagent_profile"] == "orchestrator"
     assert runtime_meta["active_harness"]["runner"] == "subagent"
 
 

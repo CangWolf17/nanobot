@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -627,7 +628,7 @@ class TestSubagentCancellation:
 
         spawn_tool = SpawnTool(manager=mgr)
         spawn_tool.set_context("telegram", "chat-1")
-        result = await spawn_tool.execute(task="do task", label="bg")
+        result = await spawn_tool.execute(task="do task", label="bg", tier="standard")
 
         assert "started" in result.lower()
         running = list(mgr._running_tasks.values())
@@ -672,7 +673,7 @@ class TestSubagentCancellation:
                 "_origin_sender_id": "user1",
             },
         )
-        result = await spawn_tool.execute(task="do task", label="bg")
+        result = await spawn_tool.execute(task="do task", label="bg", tier="standard")
 
         assert "started" in result.lower()
         running = list(mgr._running_tasks.values())
@@ -719,7 +720,7 @@ class TestSubagentCancellation:
                 },
             },
         )
-        result = await spawn_tool.execute(task="do task", label="bg")
+        result = await spawn_tool.execute(task="do task", label="bg", tier="standard")
 
         assert "blocked" in result.lower()
         assert "subagent_allowed=false" in result
@@ -745,16 +746,22 @@ class TestSubagentCancellation:
             effort="high",
         )
         resource_manager = MagicMock()
-        resource_manager.acquire.return_value = AcquireDecision(status="granted", lease=lease)
+        resource_manager.resolve_spawn_request.return_value = MagicMock(
+            reason="compatibility_tier:standard",
+            requested_type=None,
+            requested_model=None,
+            preferred_route=None,
+            candidate_chain=("m1",),
+        )
+        resource_manager.acquire_candidates.return_value = AcquireDecision(status="granted", lease=lease)
         resource_manager.release = MagicMock()
         mgr.resource_manager = resource_manager
-        mgr._resolve_subagent_request = MagicMock(return_value=object())
         mgr._run_subagent = AsyncMock()
 
-        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+        result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
 
         assert "started" in result.lower()
-        resource_manager.acquire.assert_called_once()
+        resource_manager.acquire_candidates.assert_called_once()
         running = list(mgr._running_tasks.values())
         assert len(running) == 1
         await running[0]
@@ -762,16 +769,51 @@ class TestSubagentCancellation:
         args = mgr._run_subagent.await_args.args
         assert args[4] == lease
 
-    def test_spawn_tool_accepts_optional_tier_and_model_parameters(self):
+    @pytest.mark.asyncio
+    async def test_spawn_tool_forwards_name_and_type_to_manager(self):
+        from nanobot.agent.tools.spawn import SpawnTool
+
+        mgr = MagicMock()
+        mgr.spawn = AsyncMock(return_value="started")
+        tool = SpawnTool(manager=mgr)
+        tool.set_context("feishu", "chat-1")
+
+        result = await tool.execute(task="do task", name="bg-worker", type="worker")
+
+        assert result == "started"
+        mgr.spawn.assert_awaited_once()
+        kwargs = mgr.spawn.await_args.kwargs
+        assert kwargs["name"] == "bg-worker"
+        assert kwargs["subagent_type"] == "worker"
+
+    def test_spawn_tool_accepts_name_type_tier_and_model_parameters(self):
         from nanobot.agent.tools.spawn import SpawnTool
 
         mgr = MagicMock()
         tool = SpawnTool(manager=mgr)
 
         props = tool.parameters["properties"]
+        assert "name" in props
+        assert "type" in props
+        assert props["type"]["enum"] == ["worker", "explorer"]
         assert "tier" in props
         assert props["tier"]["enum"] == ["lite", "standard"]
         assert "model" in props
+        assert "Preferred call shapes" in tool.description
+        assert "label/tier are deprecated" in tool.description
+
+    @pytest.mark.asyncio
+    async def test_spawn_tool_rejects_calls_without_type_model_or_tier(self):
+        from nanobot.agent.tools.spawn import SpawnTool
+
+        mgr = MagicMock()
+        mgr.spawn = AsyncMock(return_value="Subagent request rejected: missing selector. Provide `type` or `model` (or deprecated compatibility `tier`).")
+        tool = SpawnTool(manager=mgr)
+
+        result = await tool.execute(task="do task", label="bg")
+
+        assert "missing selector" in result.lower()
+        mgr.spawn.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_spawn_rejects_when_resource_manager_denies_request(self, tmp_path):
@@ -785,24 +827,28 @@ class TestSubagentCancellation:
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
 
         resource_manager = MagicMock()
-        resource_manager.acquire.return_value = AcquireDecision(
+        resource_manager.resolve_spawn_request.return_value = MagicMock(
+            reason="compatibility_tier:standard",
+            requested_type=None,
+            requested_model=None,
+            preferred_route=None,
+            candidate_chain=("m1",),
+        )
+        resource_manager.acquire_candidates.return_value = AcquireDecision(
             status="rejected", reason="queue_limit"
         )
         resource_manager.release = MagicMock()
         mgr.resource_manager = resource_manager
-        mgr._resolve_subagent_request = MagicMock(return_value=object())
         mgr._run_subagent = AsyncMock()
 
-        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+        result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
 
         assert "rejected" in result.lower()
         assert "queue_limit" in result
         mgr._run_subagent.assert_not_awaited()
         assert mgr._running_tasks == {}
 
-    def test_resolve_subagent_request_prefers_explicit_model_then_tier_then_harness_defaults(
-        self, tmp_path
-    ):
+    def test_build_spawn_request_leaves_compatibility_empty_when_type_model_and_tier_absent(self, tmp_path):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
 
@@ -811,30 +857,329 @@ class TestSubagentCancellation:
         provider.get_default_model.return_value = "gpt-5.4"
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
 
-        request = mgr._resolve_subagent_request(
-            task="do task",
+        request = mgr._build_spawn_request(
             label="bg",
-            tier="lite",
-            model="lite-minimax-m2.7-high-minimax",
-            origin={
-                "channel": "feishu",
-                "chat_id": "c1",
-                "metadata": {
-                    "workspace_runtime": {
-                        "active_harness": {
-                            "id": "har_0026",
-                            "subagent_model": "standard-gpt-5.4-high-aizhiwen-top",
-                            "subagent_tier": "standard",
-                        }
-                    }
-                },
-            },
+            origin={"channel": "feishu", "chat_id": "c1", "metadata": {}},
         )
 
-        assert request.model == "lite-minimax-m2.7-high-minimax"
-        assert request.tier == "lite"
-        assert request.harness_model == "standard-gpt-5.4-high-aizhiwen-top"
-        assert request.harness_tier == "standard"
+        assert request.compatibility_tier is None
+
+
+    @pytest.mark.asyncio
+    async def test_manager_spawn_rejects_calls_without_type_model_or_tier(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+        mgr._run_subagent = AsyncMock()
+
+        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+
+        assert "missing selector" in result.lower()
+        mgr._run_subagent.assert_not_awaited()
+        assert mgr._running_tasks == {}
+
+    def test_build_spawn_request_prefers_name_over_label_and_captures_main_route(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "subagent_defaults": {"model": "standard-gpt-5.4-mini-xhigh-tokenx", "task_budget": 3, "level_limit": 2},
+                    "models": {
+                        "pro-gpt-5.4-xhigh-tokenx": {
+                            "tier": "pro",
+                            "family": "gpt-5.4",
+                            "effort": "xhigh",
+                            "route": "tokenx",
+                            "provider": "custom",
+                            "provider_model": "gpt-5.4",
+                            "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k", "extra_headers": {}},
+                            "agent": {},
+                            "enabled": True,
+                            "template": False,
+                            "aliases": ["gpt-5.4"],
+                        }
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "pro-gpt-5.4-xhigh-tokenx"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus, model="pro-gpt-5.4-xhigh-tokenx")
+
+        request = mgr._build_spawn_request(
+            name="real-name",
+            subagent_type="worker",
+            label="compat-label",
+            origin={"channel": "feishu", "chat_id": "c1", "metadata": {}},
+        )
+
+        assert request.name == "real-name"
+        assert request.subagent_type == "worker"
+        assert request.preferred_route == "tokenx"
+
+    def test_resolve_subagent_resolution_uses_explicit_model_strictly(self, tmp_path):
+        from nanobot.agent.subagent_resources import RuntimeSubagentSpawnRequest
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "subagent_defaults": {"model": "standard-gpt-5.4-mini-xhigh-tokenx", "task_budget": 3, "level_limit": 2},
+                    "models": {
+                        "standard-gpt-5.4-mini-xhigh-tokenx": {
+                            "tier": "standard",
+                            "family": "gpt-5.4-mini",
+                            "effort": "xhigh",
+                            "route": "tokenx",
+                            "provider": "custom",
+                            "provider_model": "gpt-5.4-mini",
+                            "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k", "extra_headers": {}},
+                            "agent": {},
+                            "enabled": True,
+                            "template": False,
+                            "aliases": ["gpt-5.4-mini"],
+                        }
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "pro-gpt-5.4-xhigh-tokenx"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        resolution = mgr.resource_manager.resolve_spawn_request(
+            RuntimeSubagentSpawnRequest(
+                name="bg",
+                model="gpt-5.4-mini",
+                preferred_route="tokenx",
+            )
+        )
+
+        assert resolution.reason == "explicit_model"
+        assert resolution.candidate_chain == ("standard-gpt-5.4-mini-xhigh-tokenx",)
+
+    def test_resolve_subagent_resolution_prefers_main_route_for_worker_type(self, tmp_path):
+        from nanobot.agent.subagent_resources import RuntimeSubagentSpawnRequest
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 1,
+            "subagent_defaults": {"model": "standard-gpt-5.4-mini-xhigh-tokenx", "task_budget": 3, "level_limit": 2},
+            "provider_status": {
+                "aizhiwen-top": {"availability": "available", "reason": ""},
+                "tokenx": {"availability": "available", "reason": ""},
+            },
+            "models": {
+                "standard-gpt-5.4-mini-xhigh-aizhiwen-top": {
+                    "tier": "standard", "family": "gpt-5.4-mini", "effort": "xhigh", "route": "aizhiwen-top",
+                    "provider": "custom", "provider_model": "gpt-5.4-mini",
+                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k", "extra_headers": {}},
+                    "agent": {}, "enabled": True, "template": False, "aliases": []
+                },
+                "standard-gpt-5.4-mini-xhigh-tokenx": {
+                    "tier": "standard", "family": "gpt-5.4-mini", "effort": "xhigh", "route": "tokenx",
+                    "provider": "custom", "provider_model": "gpt-5.4-mini",
+                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k", "extra_headers": {}},
+                    "agent": {}, "enabled": True, "template": False, "aliases": ["gpt-5.4-mini"]
+                },
+            },
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "pro-gpt-5.4-xhigh-tokenx"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        resolution = mgr.resource_manager.resolve_spawn_request(
+            RuntimeSubagentSpawnRequest(
+                name="bg",
+                subagent_type="worker",
+                preferred_route="tokenx",
+            )
+        )
+
+        assert resolution.reason == "builtin_type:worker"
+        assert resolution.candidate_chain[0] == "standard-gpt-5.4-mini-xhigh-tokenx"
+
+    def test_resolve_subagent_resolution_maps_standard_compatibility_to_worker_first(self, tmp_path):
+        from nanobot.agent.subagent_resources import RuntimeSubagentSpawnRequest
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 1,
+            "subagent_defaults": {"model": "standard-gpt-5.4-mini-xhigh-tokenx", "task_budget": 3, "level_limit": 2},
+            "provider_status": {
+                "aizhiwen-top": {"availability": "available", "reason": ""},
+                "tokenx": {"availability": "available", "reason": ""},
+            },
+            "models": {
+                "standard-gpt-5.4-mini-xhigh-aizhiwen-top": {
+                    "tier": "standard", "family": "gpt-5.4-mini", "effort": "xhigh", "route": "aizhiwen-top",
+                    "provider": "custom", "provider_model": "gpt-5.4-mini",
+                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k", "extra_headers": {}},
+                    "agent": {}, "enabled": True, "template": False, "aliases": []
+                },
+                "standard-gpt-5.4-mini-xhigh-tokenx": {
+                    "tier": "standard", "family": "gpt-5.4-mini", "effort": "xhigh", "route": "tokenx",
+                    "provider": "custom", "provider_model": "gpt-5.4-mini",
+                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k", "extra_headers": {}},
+                    "agent": {}, "enabled": True, "template": False, "aliases": ["gpt-5.4-mini"]
+                },
+                "standard-gpt-5.4-high-tokenx": {
+                    "tier": "standard", "family": "gpt-5.4", "effort": "high", "route": "tokenx",
+                    "provider": "custom", "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k", "extra_headers": {}},
+                    "agent": {}, "enabled": True, "template": False, "aliases": []
+                },
+            },
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "pro-gpt-5.4-xhigh-tokenx"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        resolution = mgr.resource_manager.resolve_spawn_request(
+            RuntimeSubagentSpawnRequest(
+                name="bg",
+                preferred_route="tokenx",
+                compatibility_tier="standard",
+            )
+        )
+
+        assert resolution.reason == "compatibility_tier:standard->worker"
+        assert resolution.requested_type == "worker"
+        assert resolution.candidate_chain[0] == "standard-gpt-5.4-mini-xhigh-tokenx"
+
+    def test_resolve_subagent_resolution_falls_back_to_legacy_standard_when_worker_candidates_absent(self, tmp_path):
+        from nanobot.agent.subagent_resources import RuntimeSubagentSpawnRequest
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 1,
+            "subagent_defaults": {"model": "standard-gpt-5.4-high-tokenx", "task_budget": 3, "level_limit": 2},
+            "provider_status": {
+                "tokenx": {"availability": "available", "reason": ""},
+            },
+            "models": {
+                "standard-gpt-5.4-high-tokenx": {
+                    "tier": "standard", "family": "gpt-5.4", "effort": "high", "route": "tokenx",
+                    "provider": "custom", "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k", "extra_headers": {}},
+                    "agent": {}, "enabled": True, "template": False, "aliases": []
+                }
+            },
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "pro-gpt-5.4-xhigh-tokenx"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        resolution = mgr.resource_manager.resolve_spawn_request(
+            RuntimeSubagentSpawnRequest(
+                name="bg",
+                preferred_route="tokenx",
+                compatibility_tier="standard",
+            )
+        )
+
+        assert resolution.reason == "compatibility_tier:standard"
+        assert resolution.candidate_chain == ("standard-gpt-5.4-high-tokenx",)
+
+    def test_resolve_subagent_resolution_falls_back_to_legacy_standard_when_worker_candidates_only_hit_manual_outage(self, tmp_path):
+        from nanobot.agent.subagent_resources import RuntimeSubagentSpawnRequest
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        registry = {
+            "version": 1,
+            "subagent_defaults": {"model": "standard-gpt-5.4-high-aizhiwen-top", "task_budget": 3, "level_limit": 2},
+            "provider_status": {
+                "tokenx": {"availability": "manual_outage", "reason": "manual_outage"},
+                "aizhiwen-top": {"availability": "available", "reason": ""},
+            },
+            "models": {
+                "standard-gpt-5.4-mini-xhigh-tokenx": {
+                    "tier": "standard", "family": "gpt-5.4-mini", "effort": "xhigh", "route": "tokenx",
+                    "provider": "custom", "provider_model": "gpt-5.4-mini",
+                    "connection": {"api_base": "https://tokenx24.com/v1", "api_key": "k", "extra_headers": {}},
+                    "agent": {}, "enabled": True, "template": False, "aliases": ["gpt-5.4-mini"]
+                },
+                "standard-gpt-5.4-high-aizhiwen-top": {
+                    "tier": "standard", "family": "gpt-5.4", "effort": "high", "route": "aizhiwen-top",
+                    "provider": "custom", "provider_model": "gpt-5.4",
+                    "connection": {"api_base": "https://aizhiwen.top/v1", "api_key": "k", "extra_headers": {}},
+                    "agent": {}, "enabled": True, "template": False, "aliases": []
+                }
+            },
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "pro-gpt-5.4-xhigh-tokenx"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        resolution = mgr.resource_manager.resolve_spawn_request(
+            RuntimeSubagentSpawnRequest(
+                name="bg",
+                preferred_route="tokenx",
+                compatibility_tier="standard",
+            )
+        )
+
+        assert resolution.reason == "compatibility_tier:standard"
+        assert resolution.candidate_chain == ("standard-gpt-5.4-high-aizhiwen-top",)
 
     def test_build_subagent_prompt_injects_runtime_context_bundle(self, tmp_path):
         from nanobot.agent.subagent import SubagentManager
@@ -1019,6 +1364,90 @@ class TestSubagentCancellation:
 
         mgr._build_provider_for_lease.assert_called_once_with(lease)
         assert captured["model"] == "MiniMax-M2.7"
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_rebuilds_provider_from_lease_without_workspace_config_loader(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import SubagentLease
+        from nanobot.bus.queue import MessageBus
+        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+
+        registry = {
+            "version": 1,
+            "subagent_defaults": {"model": "gpt-5.4", "task_budget": 3, "level_limit": 2},
+            "models": {
+                "standard-gpt-5.4-high-aizhiwen-top": {
+                    "tier": "standard",
+                    "family": "gpt-5.4",
+                    "effort": "high",
+                    "route": "aizhiwen-top",
+                    "provider": "custom",
+                    "provider_model": "gpt-5.4",
+                    "connection": {
+                        "api_base": "https://aizhiwen.top/v1",
+                        "api_key": "k-a",
+                        "extra_headers": {"User-Agent": "UA"},
+                    },
+                    "agent": {"temperature": 0.25, "max_tokens": 1234},
+                    "enabled": True,
+                    "template": False,
+                    "aliases": ["gpt-5.4"],
+                }
+            },
+        }
+        (tmp_path / "config.json").write_text(
+            json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False)
+            + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "model_registry.json").write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        bus = MessageBus()
+        parent_provider = MagicMock()
+        parent_provider.get_default_model.return_value = "parent-model"
+        parent_provider.generation.temperature = 0.1
+        parent_provider.generation.max_tokens = 8192
+        parent_provider.generation.reasoning_effort = None
+        mgr = SubagentManager(
+            provider=parent_provider,
+            workspace=tmp_path,
+            bus=bus,
+            model="parent-model",
+        )
+
+        monkeypatch.setattr(
+            "nanobot.config.loader.load_config",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("workspace config loader should not run")),
+        )
+        monkeypatch.setattr(
+            "nanobot.nanobot._make_provider",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("_make_provider should not run")),
+        )
+
+        lease = SubagentLease(
+            model_id="standard-gpt-5.4-high-aizhiwen-top",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+
+        provider, model_name = mgr._build_provider_for_lease(lease)
+
+        assert model_name == "gpt-5.4"
+        assert isinstance(provider, OpenAICompatProvider)
+        assert provider.api_key == "k-a"
+        assert provider.api_base == "https://aizhiwen.top/v1"
+        assert provider.extra_headers == {"User-Agent": "UA"}
+        assert provider.generation.temperature == 0.25
+        assert provider.generation.max_tokens == 1234
+        assert provider.generation.reasoning_effort == "high"
 
     @pytest.mark.asyncio
     async def test_run_subagent_records_hard_provider_failure_and_shrinks_current_candidate_pool(
@@ -1503,10 +1932,16 @@ class TestSubagentCancellation:
             effort="high",
         )
         resource_manager = MagicMock()
-        resource_manager.acquire.return_value = AcquireDecision(status="granted", lease=lease)
+        resource_manager.resolve_spawn_request.return_value = MagicMock(
+            reason="compatibility_tier:standard",
+            requested_type=None,
+            requested_model=None,
+            preferred_route=None,
+            candidate_chain=("m1",),
+        )
+        resource_manager.acquire_candidates.return_value = AcquireDecision(status="granted", lease=lease)
         resource_manager.release = MagicMock()
         mgr.resource_manager = resource_manager
-        mgr._resolve_subagent_request = MagicMock(return_value=object())
         mgr._announce_result = AsyncMock()
         mgr.runner.run = AsyncMock(
             return_value=AgentRunResult(
@@ -1517,7 +1952,7 @@ class TestSubagentCancellation:
             )
         )
 
-        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+        result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
         assert "started" in result.lower()
         running = list(mgr._running_tasks.values())
         assert len(running) == 1
@@ -1543,14 +1978,20 @@ class TestSubagentCancellation:
             effort="high",
         )
         resource_manager = MagicMock()
-        resource_manager.acquire.return_value = AcquireDecision(status="granted", lease=lease)
+        resource_manager.resolve_spawn_request.return_value = MagicMock(
+            reason="compatibility_tier:standard",
+            requested_type=None,
+            requested_model=None,
+            preferred_route=None,
+            candidate_chain=("m1",),
+        )
+        resource_manager.acquire_candidates.return_value = AcquireDecision(status="granted", lease=lease)
         resource_manager.release = MagicMock()
         mgr.resource_manager = resource_manager
-        mgr._resolve_subagent_request = MagicMock(return_value=object())
         mgr._announce_result = AsyncMock()
         mgr.runner.run = AsyncMock(side_effect=RuntimeError("boom"))
 
-        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+        result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
         assert "started" in result.lower()
         running = list(mgr._running_tasks.values())
         assert len(running) == 1
@@ -1584,11 +2025,17 @@ class TestSubagentCancellation:
             effort="high",
         )
         resource_manager = MagicMock()
-        resource_manager.acquire.return_value = AcquireDecision(status="granted", lease=lease)
+        resource_manager.resolve_spawn_request.return_value = MagicMock(
+            reason="compatibility_tier:standard",
+            requested_type=None,
+            requested_model=None,
+            preferred_route=None,
+            candidate_chain=("m1",),
+        )
+        resource_manager.acquire_candidates.return_value = AcquireDecision(status="granted", lease=lease)
         resource_manager.release = MagicMock()
         mgr.resource_manager = resource_manager
-        mgr._resolve_subagent_request = MagicMock(return_value=object())
-
+        
         started = asyncio.Event()
         cancelled = asyncio.Event()
 
@@ -1602,7 +2049,7 @@ class TestSubagentCancellation:
 
         monkeypatch.setattr("nanobot.agent.tools.registry.ToolRegistry.execute", fake_execute)
 
-        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+        result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
         assert "started" in result.lower()
         running = list(mgr._running_tasks.values())
         assert len(running) == 1
@@ -1613,6 +2060,175 @@ class TestSubagentCancellation:
         assert count == 1
         assert cancelled.is_set()
         resource_manager.release.assert_called_once_with(lease)
+
+    @pytest.mark.asyncio
+    async def test_nested_spawn_is_blocked_when_level_limit_is_one(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+        mgr._default_level_limit = lambda: 1  # type: ignore[method-assign]
+
+        authorized, reason = mgr._authorize_spawn_request(
+            task_id="sub-1",
+            requested_type="worker",
+            requested_model=None,
+            origin={
+                "channel": "feishu",
+                "chat_id": "c1",
+                "metadata": {
+                    "workspace_runtime": {
+                        "active_harness": {
+                            "subagent_allowed": True,
+                            "delegation_level": "required",
+                            "risk_level": "normal",
+                            "subagent_profile": "delegate",
+                        }
+                    },
+                    "subagent_runtime": {
+                        "depth": 1,
+                        "remaining_budget": 3,
+                        "profile": "delegate",
+                        "parent_task_id": "parent-1",
+                    },
+                },
+            },
+        )
+
+        assert authorized is False
+        assert "max depth 1 exceeded" in reason
+
+    @pytest.mark.asyncio
+    async def test_nested_spawn_is_blocked_when_budget_is_exhausted(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        authorized, reason = mgr._authorize_spawn_request(
+            task_id="sub-1",
+            requested_type="worker",
+            requested_model=None,
+            origin={
+                "channel": "feishu",
+                "chat_id": "c1",
+                "metadata": {
+                    "workspace_runtime": {
+                        "active_harness": {
+                            "subagent_allowed": True,
+                            "delegation_level": "required",
+                            "risk_level": "normal",
+                            "subagent_profile": "delegate",
+                        }
+                    },
+                    "subagent_runtime": {
+                        "depth": 1,
+                        "remaining_budget": 0,
+                        "profile": "delegate",
+                        "parent_task_id": "parent-1",
+                    },
+                },
+            },
+        )
+
+        assert authorized is False
+        assert "task budget exhausted" in reason
+
+    @pytest.mark.asyncio
+    async def test_subagent_message_policy_allows_same_chat_text_only(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.tools.guarded import GuardedTool
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        sent = []
+
+        async def _capture(msg):
+            sent.append(msg)
+
+        mgr.bus.publish_outbound = _capture  # type: ignore[assignment]
+        tools = mgr._build_subagent_tools(
+            task_id="sub-1",
+            origin={
+                "channel": "feishu",
+                "chat_id": "chat-1",
+                "metadata": {
+                    "workspace_runtime": {
+                        "active_harness": {
+                            "subagent_allowed": True,
+                            "delegation_level": "assist",
+                            "risk_level": "normal",
+                            "subagent_profile": "notify",
+                        }
+                    }
+                },
+            },
+        )
+
+        tool = tools.get("message")
+        assert isinstance(tool, GuardedTool)
+
+        ok = await tool.execute(content="hello")
+        cross_chat = await tool.execute(content="hello", chat_id="chat-2")
+        with_media = await tool.execute(content="hello", media=["/tmp/x.png"])
+
+        assert ok == "Message sent to feishu:chat-1"
+        assert len(sent) == 1
+        assert sent[0].metadata["source"] == "subagent"
+        assert sent[0].metadata["subagent_task_id"] == "sub-1"
+        assert "same chat" in cross_chat.lower()
+        assert "media" in with_media.lower()
+
+    @pytest.mark.asyncio
+    async def test_subagent_spawn_policy_blocks_explicit_model_for_delegate_profile(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.tools.guarded import GuardedTool
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        tools = mgr._build_subagent_tools(
+            task_id="sub-1",
+            origin={
+                "channel": "feishu",
+                "chat_id": "chat-1",
+                "metadata": {
+                    "workspace_runtime": {
+                        "active_harness": {
+                            "subagent_allowed": True,
+                            "delegation_level": "required",
+                            "risk_level": "normal",
+                            "subagent_profile": "delegate",
+                        }
+                    },
+                    "subagent_runtime": {
+                        "depth": 1,
+                        "remaining_budget": 3,
+                        "profile": "delegate",
+                        "parent_task_id": "parent-1",
+                    },
+                },
+            },
+        )
+
+        tool = tools.get("spawn")
+        assert isinstance(tool, GuardedTool)
+
+        blocked = await tool.execute(task="do child", model="gpt-5.4-mini")
+        assert "explicit model" in blocked.lower()
 
     @pytest.mark.asyncio
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):

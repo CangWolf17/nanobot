@@ -637,7 +637,10 @@ class HarnessService:
             "blocked": record.blocked,
             "auto": requested_auto or record.execution_policy.auto_continue,
             "executor_mode": record.execution_policy.executor_mode,
+            "delegation_level": record.execution_policy.delegation_level,
+            "risk_level": record.execution_policy.risk_level,
             "subagent_allowed": record.execution_policy.subagent_allowed,
+            "subagent_profile": record.execution_policy.subagent_profile,
             "runner": record.runtime_state.runner,
         }
 
@@ -650,6 +653,12 @@ class HarnessService:
             "awaiting_user": record.awaiting_user,
             "blocked": record.blocked,
             "auto": record.execution_policy.auto_continue,
+            "executor_mode": record.execution_policy.executor_mode,
+            "delegation_level": record.execution_policy.delegation_level,
+            "risk_level": record.execution_policy.risk_level,
+            "subagent_allowed": record.execution_policy.subagent_allowed,
+            "subagent_profile": record.execution_policy.subagent_profile,
+            "runner": record.runtime_state.runner,
         }
 
     def _extract_harness_update_payload(self, content: str) -> dict[str, Any] | None:
