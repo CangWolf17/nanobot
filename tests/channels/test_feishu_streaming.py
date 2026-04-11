@@ -144,6 +144,20 @@ class TestStreamUpdateText:
 
 class TestSendDelta:
     @pytest.mark.asyncio
+    async def test_stream_start_creates_card_before_first_delta(self):
+        ch = _make_channel()
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_new")
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_new")
+
+        await ch.send_delta("oc_chat1", "", metadata={"_stream_start": True})
+
+        assert "oc_chat1" in ch._stream_bufs
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.card_id == "card_new"
+        ch._client.cardkit.v1.card.create.assert_called_once()
+        ch._client.im.v1.message.create.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_first_delta_creates_card_and_sends(self):
         ch = _make_channel()
         ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_new")
@@ -159,6 +173,19 @@ class TestSendDelta:
         assert buf.sequence == 1
         ch._client.cardkit.v1.card.create.assert_called_once()
         ch._client.im.v1.message.create.assert_called_once()
+        ch._client.cardkit.v1.card_element.content.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_first_visible_delta_after_stream_start_updates_immediately(self):
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(text="", card_id="card_1", sequence=0, last_edit=time.monotonic())
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_delta("oc_chat1", "Hello")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.text == "Hello"
+        assert buf.sequence == 1
         ch._client.cardkit.v1.card_element.content.assert_called_once()
 
     @pytest.mark.asyncio

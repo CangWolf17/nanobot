@@ -524,6 +524,48 @@ async def test_send_with_retry_calls_send_delta():
 
 
 @pytest.mark.asyncio
+async def test_send_with_retry_calls_send_delta_for_stream_start():
+    """_send_with_retry should call send_delta when metadata has _stream_start."""
+    send_delta_called = False
+
+    class _StreamingChannel(BaseChannel):
+        name = "streaming"
+        display_name = "Streaming"
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        async def send(self, msg: OutboundMessage) -> None:
+            pass
+
+        async def send_delta(self, chat_id: str, delta: str, metadata: dict | None = None) -> None:
+            nonlocal send_delta_called
+            send_delta_called = True
+
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(send_max_retries=3),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.bus = MessageBus()
+    mgr.channels = {"streaming": _StreamingChannel(fake_config, mgr.bus)}
+    mgr._dispatch_task = None
+
+    msg = OutboundMessage(
+        channel="streaming", chat_id="123", content="",
+        metadata={"_stream_start": True}
+    )
+    await mgr._send_with_retry(mgr.channels["streaming"], msg)
+
+    assert send_delta_called is True
+
+
+@pytest.mark.asyncio
 async def test_send_with_retry_skips_send_when_streamed():
     """_send_with_retry should not call send when metadata has _streamed flag."""
     send_called = False

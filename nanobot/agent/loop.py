@@ -308,7 +308,8 @@ class AgentLoop:
             return
 
         if stream_chunk_count <= 0 or stream_char_count <= 0:
-            return
+            if not mention_user:
+                return
 
         duration = 0.0
         if stream_started_at is not None and stream_finished_at is not None:
@@ -320,7 +321,7 @@ class AgentLoop:
             return
 
         content_len = len(str(response.content or ""))
-        should_notify = any(
+        should_notify = mention_user or any(
             [
                 is_harness_auto,
                 duration >= self._STREAM_COMPLETION_NOTICE_MIN_SECONDS,
@@ -909,14 +910,51 @@ class AgentLoop:
         async with lock, gate:
             try:
                 on_stream = on_stream_end = None
+                stream_base_id: str | None = None
+                stream_segment = 0
+                stream_end_sent = False
                 stream_started_at: float | None = None
                 stream_finished_at: float | None = None
                 stream_chunk_count = 0
                 stream_char_count = 0
+                segment_stream_chunk_count = 0
+                segment_stream_char_count = 0
+
+                async def _emit_pending_stream_end() -> None:
+                    nonlocal stream_end_sent, stream_finished_at
+                    if stream_base_id is None or stream_end_sent:
+                        return
+                    if stream_started_at is not None:
+                        stream_finished_at = time.monotonic()
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="",
+                            metadata={
+                                "_stream_end": True,
+                                "_resuming": False,
+                                "_stream_id": f"{stream_base_id}:{stream_segment}",
+                            },
+                        )
+                    )
+                    stream_end_sent = True
+
                 if msg.metadata.get("_wants_stream"):
                     # Split one answer into distinct stream segments.
                     stream_base_id = f"{msg.session_key}:{time.time_ns()}"
-                    stream_segment = 0
+
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="",
+                            metadata={
+                                "_stream_start": True,
+                                "_stream_id": f"{stream_base_id}:0",
+                            },
+                        )
+                    )
 
                     def _current_stream_id() -> str:
                         return f"{stream_base_id}:{stream_segment}"
@@ -926,14 +964,18 @@ class AgentLoop:
                             stream_started_at, \
                             stream_finished_at, \
                             stream_chunk_count, \
-                            stream_char_count
-                        if delta:
+                            stream_char_count, \
+                            segment_stream_chunk_count, \
+                            segment_stream_char_count
+                        if delta and delta.strip():
                             now = time.monotonic()
                             if stream_started_at is None:
                                 stream_started_at = now
                             stream_finished_at = now
                             stream_chunk_count += 1
                             stream_char_count += len(delta)
+                            segment_stream_chunk_count += 1
+                            segment_stream_char_count += len(delta)
                         await self.bus.publish_outbound(
                             OutboundMessage(
                                 channel=msg.channel,
@@ -947,7 +989,12 @@ class AgentLoop:
                         )
 
                     async def on_stream_end(*, resuming: bool = False) -> None:
-                        nonlocal stream_segment, stream_finished_at
+                        nonlocal \
+                            stream_segment, \
+                            stream_end_sent, \
+                            stream_finished_at, \
+                            segment_stream_chunk_count, \
+                            segment_stream_char_count
                         if stream_started_at is not None:
                             stream_finished_at = time.monotonic()
                         await self.bus.publish_outbound(
@@ -962,6 +1009,11 @@ class AgentLoop:
                                 },
                             )
                         )
+                        stream_end_sent = True
+                        if resuming:
+                            segment_stream_chunk_count = 0
+                            segment_stream_char_count = 0
+                            stream_end_sent = False
                         stream_segment += 1
 
                 response = await self._process_message(
@@ -970,16 +1022,45 @@ class AgentLoop:
                     on_stream_end=on_stream_end,
                 )
                 if response is not None:
-                    self._maybe_mark_stream_completion_notice(
-                        msg,
-                        response,
-                        stream_started_at=stream_started_at,
-                        stream_finished_at=stream_finished_at,
-                        stream_chunk_count=stream_chunk_count,
-                        stream_char_count=stream_char_count,
+                    await _emit_pending_stream_end()
+                    separate_completion_notice: OutboundMessage | None = None
+                    final_segment_silent = on_stream is not None and (
+                        segment_stream_chunk_count <= 0 or segment_stream_char_count <= 0
                     )
+                    if final_segment_silent:
+                        meta = dict(response.metadata or {})
+                        meta.pop("_streamed", None)
+                        response.metadata = meta
+                        separate_completion_notice = OutboundMessage(
+                            channel=response.channel,
+                            chat_id=response.chat_id,
+                            content="",
+                            metadata={**dict(response.metadata or {}), "_streamed": True},
+                        )
+                        self._maybe_mark_stream_completion_notice(
+                            msg,
+                            separate_completion_notice,
+                            stream_started_at=stream_started_at,
+                            stream_finished_at=stream_finished_at,
+                            stream_chunk_count=stream_chunk_count,
+                            stream_char_count=stream_char_count,
+                        )
+                        if not (separate_completion_notice.metadata or {}).get("_completion_notice"):
+                            separate_completion_notice = None
+                    else:
+                        self._maybe_mark_stream_completion_notice(
+                            msg,
+                            response,
+                            stream_started_at=stream_started_at,
+                            stream_finished_at=stream_finished_at,
+                            stream_chunk_count=stream_chunk_count,
+                            stream_char_count=stream_char_count,
+                        )
                     await self.bus.publish_outbound(response)
+                    if separate_completion_notice is not None:
+                        await self.bus.publish_outbound(separate_completion_notice)
                 elif msg.channel == "cli":
+                    await _emit_pending_stream_end()
                     await self.bus.publish_outbound(
                         OutboundMessage(
                             channel=msg.channel,
@@ -989,11 +1070,13 @@ class AgentLoop:
                         )
                     )
             except asyncio.CancelledError:
+                await _emit_pending_stream_end()
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
             except Exception:
                 self._discard_inflight_turn(msg.session_key)
                 logger.exception("Error processing message for session {}", msg.session_key)
+                await _emit_pending_stream_end()
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         channel=msg.channel,

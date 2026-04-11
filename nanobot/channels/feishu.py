@@ -1048,10 +1048,30 @@ class FeishuChannel(BaseChannel):
         loop = asyncio.get_running_loop()
         rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
 
+        if meta.get("_stream_start"):
+            buf = self._stream_bufs.get(chat_id)
+            if buf is None:
+                buf = _FeishuStreamBuf()
+                self._stream_bufs[chat_id] = buf
+            if buf.card_id is None:
+                card_id = await loop.run_in_executor(None, self._create_streaming_card_sync, rid_type, chat_id)
+                if card_id:
+                    buf.card_id = card_id
+                    buf.sequence = 0
+                    buf.last_edit = 0.0
+            return
+
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):
             buf = self._stream_bufs.pop(chat_id, None)
-            if not buf or not buf.text:
+            if not buf:
+                return
+            if not buf.text:
+                if buf.card_id:
+                    buf.sequence += 1
+                    await loop.run_in_executor(
+                        None, self._close_streaming_mode_sync, buf.card_id, buf.sequence,
+                    )
                 return
             if buf.card_id:
                 buf.sequence += 1
@@ -1086,7 +1106,7 @@ class FeishuChannel(BaseChannel):
                 buf.sequence = 1
                 await loop.run_in_executor(None, self._stream_update_text_sync, card_id, buf.text, 1)
                 buf.last_edit = now
-        elif (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
+        elif buf.sequence == 0 or (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
             buf.sequence += 1
             await loop.run_in_executor(None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence)
             buf.last_edit = now

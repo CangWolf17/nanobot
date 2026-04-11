@@ -2,6 +2,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncio
+import pytest
 import subprocess
 
 from nanobot.agent.loop import AgentLoop
@@ -140,6 +141,346 @@ def test_workspace_agent_diagnose_emits_progress_before_agent_run(tmp_path: Path
         assert progress.metadata["_progress"] is True
         assert result is not None
         assert result.content == "done"
+
+    asyncio.run(run())
+
+
+def test_stream_requested_without_deltas_keeps_final_reply_sendable(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={"_wants_stream": True},
+        )
+
+        await loop._dispatch(msg)
+        stream_start = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        stream_end = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+        assert stream_start.metadata["_stream_start"] is True
+        assert stream_end.metadata["_stream_end"] is True
+        assert outbound.content == "done"
+        assert "_streamed" not in (outbound.metadata or {})
+
+    asyncio.run(run())
+
+
+def test_stream_requested_command_dispatch_closes_placeholder_stream(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        loop.commands.dispatch = AsyncMock(
+            return_value=OutboundMessage(channel="feishu", chat_id="chat1", content="done")
+        )
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="/test",
+            metadata={"_wants_stream": True},
+        )
+
+        await loop._dispatch(msg)
+        stream_start = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        stream_end = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+        assert stream_start.metadata["_stream_start"] is True
+        assert stream_end.metadata["_stream_end"] is True
+        assert outbound.content == "done"
+
+    asyncio.run(run())
+
+
+def test_stream_requested_exception_closes_placeholder_stream(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        loop._process_message = AsyncMock(side_effect=RuntimeError("boom"))
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={"_wants_stream": True},
+        )
+
+        await loop._dispatch(msg)
+        stream_start = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        stream_end = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+        assert stream_start.metadata["_stream_start"] is True
+        assert stream_end.metadata["_stream_end"] is True
+        assert outbound.content == "Sorry, I encountered an error."
+
+    asyncio.run(run())
+
+
+def test_stream_requested_cancellation_closes_placeholder_stream(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        loop._process_message = AsyncMock(side_effect=asyncio.CancelledError())
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={"_wants_stream": True},
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await loop._dispatch(msg)
+
+        stream_start = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        stream_end = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+        assert stream_start.metadata["_stream_start"] is True
+        assert stream_end.metadata["_stream_end"] is True
+
+    asyncio.run(run())
+
+
+def test_final_reply_stays_sendable_when_earlier_stream_segment_had_deltas(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        call_count = {"n": 0}
+
+        async def _chat_stream_with_retry(**kwargs):
+            call_count["n"] += 1
+            on_content_delta = kwargs.get("on_content_delta")
+            if call_count["n"] == 1:
+                if on_content_delta is not None:
+                    await on_content_delta("thinking")
+                return LLMResponse(
+                    content="thinking",
+                    tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
+                )
+            return LLMResponse(content="final done", tool_calls=[])
+
+        loop.provider.chat_stream_with_retry = _chat_stream_with_retry
+        loop.tools.execute = AsyncMock(return_value="tool result")
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={"_wants_stream": True},
+        )
+
+        await loop._dispatch(msg)
+        outputs = [await asyncio.wait_for(bus.consume_outbound(), timeout=1.0) for _ in range(bus.outbound_size)]
+        final_reply = outputs[-1]
+
+        assert final_reply.content == "final done"
+        assert "_streamed" not in (final_reply.metadata or {})
+
+    asyncio.run(run())
+
+
+def test_separate_completion_notice_when_earlier_streamed_but_final_segment_silent(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        loop.channels_config = ChannelsConfig.model_validate(
+            {
+                "feishu": {
+                    "enabled": True,
+                    "streaming": True,
+                    "streamingCompletionNoticeEnabled": True,
+                    "streamingCompletionNoticeText": "✅ 回复完成",
+                    "streamingCompletionNoticeMentionUser": True,
+                }
+            }
+        )
+        call_count = {"n": 0}
+
+        async def _chat_stream_with_retry(**kwargs):
+            call_count["n"] += 1
+            on_content_delta = kwargs.get("on_content_delta")
+            if call_count["n"] == 1:
+                if on_content_delta is not None:
+                    await on_content_delta("thinking")
+                return LLMResponse(
+                    content="thinking",
+                    tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
+                )
+            return LLMResponse(content="final done", tool_calls=[])
+
+        loop.provider.chat_stream_with_retry = _chat_stream_with_retry
+        loop.tools.execute = AsyncMock(return_value="tool result")
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={"_wants_stream": True},
+        )
+
+        await loop._dispatch(msg)
+        outputs = [await asyncio.wait_for(bus.consume_outbound(), timeout=1.0) for _ in range(bus.outbound_size)]
+
+        final_reply = next(item for item in outputs if item.content == "final done")
+        completion_notice = next(
+            item for item in outputs if (item.metadata or {}).get("_completion_notice") is True
+        )
+
+        assert final_reply.content == "final done"
+        assert "_streamed" not in (final_reply.metadata or {})
+        assert completion_notice.metadata["_completion_notice"] is True
+        assert completion_notice.metadata["_completion_notice_mention_user_id"] == "user1"
+
+    asyncio.run(run())
+
+
+def test_zero_delta_streamed_turn_with_mention_emits_completion_notice(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        loop.channels_config = ChannelsConfig.model_validate(
+            {
+                "feishu": {
+                    "enabled": True,
+                    "streaming": True,
+                    "streamingCompletionNoticeEnabled": True,
+                    "streamingCompletionNoticeText": "✅ 回复完成",
+                    "streamingCompletionNoticeMentionUser": True,
+                }
+            }
+        )
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={"_wants_stream": True, "message_id": "mid-1", "thread_id": "th-1", "root_id": "root-1"},
+        )
+
+        await loop._dispatch(msg)
+        outputs = [await asyncio.wait_for(bus.consume_outbound(), timeout=1.0) for _ in range(bus.outbound_size)]
+
+        final_reply = next(item for item in outputs if item.content == "done")
+        completion_notice = next(
+            item for item in outputs if (item.metadata or {}).get("_completion_notice") is True
+        )
+
+        assert "_streamed" not in (final_reply.metadata or {})
+        assert completion_notice.metadata["_completion_notice_mention_user_id"] == "user1"
+        assert completion_notice.metadata["message_id"] == "mid-1"
+        assert completion_notice.metadata["thread_id"] == "th-1"
+        assert completion_notice.metadata["root_id"] == "root-1"
+
+    asyncio.run(run())
+
+
+def test_whitespace_only_final_segment_with_mention_keeps_reply_and_notice(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        loop.channels_config = ChannelsConfig.model_validate(
+            {
+                "feishu": {
+                    "enabled": True,
+                    "streaming": True,
+                    "streamingCompletionNoticeEnabled": True,
+                    "streamingCompletionNoticeText": "✅ 回复完成",
+                    "streamingCompletionNoticeMentionUser": True,
+                }
+            }
+        )
+
+        async def _chat_stream_with_retry(**kwargs):
+            on_content_delta = kwargs.get("on_content_delta")
+            if on_content_delta is not None:
+                await on_content_delta("   ")
+            return LLMResponse(content="final done", tool_calls=[])
+
+        loop.provider.chat_stream_with_retry = _chat_stream_with_retry
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={"_wants_stream": True},
+        )
+
+        await loop._dispatch(msg)
+        outputs = [await asyncio.wait_for(bus.consume_outbound(), timeout=1.0) for _ in range(bus.outbound_size)]
+
+        final_reply = next(item for item in outputs if item.content == "final done")
+        completion_notice = next(
+            item for item in outputs if (item.metadata or {}).get("_completion_notice") is True
+        )
+
+        assert "_streamed" not in (final_reply.metadata or {})
+        assert completion_notice.metadata["_completion_notice"] is True
+
+    asyncio.run(run())
+
+
+def test_whitespace_only_final_stream_segment_keeps_final_reply_sendable(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+
+        async def _chat_stream_with_retry(**kwargs):
+            on_content_delta = kwargs.get("on_content_delta")
+            if on_content_delta is not None:
+                await on_content_delta("   ")
+            return LLMResponse(content="final done", tool_calls=[])
+
+        loop.provider.chat_stream_with_retry = _chat_stream_with_retry
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={"_wants_stream": True},
+        )
+
+        await loop._dispatch(msg)
+        outputs = [await asyncio.wait_for(bus.consume_outbound(), timeout=1.0) for _ in range(bus.outbound_size)]
+        final_reply = outputs[-1]
+
+        assert final_reply.content == "final done"
+        assert "_streamed" not in (final_reply.metadata or {})
+
+    asyncio.run(run())
+
+
+def test_final_visible_stream_segment_preserves_streamed_marker(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        call_count = {"n": 0}
+
+        async def _chat_stream_with_retry(**kwargs):
+            call_count["n"] += 1
+            on_content_delta = kwargs.get("on_content_delta")
+            if call_count["n"] == 1:
+                if on_content_delta is not None:
+                    await on_content_delta("thinking")
+                return LLMResponse(
+                    content="thinking",
+                    tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
+                )
+            if on_content_delta is not None:
+                await on_content_delta("final")
+            return LLMResponse(content="final done", tool_calls=[])
+
+        loop.provider.chat_stream_with_retry = _chat_stream_with_retry
+        loop.tools.execute = AsyncMock(return_value="tool result")
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={"_wants_stream": True},
+        )
+
+        await loop._dispatch(msg)
+        outputs = [await asyncio.wait_for(bus.consume_outbound(), timeout=1.0) for _ in range(bus.outbound_size)]
+        final_reply = outputs[-1]
+
+        assert final_reply.content == "final done"
+        assert final_reply.metadata["_streamed"] is True
 
     asyncio.run(run())
 
@@ -704,6 +1045,43 @@ def test_stream_completion_notice_marks_long_reply_even_without_workflow(tmp_pat
     )
 
     assert response.metadata["_completion_notice"] is True
+
+
+def test_stream_completion_notice_marks_short_reply_when_mention_enabled(tmp_path: Path) -> None:
+    loop, _bus = _make_loop(tmp_path)
+    loop.channels_config = ChannelsConfig.model_validate(
+        {
+            "feishu": {
+                "enabled": True,
+                "streaming": True,
+                "streamingCompletionNoticeEnabled": True,
+                "streamingCompletionNoticeText": "✅ 回复完成",
+                "streamingCompletionNoticeMentionUser": True,
+            }
+        }
+    )
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="user1",
+        chat_id="chat1",
+        content="hi",
+        metadata={},
+    )
+    response = OutboundMessage(
+        channel="feishu", chat_id="chat1", content="短回复", metadata={"_streamed": True}
+    )
+
+    loop._maybe_mark_stream_completion_notice(
+        msg,
+        response,
+        stream_started_at=1.0,
+        stream_finished_at=2.0,
+        stream_chunk_count=2,
+        stream_char_count=20,
+    )
+
+    assert response.metadata["_completion_notice"] is True
+    assert response.metadata["_completion_notice_mention_user_id"] == "user1"
 
 
 def test_before_execute_tools_progress_sanitizes_runtime_context_echo(tmp_path: Path) -> None:
