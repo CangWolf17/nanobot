@@ -390,6 +390,50 @@ async def test_runner_returns_structured_tool_error():
 
 
 @pytest.mark.asyncio
+async def test_runner_uses_pending_requests_message_after_retries(monkeypatch):
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.providers.base import LLMProvider
+
+    class RetryingPendingProvider(LLMProvider):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def chat(self, *args, **kwargs):
+            self.calls += 1
+            return LLMResponse(
+                content="Too many pending requests, please retry later",
+                tool_calls=[],
+                finish_reason="error",
+            )
+
+        def get_default_model(self) -> str:
+            return "test-model"
+
+    provider = RetryingPendingProvider()
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+    ))
+
+    assert result.stop_reason == "error"
+    assert result.final_content == "模型服务当前排队较多，已自动重试 5 次仍失败。请稍后重试。"
+    assert delays == [1, 2, 4, 8, 10]
+
+
+@pytest.mark.asyncio
 async def test_loop_disables_concurrent_tools_when_strict_dev_mode(tmp_path):
     from nanobot.agent.runner import AgentRunResult
 

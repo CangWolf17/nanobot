@@ -64,10 +64,13 @@ class AgentRunner:
     ) -> str:
         text = (raw_error or "").lower()
         is_timeout = "timeout" in text or "timed out" in text
+        is_pending_requests = "pending requests" in text
         is_transient = bool(text) and LLMProvider._is_transient_error(raw_error)
 
         if retry_count > 0 and is_timeout:
             return f"模型响应超时，已自动重试 {retry_count} 次仍失败。请稍后重试，或切换模型。"
+        if retry_count > 0 and is_pending_requests:
+            return f"模型服务当前排队较多，已自动重试 {retry_count} 次仍失败。请稍后重试。"
         if raw_error == EMPTY_MODEL_RESPONSE_ERROR:
             if retry_count > 0:
                 return (

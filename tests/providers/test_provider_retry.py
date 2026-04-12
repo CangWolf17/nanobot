@@ -48,6 +48,29 @@ async def test_chat_with_retry_retries_transient_error_then_succeeds(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_chat_with_retry_retries_pending_requests_error_then_succeeds(monkeypatch) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content="Too many pending requests, please retry later", finish_reason="error"),
+            LLMResponse(content="ok"),
+        ]
+    )
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.finish_reason == "stop"
+    assert response.content == "ok"
+    assert provider.calls == 2
+    assert delays == [1]
+
+
+@pytest.mark.asyncio
 async def test_chat_with_retry_reports_retry_callback(monkeypatch) -> None:
     provider = ScriptedProvider(
         [
@@ -328,8 +351,57 @@ async def test_chat_stream_with_retry_buffers_failed_attempt_deltas(monkeypatch)
     assert deltas == ["Hello"]
 
 
+
+
 @pytest.mark.asyncio
-async def test_image_fallback_without_meta_uses_default_placeholder() -> None:
+async def test_chat_stream_with_retry_retries_pending_requests_error_without_leaking_failed_deltas(monkeypatch) -> None:
+    from nanobot.providers.base import LLMProvider
+
+    class ScriptedStreamingPendingProvider(LLMProvider):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def chat(self, *args, **kwargs) -> LLMResponse:
+            raise NotImplementedError
+
+        async def chat_stream(self, *args, on_content_delta=None, **kwargs) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                if on_content_delta:
+                    await on_content_delta("pending leaked text ")
+                return LLMResponse(
+                    content="Too many pending requests, please retry later",
+                    finish_reason="error",
+                )
+            if on_content_delta:
+                await on_content_delta("Hello")
+            return LLMResponse(content="Hello", finish_reason="stop")
+
+        def get_default_model(self) -> str:
+            return "test-model"
+
+    provider = ScriptedStreamingPendingProvider()
+    deltas: list[str] = []
+    delays: list[int] = []
+
+    async def _capture_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=_capture_delta,
+    )
+
+    assert provider.calls == 2
+    assert response.content == "Hello"
+    assert deltas == ["Hello"]
+    assert delays == [1]
     """When _meta is absent, fallback placeholder is '[image omitted]'."""
     provider = ScriptedProvider(
         [
