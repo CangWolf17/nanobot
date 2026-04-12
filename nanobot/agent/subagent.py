@@ -870,6 +870,8 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
         effective_type = (subagent_type or "").strip() or None
         effective_model = (model or "").strip() or None
         compatibility_tier = (tier or "").strip() or None
+        if not effective_type and not effective_model and compatibility_tier == "standard":
+            effective_type = "worker"
         return RuntimeSubagentSpawnRequest(
             name=effective_name,
             subagent_type=effective_type,

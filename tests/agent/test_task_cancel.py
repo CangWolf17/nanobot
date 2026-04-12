@@ -753,8 +753,8 @@ class TestSubagentCancellation:
         )
         resource_manager = MagicMock()
         resource_manager.resolve_spawn_request.return_value = MagicMock(
-            reason="compatibility_tier:standard",
-            requested_type=None,
+            reason="builtin_type:worker",
+            requested_type="worker",
             requested_model=None,
             preferred_route=None,
             candidate_chain=("m1",),
@@ -767,6 +767,9 @@ class TestSubagentCancellation:
         result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
 
         assert "started" in result.lower()
+        request = resource_manager.resolve_spawn_request.call_args.args[0]
+        assert request.subagent_type == "worker"
+        assert request.compatibility_tier == "standard"
         resource_manager.acquire_candidates.assert_called_once()
         running = list(mgr._running_tasks.values())
         assert len(running) == 1
@@ -834,8 +837,8 @@ class TestSubagentCancellation:
 
         resource_manager = MagicMock()
         resource_manager.resolve_spawn_request.return_value = MagicMock(
-            reason="compatibility_tier:standard",
-            requested_type=None,
+            reason="builtin_type:worker",
+            requested_type="worker",
             requested_model=None,
             preferred_route=None,
             candidate_chain=("m1",),
@@ -869,6 +872,24 @@ class TestSubagentCancellation:
         )
 
         assert request.compatibility_tier is None
+
+    def test_build_spawn_request_normalizes_standard_tier_to_worker_type(self, tmp_path):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "gpt-5.4"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+        request = mgr._build_spawn_request(
+            label="bg",
+            tier="standard",
+            origin={"channel": "feishu", "chat_id": "c1", "metadata": {}},
+        )
+
+        assert request.subagent_type == "worker"
+        assert request.compatibility_tier == "standard"
 
 
     @pytest.mark.asyncio
@@ -1040,8 +1061,7 @@ class TestSubagentCancellation:
         assert resolution.reason == "builtin_type:worker"
         assert resolution.candidate_chain[0] == "standard-gpt-5.4-mini-xhigh-tokenx"
 
-    def test_resolve_subagent_resolution_maps_standard_compatibility_to_worker_first(self, tmp_path):
-        from nanobot.agent.subagent_resources import RuntimeSubagentSpawnRequest
+    def test_build_spawn_request_maps_standard_tier_to_worker_before_resource_resolution(self, tmp_path):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
 
@@ -1084,15 +1104,20 @@ class TestSubagentCancellation:
         provider.get_default_model.return_value = "pro-gpt-5.4-xhigh-tokenx"
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
 
-        resolution = mgr.resource_manager.resolve_spawn_request(
-            RuntimeSubagentSpawnRequest(
-                name="bg",
-                preferred_route="tokenx",
-                compatibility_tier="standard",
-            )
+        request = mgr._build_spawn_request(
+            name="bg",
+            tier="standard",
+            origin={
+                "channel": "feishu",
+                "chat_id": "c1",
+                "metadata": {"workspace_runtime": {"main_agent_route": "tokenx"}},
+            },
         )
+        resolution = mgr.resource_manager.resolve_spawn_request(request)
 
-        assert resolution.reason == "compatibility_tier:standard->worker"
+        assert request.subagent_type == "worker"
+        assert request.compatibility_tier == "standard"
+        assert resolution.reason == "builtin_type:worker"
         assert resolution.requested_type == "worker"
         assert resolution.candidate_chain[0] == "standard-gpt-5.4-mini-xhigh-tokenx"
 
@@ -2096,8 +2121,8 @@ class TestSubagentCancellation:
         )
         resource_manager = MagicMock()
         resource_manager.resolve_spawn_request.return_value = MagicMock(
-            reason="compatibility_tier:standard",
-            requested_type=None,
+            reason="builtin_type:worker",
+            requested_type="worker",
             requested_model=None,
             preferred_route=None,
             candidate_chain=("m1",),
@@ -2142,8 +2167,8 @@ class TestSubagentCancellation:
         )
         resource_manager = MagicMock()
         resource_manager.resolve_spawn_request.return_value = MagicMock(
-            reason="compatibility_tier:standard",
-            requested_type=None,
+            reason="builtin_type:worker",
+            requested_type="worker",
             requested_model=None,
             preferred_route=None,
             candidate_chain=("m1",),
@@ -2189,8 +2214,8 @@ class TestSubagentCancellation:
         )
         resource_manager = MagicMock()
         resource_manager.resolve_spawn_request.return_value = MagicMock(
-            reason="compatibility_tier:standard",
-            requested_type=None,
+            reason="builtin_type:worker",
+            requested_type="worker",
             requested_model=None,
             preferred_route=None,
             candidate_chain=("m1",),

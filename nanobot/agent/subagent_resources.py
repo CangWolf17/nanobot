@@ -370,38 +370,22 @@ class SubagentResourceManager:
                 effort=spec.effort,
                 preferred_route=preferred_route,
             )
-            if not candidates:
+            if candidates:
+                return SubagentResolution(
+                    requested_name=requested_name,
+                    requested_type=requested_type,
+                    requested_model=requested_model,
+                    preferred_route=preferred_route,
+                    candidate_chain=tuple(candidates),
+                    resolved_model_id=candidates[0],
+                    reason=f"builtin_type:{spec.name}",
+                )
+            if not compatibility_tier:
                 raise ValueError(
                     f"no candidates for subagent type {requested_type} ({spec.family}/{spec.effort})"
                 )
-            return SubagentResolution(
-                requested_name=requested_name,
-                requested_type=requested_type,
-                requested_model=requested_model,
-                preferred_route=preferred_route,
-                candidate_chain=tuple(candidates),
-                resolved_model_id=candidates[0],
-                reason=f"builtin_type:{spec.name}",
-            )
 
         if compatibility_tier:
-            if compatibility_tier == "standard":
-                worker_spec = get_subagent_type_spec("worker")
-                worker_candidates = self.list_type_candidates(
-                    family=worker_spec.family,
-                    effort=worker_spec.effort,
-                    preferred_route=preferred_route,
-                )
-                if worker_candidates and self.has_eligible_candidates(worker_candidates):
-                    return SubagentResolution(
-                        requested_name=requested_name,
-                        requested_type="worker",
-                        requested_model=requested_model,
-                        preferred_route=preferred_route,
-                        candidate_chain=tuple(worker_candidates),
-                        resolved_model_id=worker_candidates[0],
-                        reason="compatibility_tier:standard->worker",
-                    )
             manager_request = self.default_request(tier=compatibility_tier)
             candidates = self._resolve_candidates(manager_request)
             if not candidates:
