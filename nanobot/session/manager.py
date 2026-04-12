@@ -132,6 +132,8 @@ class SessionManager:
     Sessions are stored as JSONL files in the sessions directory.
     """
 
+    _MIGRATED_GLOB = "sessions.migrated*"
+
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
@@ -147,6 +149,39 @@ class SessionManager:
         """Legacy global session path (~/.nanobot/sessions/)."""
         safe_key = safe_filename(key.replace(":", "_"))
         return self.legacy_sessions_dir / f"{safe_key}.jsonl"
+
+    def _iter_migrated_session_dirs(self) -> list[Path]:
+        return sorted(
+            [path for path in self.workspace.glob(self._MIGRATED_GLOB) if path.is_dir()],
+            key=lambda path: path.name,
+        )
+
+    def _recover_misarchived_session(self, key: str, destination: Path) -> bool:
+        if destination.exists():
+            return False
+        filename = destination.name
+        candidates = [
+            directory / filename
+            for directory in self._iter_migrated_session_dirs()
+            if (directory / filename).exists()
+        ]
+        if len(candidates) != 1:
+            if len(candidates) > 1:
+                logger.warning(
+                    "Refusing to auto-recover session {} because {} archived copies exist",
+                    key,
+                    len(candidates),
+                )
+            return False
+        source = candidates[0]
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            logger.warning("Recovered misarchived session {} from {}", key, source)
+            return True
+        except Exception:
+            logger.exception("Failed to recover misarchived session {} from {}", key, source)
+            return False
 
     def get_or_create(self, key: str) -> Session:
         """
@@ -179,6 +214,8 @@ class SessionManager:
                     logger.info("Migrated session {} from legacy path", key)
                 except Exception:
                     logger.exception("Failed to migrate session {}", key)
+            else:
+                self._recover_misarchived_session(key, path)
 
         if not path.exists():
             return None

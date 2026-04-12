@@ -169,6 +169,22 @@ class TestSessionPersistence:
         assert history[0]["content"] == "msg20"
         assert history[-1]["content"] == "msg29"
 
+    def test_load_recovers_unique_misarchived_workspace_session(self, temp_manager, tmp_path):
+        archived = Path(tmp_path) / "sessions.migrated.2"
+        archived.mkdir(parents=True)
+        archived_file = archived / "feishu_chat.jsonl"
+        archived_file.write_text(
+            '{"_type":"metadata","key":"feishu:chat","created_at":"2026-04-12T00:00:00","updated_at":"2026-04-12T00:00:01","metadata":{},"last_consolidated":0}\n'
+            '{"role":"user","content":"hello"}\n',
+            encoding="utf-8",
+        )
+
+        session = temp_manager.get_or_create("feishu:chat")
+
+        assert session.messages[-1]["content"] == "hello"
+        assert (Path(tmp_path) / "sessions" / "feishu_chat.jsonl").exists()
+        assert not archived_file.exists()
+
     def test_clear_resets_session(self, temp_manager):
         """Test that clear() properly resets session."""
         session = create_session_with_messages("test:clear", 10)
