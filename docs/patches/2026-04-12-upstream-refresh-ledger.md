@@ -66,6 +66,7 @@ These remain useful for intent/history, but they are not the current operational
 ### Current truth docs
 
 - this ledger
+- `docs/patches/2026-04-12-donor-branch-triage.md`
 - `docs/patches/2026-04-02-self-use-runtime-patch-playbook.md`
 - `docs/patches/2026-04-03-runtime-control-plane-followups.md`
 - `docs/patches/2026-04-11-runtime-subagent-v3-cleanup-execution-plan.md`
@@ -121,6 +122,6 @@ Observed: `38 passed, 55 deselected in 4.20s`
 
 ## Follow-up Work
 
-1. decide whether the two `runtime-model-subagent-*` donor branches still contain value worth replaying on top of the refreshed mainline
+1. if later work revives the `runtime-model-subagent-*` ideas, replay them selectively using `docs/patches/2026-04-12-donor-branch-triage.md` instead of merging the donor branches wholesale
 2. if the refresh branch stays stable, promote it and archive superseded historical branches
 3. revisit the local `.venv` provisioning path so refresh verification does not depend on ad hoc dependency repair
