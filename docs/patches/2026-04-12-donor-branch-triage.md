@@ -10,6 +10,8 @@ Do **not** auto-merge the remaining `runtime-model-subagent-*` branches into the
 
 Treat them as **historical donor branches** that require selective replay only if a later task explicitly revives their design goals.
 
+Commit-level screening is recorded in `docs/patches/2026-04-12-donor-commit-screen.md`.
+
 ## Branch-by-Branch Outcome
 
 ### `runtime-model-subagent-refactor`
