@@ -69,6 +69,7 @@ These remain useful for intent/history, but they are not the current operational
 - `docs/patches/2026-04-12-donor-branch-triage.md`
 - `docs/patches/2026-04-12-donor-commit-screen.md`
 - `docs/patches/2026-04-12-refresh-cleanup-backlog.md`
+- `docs/patches/2026-04-12-patch-reality-map.md`
 - `docs/patches/2026-04-02-self-use-runtime-patch-playbook.md`
 - `docs/patches/2026-04-03-runtime-control-plane-followups.md`
 - `docs/patches/2026-04-11-runtime-subagent-v3-cleanup-execution-plan.md`
