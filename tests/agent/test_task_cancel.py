@@ -1455,6 +1455,163 @@ class TestSubagentCancellation:
         assert provider.generation.reasoning_effort == "high"
 
     @pytest.mark.asyncio
+    async def test_run_subagent_falls_back_to_next_candidate_after_provider_error_before_any_tools(
+        self, monkeypatch, tmp_path
+    ):
+        from nanobot.agent.runner import AgentRunResult
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import AcquireDecision, SubagentLease, SubagentResolution
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "parent-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus, model="parent-model")
+        mgr._announce_result = AsyncMock()
+
+        lease_primary = SubagentLease(
+            model_id="m1",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+        lease_fallback = SubagentLease(
+            model_id="m2",
+            tier="standard",
+            route="tokenx",
+            effort="high",
+        )
+        resolution = SubagentResolution(
+            requested_name="bg",
+            requested_type="worker",
+            requested_model=None,
+            preferred_route="aizhiwen-top",
+            candidate_chain=("m1", "m2"),
+            resolved_model_id="m1",
+            reason="builtin_type:worker",
+        )
+
+        resource_manager = MagicMock()
+        resource_manager.acquire_candidates.return_value = AcquireDecision(status="granted", lease=lease_fallback)
+        resource_manager.release = MagicMock()
+        mgr.resource_manager = resource_manager
+
+        monkeypatch.setattr(
+            mgr,
+            "_build_provider_for_lease",
+            lambda lease: (MagicMock(), lease.model_id),
+        )
+
+        calls: list[str] = []
+
+        async def fake_run(self, spec):
+            calls.append(spec.model)
+            if spec.model == "m1":
+                return AgentRunResult(
+                    final_content=None,
+                    messages=[],
+                    tools_used=[],
+                    usage={},
+                    stop_reason="error",
+                    error="quota exceeded",
+                )
+            return AgentRunResult(
+                final_content="done via fallback",
+                messages=[],
+                tools_used=[],
+                usage={},
+            )
+
+        monkeypatch.setattr("nanobot.agent.subagent.AgentRunner.run", fake_run)
+
+        await mgr._run_subagent(
+            "sub-1",
+            "do task",
+            "label",
+            {"channel": "test", "chat_id": "c1"},
+            lease_primary,
+            resolution,
+        )
+
+        assert calls == ["m1", "m2"]
+        resource_manager.acquire_candidates.assert_called_once_with(["m2"])
+        resource_manager.release.assert_any_call(lease_primary)
+        resource_manager.release.assert_any_call(lease_fallback)
+        args = mgr._announce_result.await_args.args
+        assert args[3] == "done via fallback"
+        assert args[5] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_does_not_fallback_after_tool_side_effects(self, monkeypatch, tmp_path):
+        from nanobot.agent.runner import AgentRunResult
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.agent.subagent_resources import AcquireDecision, SubagentLease, SubagentResolution
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "parent-model"
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus, model="parent-model")
+        mgr._announce_result = AsyncMock()
+
+        lease_primary = SubagentLease(
+            model_id="m1",
+            tier="standard",
+            route="aizhiwen-top",
+            effort="high",
+        )
+        resolution = SubagentResolution(
+            requested_name="bg",
+            requested_type="worker",
+            requested_model=None,
+            preferred_route="aizhiwen-top",
+            candidate_chain=("m1", "m2"),
+            resolved_model_id="m1",
+            reason="builtin_type:worker",
+        )
+
+        resource_manager = MagicMock()
+        resource_manager.acquire_candidates.return_value = AcquireDecision(
+            status="granted",
+            lease=SubagentLease(model_id="m2", tier="standard", route="tokenx", effort="high"),
+        )
+        resource_manager.release = MagicMock()
+        mgr.resource_manager = resource_manager
+
+        monkeypatch.setattr(
+            mgr,
+            "_build_provider_for_lease",
+            lambda lease: (MagicMock(), lease.model_id),
+        )
+
+        async def fake_run(self, spec):
+            return AgentRunResult(
+                final_content=None,
+                messages=[],
+                tools_used=["write_file"],
+                usage={},
+                stop_reason="error",
+                error="quota exceeded",
+                tool_events=[{"name": "write_file", "status": "ok", "detail": "updated file"}],
+            )
+
+        monkeypatch.setattr("nanobot.agent.subagent.AgentRunner.run", fake_run)
+
+        await mgr._run_subagent(
+            "sub-1",
+            "do task",
+            "label",
+            {"channel": "test", "chat_id": "c1"},
+            lease_primary,
+            resolution,
+        )
+
+        resource_manager.acquire_candidates.assert_not_called()
+        args = mgr._announce_result.await_args.args
+        assert "quota exceeded" in args[3]
+        assert args[5] == "error"
+
+    @pytest.mark.asyncio
     async def test_run_subagent_records_hard_provider_failure_and_shrinks_current_candidate_pool(
         self, tmp_path
     ):

@@ -383,6 +383,18 @@ def test_classify_provider_failure_distinguishes_transient_from_hard_unavailable
 
 
 
+def test_classify_provider_failure_treats_daily_limit_exceeded_as_quota_exhausted():
+    from nanobot.agent.subagent_resources import classify_provider_failure
+
+    status = classify_provider_failure(
+        '{"code":"USAGE_LIMIT_EXCEEDED","message":"error: code=429 reason="DAILY_LIMIT_EXCEEDED" message="daily usage limit exceeded" metadata=map[]"}'
+    )
+
+    assert status.availability == "hard_unavailable"
+    assert status.reason == "quota_exhausted"
+
+
+
 def test_acquire_candidates_grants_direct_fallback_for_unregistered_model():
     manager = _manager()
 

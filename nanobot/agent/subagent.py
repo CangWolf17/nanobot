@@ -215,6 +215,7 @@ class SubagentManager:
             origin=origin,
             lease=lease,
             session_key=session_key,
+            resolution=resolution,
         )
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
         return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
@@ -228,9 +229,10 @@ class SubagentManager:
         origin: dict[str, Any],
         lease: SubagentLease | None,
         session_key: str | None,
+        resolution: SubagentResolution | None = None,
     ) -> None:
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, label, origin, lease)
+            self._run_subagent(task_id, task, label, origin, lease, resolution)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -301,6 +303,7 @@ class SubagentManager:
                     origin=pending.origin,
                     lease=decision.lease,
                     session_key=pending.session_key,
+                    resolution=resolution,
                 )
                 logger.info(
                     "Drained queued subagent [{}]: label={} remaining_pending={}",
@@ -316,9 +319,12 @@ class SubagentManager:
         label: str,
         origin: dict[str, Any],
         lease: SubagentLease | None = None,
+        resolution: SubagentResolution | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        current_lease = lease
+        current_resolution = resolution
 
         try:
             tools = self._build_subagent_tools(task_id=task_id, origin=origin)
@@ -340,98 +346,161 @@ class SubagentManager:
                             args_str,
                         )
 
-            run_model = self.model
-            run_runner = self.runner
-            if lease is not None:
-                logger.info(
-                    "Subagent [{}] using leased model={} route={} effort={}",
-                    task_id,
-                    lease.model_id,
-                    lease.route,
-                    lease.effort,
-                )
-                leased_provider, leased_model = self._build_provider_for_lease(lease)
-                run_model = leased_model
-                run_runner = self.runner if leased_provider is self.provider else AgentRunner(leased_provider)
-            result = await run_runner.run(
-                AgentRunSpec(
-                    initial_messages=messages,
-                    tools=tools,
-                    model=run_model,
-                    max_iterations=15,
-                    hook=_SubagentHook(),
-                    max_iterations_message="Task completed but no final response was generated.",
-                    error_message=None,
-                    fail_on_tool_error=True,
-                    concurrent_tools=not should_disable_concurrent_tools(self.workspace),
-                )
-            )
-            if result.stop_reason == "tool_error":
-                await self._announce_result(
-                    task_id,
-                    label,
-                    task,
-                    self._format_partial_progress(result),
-                    origin,
-                    "error",
-                )
-                return
-            if result.stop_reason == "error":
-                if lease is not None and self.resource_manager is not None:
-                    apply_provider_failure_to_manager(
-                        self.resource_manager,
-                        route=lease.route,
-                        error_text=result.error,
-                    )
-                    record_provider_failure(
-                        workspace=self.workspace,
-                        route=lease.route,
-                        error_text=result.error,
-                    )
-                    probe = self.provider_probe(self.workspace, ref=lease.model_id)
-                    if isinstance(probe, dict) and bool(probe.get("ok")):
-                        probed_route = apply_provider_probe_result(
-                            workspace=self.workspace,
-                            probe=probe,
-                        )
-                        if probed_route == lease.route:
-                            refresh_provider_in_manager(self.resource_manager, route=lease.route)
-                await self._announce_result(
-                    task_id,
-                    label,
-                    task,
-                    result.error or "Error: subagent execution failed.",
-                    origin,
-                    "error",
-                )
-                return
-            final_result = result.final_content or "Task completed but no final response was generated."
-            if lease is not None and self.resource_manager is not None:
-                refresh_provider_in_manager(self.resource_manager, route=lease.route)
-                refresh_provider_status(workspace=self.workspace, route=lease.route)
+            attempted_models: set[str] = set()
 
-            logger.info("Subagent [{}] completed successfully", task_id)
-            await self._announce_result(task_id, label, task, final_result, origin, "ok")
+            while True:
+                run_model = self.model
+                run_runner = self.runner
+                if current_lease is not None:
+                    attempted_models.add(current_lease.model_id)
+                    logger.info(
+                        "Subagent [{}] using leased model={} route={} effort={}",
+                        task_id,
+                        current_lease.model_id,
+                        current_lease.route,
+                        current_lease.effort,
+                    )
+                    leased_provider, leased_model = self._build_provider_for_lease(current_lease)
+                    run_model = leased_model
+                    run_runner = self.runner if leased_provider is self.provider else AgentRunner(leased_provider)
+                result = await run_runner.run(
+                    AgentRunSpec(
+                        initial_messages=messages,
+                        tools=tools,
+                        model=run_model,
+                        max_iterations=15,
+                        hook=_SubagentHook(),
+                        max_iterations_message="Task completed but no final response was generated.",
+                        error_message=None,
+                        fail_on_tool_error=True,
+                        concurrent_tools=not should_disable_concurrent_tools(self.workspace),
+                    )
+                )
+                if result.stop_reason == "tool_error":
+                    await self._announce_result(
+                        task_id,
+                        label,
+                        task,
+                        self._format_partial_progress(result),
+                        origin,
+                        "error",
+                    )
+                    return
+                if result.stop_reason == "error":
+                    if current_lease is not None and self.resource_manager is not None:
+                        apply_provider_failure_to_manager(
+                            self.resource_manager,
+                            route=current_lease.route,
+                            error_text=result.error,
+                        )
+                        record_provider_failure(
+                            workspace=self.workspace,
+                            route=current_lease.route,
+                            error_text=result.error,
+                        )
+                        probe = self.provider_probe(self.workspace, ref=current_lease.model_id)
+                        if isinstance(probe, dict) and bool(probe.get("ok")):
+                            probed_route = apply_provider_probe_result(
+                                workspace=self.workspace,
+                                probe=probe,
+                            )
+                            if probed_route == current_lease.route:
+                                refresh_provider_in_manager(self.resource_manager, route=current_lease.route)
+                    fallback_lease = self._acquire_fallback_lease(
+                        current_lease=current_lease,
+                        resolution=current_resolution,
+                        attempted_models=attempted_models,
+                        result=result,
+                    )
+                    if fallback_lease is not None:
+                        if current_lease is not None and self.resource_manager is not None:
+                            self.resource_manager.release(current_lease)
+                        current_lease = fallback_lease
+                        continue
+                    await self._announce_result(
+                        task_id,
+                        label,
+                        task,
+                        result.error or "Error: subagent execution failed.",
+                        origin,
+                        "error",
+                    )
+                    return
+                final_result = result.final_content or "Task completed but no final response was generated."
+                if current_lease is not None and self.resource_manager is not None:
+                    refresh_provider_in_manager(self.resource_manager, route=current_lease.route)
+                    refresh_provider_status(workspace=self.workspace, route=current_lease.route)
+
+                logger.info("Subagent [{}] completed successfully", task_id)
+                await self._announce_result(task_id, label, task, final_result, origin, "ok")
+                return
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
-            if lease is not None and self.resource_manager is not None:
+            if current_lease is not None and self.resource_manager is not None:
                 apply_provider_failure_to_manager(
                     self.resource_manager,
-                    route=lease.route,
+                    route=current_lease.route,
                     error_text=error_msg,
                 )
                 record_provider_failure(
                     workspace=self.workspace,
-                    route=lease.route,
+                    route=current_lease.route,
                     error_text=error_msg,
                 )
             logger.error("Subagent [{}] failed: {}", task_id, e)
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
         finally:
-            if lease is not None and self.resource_manager is not None:
-                self.resource_manager.release(lease)
+            if current_lease is not None and self.resource_manager is not None:
+                self.resource_manager.release(current_lease)
             await self._drain_pending_queue()
+
+    @staticmethod
+    def _can_retry_with_fallback(result) -> bool:
+        if result is None:
+            return False
+        if result.stop_reason != "error":
+            return False
+        if result.tools_used:
+            return False
+        if result.tool_events:
+            return False
+        return True
+
+    def _acquire_fallback_lease(
+        self,
+        *,
+        current_lease: SubagentLease | None,
+        resolution: SubagentResolution | None,
+        attempted_models: set[str],
+        result,
+    ) -> SubagentLease | None:
+        if self.resource_manager is None or current_lease is None or resolution is None:
+            return None
+        if not self._can_retry_with_fallback(result):
+            return None
+        remaining = [
+            model_id
+            for model_id in resolution.candidate_chain
+            if model_id and model_id != current_lease.model_id and model_id not in attempted_models
+        ]
+        if not remaining:
+            return None
+        decision = self.resource_manager.acquire_candidates(list(remaining))
+        if decision.status != "granted" or decision.lease is None:
+            logger.info(
+                "Subagent fallback skipped: current_model={} reason={} candidates={}",
+                current_lease.model_id,
+                decision.reason or decision.status,
+                remaining,
+            )
+            return None
+        logger.warning(
+            "Subagent provider fallback: {} -> {} after error before tool execution",
+            current_lease.model_id,
+            decision.lease.model_id,
+        )
+        return decision.lease
 
     def _build_subagent_tools(self, *, task_id: str, origin: dict[str, Any]) -> ToolRegistry:
         tools = ToolRegistry()
