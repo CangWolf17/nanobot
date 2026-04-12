@@ -703,7 +703,7 @@ class TestSubagentCancellation:
         provider.get_default_model.return_value = "test-model"
 
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
-        mgr.spawn = AsyncMock()
+        mgr._run_subagent = AsyncMock()
 
         spawn_tool = SpawnTool(manager=mgr)
         spawn_tool.set_context(
@@ -729,7 +729,8 @@ class TestSubagentCancellation:
 
         assert "blocked" in result.lower()
         assert "subagent_allowed=false" in result
-        mgr.spawn.assert_not_awaited()
+        mgr._run_subagent.assert_not_awaited()
+        assert mgr._running_tasks == {}
 
     @pytest.mark.asyncio
     async def test_spawn_acquires_resource_lease_before_starting_background_task(
@@ -791,7 +792,7 @@ class TestSubagentCancellation:
         assert kwargs["name"] == "bg-worker"
         assert kwargs["subagent_type"] == "worker"
 
-    def test_spawn_tool_accepts_name_type_tier_and_model_parameters(self):
+    def test_spawn_tool_exposes_canonical_name_type_and_model_parameters(self):
         from nanobot.agent.tools.spawn import SpawnTool
 
         mgr = MagicMock()
@@ -801,11 +802,11 @@ class TestSubagentCancellation:
         assert "name" in props
         assert "type" in props
         assert props["type"]["enum"] == ["worker", "explorer"]
-        assert "tier" in props
-        assert props["tier"]["enum"] == ["lite", "standard"]
         assert "model" in props
+        assert "label" not in props
+        assert "tier" not in props
         assert "Preferred call shapes" in tool.description
-        assert "label/tier are deprecated" in tool.description
+        assert "Legacy label/tier inputs" in tool.description
 
     @pytest.mark.asyncio
     async def test_spawn_tool_rejects_calls_without_type_model_or_tier(self):
@@ -1282,14 +1283,15 @@ class TestSubagentCancellation:
             None,
         )
 
+        system_message = captured["messages"][0]["content"]
         user_message = captured["messages"][1]["content"]
-        assert "## Subagent Execution Context" in user_message
-        assert "### Project Context" in user_message
-        assert "har_0024" in user_message
-        assert "Inspect scripts/subagent.py and report the wiring gap." in user_message
+        assert "## Subagent Execution Context" in system_message
+        assert "### Project Context" in system_message
+        assert "har_0024" in system_message
+        assert user_message == "Inspect scripts/subagent.py and report the wiring gap."
 
     @pytest.mark.asyncio
-    async def test_run_subagent_keeps_manual_task_text_as_additive_override(
+    async def test_run_subagent_keeps_manual_task_text_without_context_duplication(
         self, monkeypatch, tmp_path
     ):
         from nanobot.agent.runner import AgentRunner, AgentRunResult
@@ -1319,8 +1321,7 @@ class TestSubagentCancellation:
         )
 
         user_message = captured["messages"][1]["content"]
-        assert "## Subagent Execution Context" in user_message
-        assert "Extra caller note: focus only on spawn metadata passthrough." in user_message
+        assert user_message == "Extra caller note: focus only on spawn metadata passthrough."
 
     @pytest.mark.asyncio
     async def test_run_subagent_rebuilds_provider_from_lease_and_uses_provider_model(
@@ -2197,7 +2198,7 @@ class TestSubagentCancellation:
         resource_manager.acquire_candidates.return_value = AcquireDecision(status="granted", lease=lease)
         resource_manager.release = MagicMock()
         mgr.resource_manager = resource_manager
-        
+
         started = asyncio.Event()
         cancelled = asyncio.Event()
 

@@ -61,7 +61,7 @@ class SpawnTool(Tool):
             "Preferred call shapes: (task + type) or (task + model). "
             "Use type=worker for implementation/execution and type=explorer for reconnaissance/search. "
             "Do not omit both type and model. "
-            "label/tier are deprecated compatibility inputs only. "
+            "Legacy label/tier inputs are still accepted for compatibility, but they are not part of the preferred surface. "
             "For deliverables or existing projects, inspect the workspace first "
             "and use a dedicated subdirectory when helpful."
         )
@@ -84,15 +84,6 @@ class SpawnTool(Tool):
                     "enum": list(list_builtin_subagent_types()),
                     "description": "Built-in runtime subagent type. Prefer this for default behavior: worker=execution/implementation, explorer=exploration/recon.",
                 },
-                "label": {
-                    "type": "string",
-                    "description": "Deprecated compatibility alias of `name`. Avoid in new calls.",
-                },
-                "tier": {
-                    "type": "string",
-                    "enum": ["lite", "standard"],
-                    "description": "Deprecated compatibility hint only. Use `type` or `model` for new calls.",
-                },
                 "model": {
                     "type": "string",
                     "description": "Optional explicit registry model ref. Overrides built-in type/default routing when provided.",
@@ -106,24 +97,12 @@ class SpawnTool(Tool):
         task: str,
         name: str | None = None,
         type: str | None = None,
-        label: str | None = None,
-        tier: str | None = None,
         model: str | None = None,
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
-        runtime_meta = self._metadata.get("workspace_runtime")
-        if self._metadata.get("workspace_agent_cmd") == "harness" and isinstance(
-            runtime_meta, dict
-        ):
-            active_harness = runtime_meta.get("active_harness")
-            if isinstance(active_harness, dict) and not bool(
-                active_harness.get("subagent_allowed", False)
-            ):
-                return (
-                    "Error: spawn blocked by harness policy "
-                    "(subagent_allowed=false for active harness)."
-                )
+        label = kwargs.get("label")
+        tier = kwargs.get("tier")
         return await self._manager.spawn(
             task=task,
             name=name,

@@ -16,7 +16,7 @@ from nanobot.agent.policy.dev_discipline import (
     format_dev_discipline_block,
     should_disable_concurrent_tools,
 )
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent_policy import (
     SubagentRunContext,
@@ -49,7 +49,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import ExecToolConfig
+from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 from nanobot.providers.base import GenerationSettings, LLMProvider
 
 
@@ -144,7 +144,6 @@ class SubagentManager:
         }
 
         authorized, auth_reason = self._authorize_spawn_request(
-            task_id=task_id,
             requested_type=subagent_type,
             requested_model=model,
             origin=origin,
@@ -527,7 +526,6 @@ class SubagentManager:
         tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         tools.register(WebFetchTool(proxy=self.web_proxy))
 
-        runtime_meta = self._runtime_metadata_from_origin(origin)
         run_context, tool_policy = self._resolve_subagent_policy(origin)
 
         if tool_policy.allow_message:
@@ -626,7 +624,7 @@ class SubagentManager:
     def _authorize_spawn_request(
         self,
         *,
-        task_id: str,
+        task_id: str | None = None,
         requested_type: str | None,
         requested_model: str | None,
         origin: dict[str, Any],
@@ -786,12 +784,7 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
         return "\n\n".join(parts)
 
     def _build_subagent_task_payload(self, *, task: str, origin: dict[str, Any] | None = None) -> str:
-        injected = self._build_subagent_execution_context(origin)
         task_text = str(task or "").strip()
-        if injected and task_text:
-            return f"{injected}\n\n## Assigned Task\n{task_text}"
-        if injected:
-            return injected
         return task_text
 
     @staticmethod
