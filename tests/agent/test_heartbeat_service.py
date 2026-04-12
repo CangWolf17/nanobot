@@ -23,6 +23,27 @@ class DummyProvider(LLMProvider):
 
 
 @pytest.mark.asyncio
+async def test_tick_runs_maintenance_even_without_heartbeat_file(tmp_path) -> None:
+    provider = DummyProvider([])
+    calls: list[str] = []
+
+    async def _maintenance() -> None:
+        calls.append("ran")
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+        on_maintenance=_maintenance,
+    )
+
+    await service._tick()
+
+    assert calls == ["ran"]
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_start_is_idempotent(tmp_path) -> None:
     provider = DummyProvider([])
 
@@ -110,8 +131,11 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
         )
     ])
 
+    called_with: list[str] = []
+
     async def _on_execute(tasks: str) -> str:
-        return tasks
+        called_with.append(tasks)
+        return "done"
 
     service = HeartbeatService(
         workspace=tmp_path,
@@ -121,6 +145,7 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
     )
 
     assert await service.trigger_now() is None
+    assert called_with == []
 
 
 @pytest.mark.asyncio

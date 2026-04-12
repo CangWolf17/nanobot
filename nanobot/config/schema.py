@@ -133,20 +133,21 @@ class ProvidersConfig(Base):
     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
 
 
+class StartupNotifyConfig(Base):
+    """Optional startup online-notice target."""
+
+    enabled: bool = False
+    channel: str = ""
+    chat_id: str = ""
+
+
 class HeartbeatConfig(Base):
     """Heartbeat service configuration."""
 
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
     keep_recent_messages: int = 8
-
-
-class ApiConfig(Base):
-    """OpenAI-compatible API server configuration."""
-
-    host: str = "127.0.0.1"  # Safer default: local-only bind.
-    port: int = 8900
-    timeout: float = 120.0  # Per-request timeout in seconds.
+    startup_notify: StartupNotifyConfig = Field(default_factory=StartupNotifyConfig)
 
 
 class GatewayConfig(Base):
@@ -198,6 +199,20 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
 
+
+class MemoryConsolidationConfig(Base):
+    """Memory consolidation runtime controls."""
+
+    enabled: bool = True
+    compact_state_enabled: bool = True
+    compact_state_model: str = ""
+    compact_state_max_chars: int = 4000
+    pre_reply_timeout_seconds: float = 8.0
+    background_timeout_seconds: float = 20.0
+    recent_history_fallback_messages: int = 80
+    model: str = ""  # Optional dedicated consolidation model. Current special route only supports minimax/...
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -214,9 +229,9 @@ class Config(BaseSettings):
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
-    api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    memory: MemoryConsolidationConfig = Field(default_factory=MemoryConsolidationConfig)
 
     @property
     def workspace_path(self) -> Path:

@@ -317,7 +317,7 @@ async def test_multimodal_content_extracts_text(aiohttp_client, mock_agent) -> N
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
-async def test_empty_response_retry_then_success(aiohttp_client) -> None:
+async def test_empty_response_uses_unified_fallback(aiohttp_client) -> None:
     call_count = 0
 
     async def sometimes_empty(content, session_key="", channel="", chat_id=""):
@@ -340,15 +340,13 @@ async def test_empty_response_retry_then_success(aiohttp_client) -> None:
     )
     assert resp.status == 200
     body = await resp.json()
-    assert body["choices"][0]["message"]["content"] == "recovered response"
-    assert call_count == 2
+    assert body["choices"][0]["message"]["content"] == "模型返回了空响应。请稍后重试，或切换模型。"
+    assert call_count == 1
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
 async def test_empty_response_falls_back(aiohttp_client) -> None:
-    from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
-
     call_count = 0
 
     async def always_empty(content, session_key="", channel="", chat_id=""):
@@ -369,5 +367,5 @@ async def test_empty_response_falls_back(aiohttp_client) -> None:
     )
     assert resp.status == 200
     body = await resp.json()
-    assert body["choices"][0]["message"]["content"] == EMPTY_FINAL_RESPONSE_MESSAGE
-    assert call_count == 2
+    assert body["choices"][0]["message"]["content"] == "模型返回了空响应。请稍后重试，或切换模型。"
+    assert call_count == 1

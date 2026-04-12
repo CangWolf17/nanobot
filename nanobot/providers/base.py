@@ -14,6 +14,8 @@ from loguru import logger
 
 from nanobot.utils.helpers import image_placeholder_text
 
+EMPTY_MODEL_RESPONSE_ERROR = "empty model response"
+
 
 @dataclass
 class ToolCallRequest:
@@ -80,13 +82,18 @@ class GenerationSettings:
 class LLMProvider(ABC):
     """Base class for LLM providers."""
 
-    _CHAT_RETRY_DELAYS = (1, 2, 4)
-    _PERSISTENT_MAX_DELAY = 60
+    _CHAT_RETRY_DELAYS = (1, 2, 4, 8, 10)
+    _PERSISTENT_MAX_DELAY = 4
     _PERSISTENT_IDENTICAL_ERROR_LIMIT = 10
     _RETRY_HEARTBEAT_CHUNK = 30
     _TRANSIENT_ERROR_MARKERS = (
         "429",
         "rate limit",
+        "rate_limit",
+        "rate_limit_error",
+        "too many requests",
+        "too many pending requests",
+        "pending requests",
         "500",
         "502",
         "503",
@@ -138,6 +145,8 @@ class LLMProvider(ABC):
         "rate limit",
         "rate_limit",
         "too many requests",
+        "too many pending requests",
+        "pending requests",
         "retry after",
         "try again in",
         "temporarily unavailable",
@@ -278,6 +287,34 @@ class LLMProvider(ABC):
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
+
+    @staticmethod
+    def _classify_response_error(response: LLMResponse) -> str | None:
+        if response.finish_reason == "error":
+            return response.content or "Error calling LLM"
+        if response.has_tool_calls:
+            return None
+        if isinstance(response.content, str) and response.content.strip():
+            return None
+        return EMPTY_MODEL_RESPONSE_ERROR
+
+    @staticmethod
+    def _as_error_response(response: LLMResponse, error: str) -> LLMResponse:
+        return LLMResponse(
+            content=error,
+            tool_calls=list(response.tool_calls),
+            finish_reason="error",
+            usage=dict(response.usage),
+            retry_after=response.retry_after,
+            reasoning_content=response.reasoning_content,
+            thinking_blocks=response.thinking_blocks,
+            error_status_code=response.error_status_code,
+            error_kind=response.error_kind,
+            error_type=response.error_type,
+            error_code=response.error_code,
+            error_retry_after_s=response.error_retry_after_s,
+            error_should_retry=response.error_should_retry,
+        )
 
     @classmethod
     def _is_transient_response(cls, response: LLMResponse) -> bool:
@@ -496,6 +533,7 @@ class LLMProvider(ABC):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        on_retry: Callable[..., Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Call chat_stream() with retry on transient provider failures."""
         if max_tokens is self._SENTINEL:
@@ -509,14 +547,31 @@ class LLMProvider(ABC):
             messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
-            on_content_delta=on_content_delta,
         )
+        async def _call_stream_buffered(**call_kw: Any) -> LLMResponse:
+            buffered_deltas: list[str] = []
+
+            async def _buffer_delta(delta: str) -> None:
+                buffered_deltas.append(delta)
+
+            response = await self._safe_chat_stream(
+                **{
+                    **call_kw,
+                    "on_content_delta": _buffer_delta,
+                }
+            )
+            if self._classify_response_error(response) is None and on_content_delta:
+                for delta in buffered_deltas:
+                    await on_content_delta(delta)
+            return response
+
         return await self._run_with_retry(
-            self._safe_chat_stream,
+            _call_stream_buffered,
             kw,
             messages,
             retry_mode=retry_mode,
             on_retry_wait=on_retry_wait,
+            on_retry=on_retry,
         )
 
     async def chat_with_retry(
@@ -530,6 +585,7 @@ class LLMProvider(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        on_retry: Callable[..., Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures.
 
@@ -555,6 +611,7 @@ class LLMProvider(ABC):
             messages,
             retry_mode=retry_mode,
             on_retry_wait=on_retry_wait,
+            on_retry=on_retry,
         )
 
     @classmethod
@@ -662,6 +719,7 @@ class LLMProvider(ABC):
         *,
         retry_mode: str,
         on_retry_wait: Callable[[str], Awaitable[None]] | None,
+        on_retry: Callable[..., Awaitable[None]] | None,
     ) -> LLMResponse:
         attempt = 0
         delays = list(self._CHAT_RETRY_DELAYS)
@@ -672,17 +730,18 @@ class LLMProvider(ABC):
         while True:
             attempt += 1
             response = await call(**kw)
-            if response.finish_reason != "error":
+            error = self._classify_response_error(response)
+            if error is None:
                 return response
             last_response = response
-            error_key = ((response.content or "").strip().lower() or None)
+            error_key = (error.strip().lower() or None)
             if error_key and error_key == last_error_key:
                 identical_error_count += 1
             else:
                 last_error_key = error_key
                 identical_error_count = 1 if error_key else 0
 
-            if not self._is_transient_response(response):
+            if error != EMPTY_MODEL_RESPONSE_ERROR and not self._is_transient_response(response):
                 stripped = self._strip_image_content(original_messages)
                 if stripped is not None and stripped != kw["messages"]:
                     logger.warning(
@@ -691,12 +750,12 @@ class LLMProvider(ABC):
                     retry_kw = dict(kw)
                     retry_kw["messages"] = stripped
                     result = await call(**retry_kw)
-                    # Permanently strip images from the original messages so
-                    # subsequent iterations do not repeat the error-retry cycle.
-                    if result.finish_reason != "error":
+                    stripped_error = self._classify_response_error(result)
+                    if stripped_error is None:
                         self._strip_image_content_inplace(original_messages)
-                    return result
-                return response
+                        return result
+                    return self._as_error_response(result, stripped_error)
+                return self._as_error_response(response, error)
 
             if persistent and identical_error_count >= self._PERSISTENT_IDENTICAL_ERROR_LIMIT:
                 logger.warning(
@@ -719,8 +778,15 @@ class LLMProvider(ABC):
                 attempt,
                 "+" if persistent and attempt > len(delays) else f"/{len(delays)}",
                 int(round(delay)),
-                (response.content or "")[:120].lower(),
+                error[:120].lower(),
             )
+            if on_retry:
+                await on_retry(
+                    attempt=attempt,
+                    max_retries=len(delays),
+                    delay=delay,
+                    error=error,
+                )
             await self._sleep_with_heartbeat(
                 delay,
                 attempt=attempt,
@@ -728,7 +794,16 @@ class LLMProvider(ABC):
                 on_retry_wait=on_retry_wait,
             )
 
-        return last_response if last_response is not None else await call(**kw)
+        if last_response is not None:
+            final_error = self._classify_response_error(last_response)
+            return (
+                last_response
+                if final_error is None
+                else self._as_error_response(last_response, final_error)
+            )
+        response = await call(**kw)
+        final_error = self._classify_response_error(response)
+        return response if final_error is None else self._as_error_response(response, final_error)
 
     @abstractmethod
     def get_default_model(self) -> str:

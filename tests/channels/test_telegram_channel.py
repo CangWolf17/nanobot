@@ -1109,6 +1109,7 @@ async def test_on_help_includes_restart_command() -> None:
 
     update.message.reply_text.assert_awaited_once()
     help_text = update.message.reply_text.await_args.args[0]
+    assert "/interrupt" in help_text
     assert "/restart" in help_text
     assert "/status" in help_text
     assert "/dream" in help_text

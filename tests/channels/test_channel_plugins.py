@@ -7,13 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.manager import ChannelManager
 from nanobot.config.schema import ChannelsConfig
-from nanobot.utils.restart import RestartNotice
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +209,10 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
             seen["config"] = self.config
             return True
 
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda config_path=None: Config())
+    monkeypatch.setattr(
+        "nanobot.config.loader.load_config",
+        lambda config_path=None: Config(),
+    )
     monkeypatch.setattr(
         "nanobot.channels.registry.discover_all",
         lambda: {"fakeplugin": _LoginPlugin},
@@ -221,55 +224,64 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
     assert seen["force"] is True
 
 
-def test_channels_login_sets_custom_config_path(monkeypatch, tmp_path):
+def test_channels_status_uses_explicit_config_path(monkeypatch, tmp_path):
     from nanobot.cli.commands import app
     from nanobot.config.schema import Config
-    from typer.testing import CliRunner
 
     runner = CliRunner()
+    config_path = tmp_path / "channels-status-config.json"
     seen: dict[str, object] = {}
-    config_path = tmp_path / "custom-config.json"
 
-    class _LoginPlugin(_FakePlugin):
-        async def login(self, force: bool = False) -> bool:
-            return True
+    def _load_config(config_path_arg=None):
+        seen["config_path"] = config_path_arg
+        return Config()
 
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda config_path=None: Config())
-    monkeypatch.setattr(
-        "nanobot.config.loader.set_config_path",
-        lambda path: seen.__setitem__("config_path", path),
-    )
+    monkeypatch.setattr("nanobot.config.loader.load_config", _load_config)
     monkeypatch.setattr(
         "nanobot.channels.registry.discover_all",
-        lambda: {"fakeplugin": _LoginPlugin},
+        lambda: {"fakeplugin": _FakePlugin},
     )
-
-    result = runner.invoke(app, ["channels", "login", "fakeplugin", "--config", str(config_path)])
-
-    assert result.exit_code == 0
-    assert seen["config_path"] == config_path.resolve()
-
-
-def test_channels_status_sets_custom_config_path(monkeypatch, tmp_path):
-    from nanobot.cli.commands import app
-    from nanobot.config.schema import Config
-    from typer.testing import CliRunner
-
-    runner = CliRunner()
-    seen: dict[str, object] = {}
-    config_path = tmp_path / "custom-config.json"
-
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda config_path=None: Config())
-    monkeypatch.setattr(
-        "nanobot.config.loader.set_config_path",
-        lambda path: seen.__setitem__("config_path", path),
-    )
-    monkeypatch.setattr("nanobot.channels.registry.discover_all", lambda: {})
 
     result = runner.invoke(app, ["channels", "status", "--config", str(config_path)])
 
     assert result.exit_code == 0
     assert seen["config_path"] == config_path.resolve()
+
+
+def test_channels_login_uses_explicit_config_path(monkeypatch, tmp_path):
+    from nanobot.cli.commands import app
+    from nanobot.config.schema import Config
+
+    runner = CliRunner()
+    config_path = tmp_path / "channels-login-config.json"
+    seen: dict[str, object] = {}
+
+    class _LoginPlugin(_FakePlugin):
+        display_name = "Login Plugin"
+
+        async def login(self, force: bool = False) -> bool:
+            seen["force"] = force
+            seen["config"] = self.config
+            return True
+
+    def _load_config(config_path_arg=None):
+        seen["config_path"] = config_path_arg
+        return Config.model_validate({"channels": {"fakeplugin": {"enabled": True}}})
+
+    monkeypatch.setattr("nanobot.config.loader.load_config", _load_config)
+    monkeypatch.setattr(
+        "nanobot.channels.registry.discover_all",
+        lambda: {"fakeplugin": _LoginPlugin},
+    )
+
+    result = runner.invoke(
+        app,
+        ["channels", "login", "fakeplugin", "--config", str(config_path), "--force"],
+    )
+
+    assert result.exit_code == 0
+    assert seen["config_path"] == config_path.resolve()
+    assert seen["force"] is True
 
 
 @pytest.mark.asyncio
@@ -512,6 +524,48 @@ async def test_send_with_retry_calls_send_delta():
 
 
 @pytest.mark.asyncio
+async def test_send_with_retry_calls_send_delta_for_stream_start():
+    """_send_with_retry should call send_delta when metadata has _stream_start."""
+    send_delta_called = False
+
+    class _StreamingChannel(BaseChannel):
+        name = "streaming"
+        display_name = "Streaming"
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        async def send(self, msg: OutboundMessage) -> None:
+            pass
+
+        async def send_delta(self, chat_id: str, delta: str, metadata: dict | None = None) -> None:
+            nonlocal send_delta_called
+            send_delta_called = True
+
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(send_max_retries=3),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.bus = MessageBus()
+    mgr.channels = {"streaming": _StreamingChannel(fake_config, mgr.bus)}
+    mgr._dispatch_task = None
+
+    msg = OutboundMessage(
+        channel="streaming", chat_id="123", content="",
+        metadata={"_stream_start": True}
+    )
+    await mgr._send_with_retry(mgr.channels["streaming"], msg)
+
+    assert send_delta_called is True
+
+
+@pytest.mark.asyncio
 async def test_send_with_retry_skips_send_when_streamed():
     """_send_with_retry should not call send when metadata has _streamed flag."""
     send_called = False
@@ -555,6 +609,50 @@ async def test_send_with_retry_skips_send_when_streamed():
 
     assert send_called is False
     assert send_delta_called is False
+
+
+@pytest.mark.asyncio
+async def test_send_with_retry_sends_streamed_message_when_completion_notice_requested():
+    """_streamed messages stay skippable by default, but explicit completion notices must still send."""
+    send_called = False
+
+    class _CompletionNoticeChannel(BaseChannel):
+        name = "streamed_notice"
+        display_name = "Streamed Notice"
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        async def send(self, msg: OutboundMessage) -> None:
+            nonlocal send_called
+            send_called = True
+
+        async def send_delta(self, chat_id: str, delta: str, metadata: dict | None = None) -> None:
+            pass
+
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(send_max_retries=3),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.bus = MessageBus()
+    mgr.channels = {"streamed_notice": _CompletionNoticeChannel(fake_config, mgr.bus)}
+    mgr._dispatch_task = None
+
+    msg = OutboundMessage(
+        channel="streamed_notice",
+        chat_id="123",
+        content="already streamed",
+        metadata={"_streamed": True, "_completion_notice": True, "_completion_notice_text": "✅ 回复完成"},
+    )
+    await mgr._send_with_retry(mgr.channels["streamed_notice"], msg)
+
+    assert send_called is True
 
 
 @pytest.mark.asyncio
@@ -929,31 +1027,3 @@ async def test_start_all_creates_dispatch_task():
 
     # Dispatch task should have been created
     assert mgr._dispatch_task is not None
-
-
-@pytest.mark.asyncio
-async def test_notify_restart_done_enqueues_outbound_message():
-    """Restart notice should schedule send_with_retry for target channel."""
-    fake_config = SimpleNamespace(
-        channels=ChannelsConfig(),
-        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
-    )
-
-    mgr = ChannelManager.__new__(ChannelManager)
-    mgr.config = fake_config
-    mgr.bus = MessageBus()
-    mgr.channels = {"feishu": _StartableChannel(fake_config, mgr.bus)}
-    mgr._dispatch_task = None
-    mgr._send_with_retry = AsyncMock()
-
-    notice = RestartNotice(channel="feishu", chat_id="oc_123", started_at_raw="100.0")
-    with patch("nanobot.channels.manager.consume_restart_notice_from_env", return_value=notice):
-        mgr._notify_restart_done_if_needed()
-
-    await asyncio.sleep(0)
-    mgr._send_with_retry.assert_awaited_once()
-    sent_channel, sent_msg = mgr._send_with_retry.await_args.args
-    assert sent_channel is mgr.channels["feishu"]
-    assert sent_msg.channel == "feishu"
-    assert sent_msg.chat_id == "oc_123"
-    assert sent_msg.content.startswith("Restart completed")

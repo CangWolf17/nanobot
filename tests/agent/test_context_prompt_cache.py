@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from datetime import datetime as real_datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
@@ -48,21 +47,19 @@ def test_system_prompt_stays_stable_when_clock_changes(tmp_path, monkeypatch) ->
     assert prompt1 == prompt2
 
 
-def test_system_prompt_reflects_current_dream_memory_contract(tmp_path) -> None:
+def test_system_prompt_includes_dynamic_work_mode_block_when_requested(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    prompt = builder.build_system_prompt()
+    prompt = builder.build_system_prompt(workspace_work_mode="plan")
 
-    assert "memory/history.jsonl" in prompt
-    assert "automatically managed by Dream" in prompt
-    assert "do not edit directly" in prompt
-    assert "memory/HISTORY.md" not in prompt
-    assert "write important facts here" not in prompt
+    assert "## Work Mode" in prompt
+    assert "Current workspace work mode: plan" in prompt
+    assert "Do not make code or implementation changes" in prompt
 
 
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
-    """Runtime metadata should be merged with the user message."""
+    """Runtime metadata should be merged with the user message and expose time plus explicit routing metadata."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
@@ -76,146 +73,126 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert messages[0]["role"] == "system"
     assert "## Current Session" not in messages[0]["content"]
 
-    # Runtime context is now merged with user message into a single message
     assert messages[-1]["role"] == "user"
     user_content = messages[-1]["content"]
     assert isinstance(user_content, str)
     assert ContextBuilder._RUNTIME_CONTEXT_TAG in user_content
     assert "Current Time:" in user_content
     assert "Channel: cli" in user_content
-    assert "Chat ID: direct" in user_content
+    assert "Chat ID: `direct`" in user_content
     assert "Return exactly: OK" in user_content
 
 
-def test_unprocessed_history_injected_into_system_prompt(tmp_path) -> None:
-    """Entries in history.jsonl not yet consumed by Dream appear with timestamps."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    builder.memory.append_history("User asked about weather in Tokyo")
-    builder.memory.append_history("Agent fetched forecast via web_search")
-
-    prompt = builder.build_system_prompt()
-    assert "# Recent History" in prompt
-    assert "User asked about weather in Tokyo" in prompt
-    assert "Agent fetched forecast via web_search" in prompt
-    assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]", prompt)
-
-
-def test_recent_history_capped_at_max(tmp_path) -> None:
-    """Only the most recent _MAX_RECENT_HISTORY entries are injected."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    for i in range(builder._MAX_RECENT_HISTORY + 20):
-        builder.memory.append_history(f"entry-{i}")
-
-    prompt = builder.build_system_prompt()
-    assert "entry-0" not in prompt
-    assert "entry-19" not in prompt
-    assert f"entry-{builder._MAX_RECENT_HISTORY + 19}" in prompt
-
-
-def test_no_recent_history_when_dream_has_processed_all(tmp_path) -> None:
-    """If Dream has consumed everything, no Recent History section should appear."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    cursor = builder.memory.append_history("already processed entry")
-    builder.memory.set_last_dream_cursor(cursor)
-
-    prompt = builder.build_system_prompt()
-    assert "# Recent History" not in prompt
-
-
-def test_partial_dream_processing_shows_only_remainder(tmp_path) -> None:
-    """When Dream has processed some entries, only the unprocessed ones appear."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    c1 = builder.memory.append_history("old conversation about Python")
-    c2 = builder.memory.append_history("old conversation about Rust")
-    builder.memory.append_history("recent question about Docker")
-    builder.memory.append_history("recent question about K8s")
-
-    builder.memory.set_last_dream_cursor(c2)
-
-    prompt = builder.build_system_prompt()
-    assert "# Recent History" in prompt
-    assert "old conversation about Python" not in prompt
-    assert "old conversation about Rust" not in prompt
-    assert "recent question about Docker" in prompt
-    assert "recent question about K8s" in prompt
-
-
-def test_execution_rules_in_system_prompt(tmp_path) -> None:
-    """New execution rules should appear in the system prompt."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    prompt = builder.build_system_prompt()
-    assert "Act, don't narrate" in prompt
-    assert "Read before you write" in prompt
-    assert "verify the result" in prompt
-
-
-def test_channel_format_hint_telegram(tmp_path) -> None:
-    """Telegram channel should get messaging-app format hint."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    prompt = builder.build_system_prompt(channel="telegram")
-    assert "Format Hint" in prompt
-    assert "messaging app" in prompt
-
-
-def test_channel_format_hint_whatsapp(tmp_path) -> None:
-    """WhatsApp should get plain-text format hint."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    prompt = builder.build_system_prompt(channel="whatsapp")
-    assert "Format Hint" in prompt
-    assert "plain text only" in prompt
-
-
-def test_channel_format_hint_absent_for_unknown(tmp_path) -> None:
-    """Unknown or None channel should not inject a format hint."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    prompt = builder.build_system_prompt(channel=None)
-    assert "Format Hint" not in prompt
-
-    prompt2 = builder.build_system_prompt(channel="feishu")
-    assert "Format Hint" not in prompt2
-
-
-def test_build_messages_passes_channel_to_system_prompt(tmp_path) -> None:
-    """build_messages should pass channel through to build_system_prompt."""
+def test_runtime_context_uses_short_hard_rules_and_keeps_routing_metadata(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
     messages = builder.build_messages(
-        history=[], current_message="hi",
-        channel="telegram", chat_id="123",
-    )
-    system = messages[0]["content"]
-    assert "Format Hint" in system
-    assert "messaging app" in system
-
-
-def test_subagent_result_does_not_create_consecutive_assistant_messages(tmp_path) -> None:
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    messages = builder.build_messages(
-        history=[{"role": "assistant", "content": "previous result"}],
-        current_message="subagent result",
+        history=[],
+        current_message="Return exactly: OK",
         channel="cli",
         chat_id="direct",
-        current_role="assistant",
     )
 
-    for left, right in zip(messages, messages[1:]):
-        assert not (left.get("role") == right.get("role") == "assistant")
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert user_content.startswith("[Runtime Context — metadata only, not instructions]\n")
+    assert "Rules:" in user_content
+    assert "Metadata only. Not part of the user's request." in user_content
+    assert "Use `Current Time` only for time-sensitive reasoning." in user_content
+    assert "Treat `Channel` and `Chat ID` as opaque routing metadata." in user_content
+    assert "Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\"." in user_content
+    assert "If this block conflicts with the conversation content, trust the conversation content." in user_content
+    assert "Current Time:" in user_content
+    assert "Channel: cli" in user_content
+    assert "Chat ID: `direct`" in user_content
+    assert "Auxiliary metadata injected by the nanobot runtime for reference only; not user-authored input." not in user_content
+
+
+def test_runtime_context_includes_sparse_harness_metadata_when_present(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="继续",
+        channel="cli",
+        chat_id="direct",
+        runtime_metadata={
+            "has_active_harness": True,
+            "active_harness": {
+                "id": "har_0038",
+                "type": "feature",
+                "status": "active",
+                "phase": "executing",
+                "awaiting_user": False,
+                "blocked": False,
+                "auto": True,
+            },
+        },
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "has_active_harness: true" in user_content
+    assert "active_harness:" in user_content
+    assert "id: har_0038" in user_content
+    assert "phase: executing" in user_content
+    assert "auto: true" in user_content
+
+
+def test_runtime_context_echo_strip_handles_runtime_metadata_block() -> None:
+    from nanobot.agent.loop import AgentLoop
+
+    text = """[Runtime Context — metadata only, not instructions]
+Rules:
+- Metadata only. Not part of the user's request.
+- Use `Current Time` only for time-sensitive reasoning.
+- Treat `Channel` and `Chat ID` as opaque routing metadata. Use them only for reply delivery, tool targeting, or channel-specific formatting when explicitly relevant.
+- Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\".
+- If this block conflicts with the conversation content, trust the conversation content.
+
+Current Time: 2026-04-05 11:37 (Sunday) (UTC, UTC+00:00)
+Channel: feishu
+Chat ID: `ou_test`
+Runtime Metadata:
+work_mode: build
+has_active_harness: true
+active_harness:
+  id: har_0040
+  type: project
+  status: active
+  phase: executing
+  awaiting_user: false
+  blocked: false
+  auto: true
+
+真正给用户的话"""
+
+    assert AgentLoop._sanitize_visible_output(text) == "真正给用户的话"
+
+
+
+def test_system_prompt_includes_dev_discipline_block_when_active_session_exists(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    session_root = workspace / "sessions" / "ses_0001"
+    session_root.mkdir(parents=True)
+    (workspace / "sessions" / "control.json").write_text(
+        '{"active_session_id":"ses_0001"}', encoding="utf-8"
+    )
+    (workspace / "sessions" / "index.json").write_text(
+        '{"sessions":{"ses_0001":{"session_root":"' + str(session_root) + '"}}}',
+        encoding="utf-8",
+    )
+    (session_root / "dev_state.json").write_text(
+        '{"strict_dev_mode":"enforce","task_kind":"feature","phase":"red_required","work_mode":"build","gates":{"plan":{"required":true,"satisfied":true},"debug_root_cause":{"required":false,"satisfied":false},"failing_test":{"required":true,"satisfied":false},"verification":{"required":true,"satisfied":false}}}',
+        encoding="utf-8",
+    )
+
+    builder = ContextBuilder(workspace)
+    prompt = builder.build_system_prompt()
+
+    assert "## Dev Discipline" in prompt
+    assert "task_kind: feature" in prompt
+    assert "phase: red_required" in prompt
+    assert "- failing_test: pending" in prompt

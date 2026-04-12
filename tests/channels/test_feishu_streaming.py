@@ -59,6 +59,20 @@ class TestFeishuStreamingConfig:
         assert ch.supports_streaming is False
 
 
+
+
+def test_feishu_streaming_completion_notice_defaults_disabled() -> None:
+    assert FeishuConfig().streaming_completion_notice_enabled is False
+
+
+def test_feishu_streaming_completion_notice_can_be_enabled() -> None:
+    config = FeishuConfig(streaming_completion_notice_enabled=True)
+    assert config.streaming_completion_notice_enabled is True
+    assert config.streaming_completion_notice_text == "✅ 回复完成"
+    assert config.streaming_completion_notice_mention_user is False
+    assert config.streaming_completion_notice_mention_fallback_name == ""
+
+
 class TestCreateStreamingCard:
     def test_returns_card_id_on_success(self):
         ch = _make_channel()
@@ -131,6 +145,20 @@ class TestStreamUpdateText:
 
 class TestSendDelta:
     @pytest.mark.asyncio
+    async def test_stream_start_creates_card_before_first_delta(self):
+        ch = _make_channel()
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_new")
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_new")
+
+        await ch.send_delta("oc_chat1", "", metadata={"_stream_start": True})
+
+        assert "oc_chat1" in ch._stream_bufs
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.card_id == "card_new"
+        ch._client.cardkit.v1.card.create.assert_called_once()
+        ch._client.im.v1.message.create.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_first_delta_creates_card_and_sends(self):
         ch = _make_channel()
         ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_new")
@@ -146,6 +174,19 @@ class TestSendDelta:
         assert buf.sequence == 1
         ch._client.cardkit.v1.card.create.assert_called_once()
         ch._client.im.v1.message.create.assert_called_once()
+        ch._client.cardkit.v1.card_element.content.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_first_visible_delta_after_stream_start_updates_immediately(self):
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(text="", card_id="card_1", sequence=0, last_edit=time.monotonic())
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_delta("oc_chat1", "Hello")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.text == "Hello"
+        assert buf.sequence == 1
         ch._client.cardkit.v1.card_element.content.assert_called_once()
 
     @pytest.mark.asyncio
@@ -203,6 +244,177 @@ class TestSendDelta:
         assert "oc_chat1" not in ch._stream_bufs
         ch._client.cardkit.v1.card_element.content.assert_not_called()
         ch._client.im.v1.message.create.assert_called_once()
+
+
+    @pytest.mark.asyncio
+    async def test_stream_end_does_not_send_completion_notice_without_explicit_metadata(self):
+        ch = _make_channel()
+        ch.config.streaming_completion_notice_enabled = True
+        ch.config.streaming_completion_notice_text = "✅ 回复完成"
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="Final content", card_id="card_1", sequence=3, last_edit=0.0,
+        )
+
+        from unittest.mock import patch
+        with (
+            patch.object(ch, "_stream_update_text_sync", return_value=True) as mock_update,
+            patch.object(ch, "_close_streaming_mode_sync", return_value=True) as mock_close,
+            patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send,
+        ):
+            await ch.send_delta("oc_chat1", "", metadata={"_stream_end": True, "_resuming": False})
+
+        assert "oc_chat1" not in ch._stream_bufs
+        mock_update.assert_called_once_with("card_1", "Final content", 4)
+        mock_close.assert_called_once_with("card_1", 5)
+        mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_emits_completion_notice_when_explicitly_requested(self):
+        ch = _make_channel()
+
+        from unittest.mock import patch
+        from nanobot.bus.events import OutboundMessage
+        with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
+            await ch.send(OutboundMessage(
+                channel="feishu",
+                chat_id="oc_chat1",
+                content="Final content that was already streamed",
+                metadata={
+                    "_streamed": True,
+                    "_completion_notice": True,
+                    "_completion_notice_text": "✅ 回复完成",
+                },
+            ))
+
+        mock_send.assert_called_once_with(
+            "chat_id",
+            "oc_chat1",
+            "text",
+            '{"text": "✅ 回复完成"}',
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_emits_completion_notice_with_group_mention_when_enabled(self):
+        ch = _make_channel()
+        ch.config.streaming_completion_notice_enabled = True
+        ch.config.streaming_completion_notice_mention_user = True
+
+        from unittest.mock import patch
+        from nanobot.bus.events import OutboundMessage
+        with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
+            await ch.send(OutboundMessage(
+                channel="feishu",
+                chat_id="oc_chat1",
+                content="Final content that was already streamed",
+                metadata={
+                    "_streamed": True,
+                    "_completion_notice": True,
+                    "_completion_notice_text": "✅ 回复完成",
+                    "_completion_notice_mention_user_id": "ou_runtime_user",
+                },
+            ))
+
+        args = mock_send.call_args[0]
+        assert args[0] == "chat_id"
+        assert args[1] == "oc_chat1"
+        assert args[2] == "post"
+        assert '"tag": "at"' in args[3]
+        assert '"user_id": "ou_runtime_user"' in args[3]
+        assert '"user_name": "你"' not in args[3]
+        assert '"text": " ✅ 回复完成"' in args[3]
+
+    @pytest.mark.asyncio
+    async def test_send_completion_notice_in_direct_message_emits_mention_post_without_fallback_name(self):
+        ch = _make_channel()
+        ch.config.streaming_completion_notice_enabled = True
+        ch.config.streaming_completion_notice_mention_user = True
+
+        from unittest.mock import patch
+        from nanobot.bus.events import OutboundMessage
+        with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
+            await ch.send(OutboundMessage(
+                channel="feishu",
+                chat_id="ou_runtime_user",
+                content="Final content that was already streamed",
+                metadata={
+                    "_streamed": True,
+                    "_completion_notice": True,
+                    "_completion_notice_text": "✅ 回复完成",
+                    "_completion_notice_mention_user_id": "ou_runtime_user",
+                },
+            ))
+
+        args = mock_send.call_args[0]
+        assert args[0] == "open_id"
+        assert args[1] == "ou_runtime_user"
+        assert args[2] == "post"
+        assert '"tag": "at"' in args[3]
+        assert '"user_id": "ou_runtime_user"' in args[3]
+        assert '"user_name": "你"' not in args[3]
+        assert '"text": " ✅ 回复完成"' in args[3]
+
+    @pytest.mark.asyncio
+    async def test_send_completion_notice_uses_configured_fallback_name_when_present(self):
+        ch = _make_channel()
+        ch.config.streaming_completion_notice_enabled = True
+        ch.config.streaming_completion_notice_mention_user = True
+        ch.config.streaming_completion_notice_mention_fallback_name = "Tim"
+
+        from unittest.mock import patch
+        from nanobot.bus.events import OutboundMessage
+        with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
+            await ch.send(OutboundMessage(
+                channel="feishu",
+                chat_id="ou_runtime_user",
+                content="Final content that was already streamed",
+                metadata={
+                    "_streamed": True,
+                    "_completion_notice": True,
+                    "_completion_notice_text": "✅ 回复完成",
+                    "_completion_notice_mention_user_id": "ou_runtime_user",
+                },
+            ))
+
+        args = mock_send.call_args[0]
+        assert args[2] == "post"
+        assert '"user_name": "Tim"' in args[3]
+        assert '"user_name": "你"' not in args[3]
+
+    @pytest.mark.asyncio
+    async def test_stream_end_skips_completion_notice_when_resuming(self):
+        ch = _make_channel()
+        ch.config.streaming_completion_notice_enabled = True
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="Final content", card_id="card_1", sequence=3, last_edit=0.0,
+        )
+
+        from unittest.mock import patch
+        with (
+            patch.object(ch, "_stream_update_text_sync", return_value=True),
+            patch.object(ch, "_close_streaming_mode_sync", return_value=True),
+            patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send,
+        ):
+            await ch.send_delta("oc_chat1", "", metadata={"_stream_end": True, "_resuming": True})
+
+        mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_end_skips_completion_notice_when_disabled(self):
+        ch = _make_channel()
+        ch.config.streaming_completion_notice_enabled = False
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="Final content", card_id="card_1", sequence=3, last_edit=0.0,
+        )
+
+        from unittest.mock import patch
+        with (
+            patch.object(ch, "_stream_update_text_sync", return_value=True),
+            patch.object(ch, "_close_streaming_mode_sync", return_value=True),
+            patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send,
+        ):
+            await ch.send_delta("oc_chat1", "", metadata={"_stream_end": True, "_resuming": False})
+
+        mock_send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stream_end_resuming_keeps_buffer(self):

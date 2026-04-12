@@ -24,13 +24,12 @@ class AgentHookContext:
     final_content: str | None = None
     stop_reason: str | None = None
     error: str | None = None
+    retry_count: int = 0
+    last_retry_error: str | None = None
 
 
 class AgentHook:
     """Minimal lifecycle surface for shared runner customization."""
-
-    def __init__(self, reraise: bool = False) -> None:
-        self._reraise = reraise
 
     def wants_streaming(self) -> bool:
         return False
@@ -42,6 +41,17 @@ class AgentHook:
         pass
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+        pass
+
+    async def on_retry(
+        self,
+        context: AgentHookContext,
+        *,
+        attempt: int,
+        max_retries: int,
+        delay: float,
+        error: str | None,
+    ) -> None:
         pass
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
@@ -57,47 +67,75 @@ class AgentHook:
 class CompositeHook(AgentHook):
     """Fan-out hook that delegates to an ordered list of hooks.
 
-    Error isolation: async methods catch and log per-hook exceptions
-    so a faulty custom hook cannot crash the agent loop.
-    ``finalize_content`` is a pipeline (no isolation — bugs should surface).
+    Async methods isolate per-hook failures so one custom hook cannot break the
+    whole agent run. ``finalize_content`` remains a simple pipeline.
     """
 
     __slots__ = ("_hooks",)
 
     def __init__(self, hooks: list[AgentHook]) -> None:
-        super().__init__()
         self._hooks = list(hooks)
 
     def wants_streaming(self) -> bool:
         return any(h.wants_streaming() for h in self._hooks)
 
-    async def _for_each_hook_safe(self, method_name: str, *args: Any, **kwargs: Any) -> None:
-        for h in self._hooks:
-            if getattr(h, "_reraise", False):
-                await getattr(h, method_name)(*args, **kwargs)
-                continue
-
-            try:
-                await getattr(h, method_name)(*args, **kwargs)
-            except Exception:
-                logger.exception("AgentHook.{} error in {}", method_name, type(h).__name__)
-
     async def before_iteration(self, context: AgentHookContext) -> None:
-        await self._for_each_hook_safe("before_iteration", context)
+        for hook in self._hooks:
+            try:
+                await hook.before_iteration(context)
+            except Exception:
+                logger.exception("AgentHook.before_iteration error in {}", type(hook).__name__)
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
-        await self._for_each_hook_safe("on_stream", context, delta)
+        for hook in self._hooks:
+            try:
+                await hook.on_stream(context, delta)
+            except Exception:
+                logger.exception("AgentHook.on_stream error in {}", type(hook).__name__)
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
-        await self._for_each_hook_safe("on_stream_end", context, resuming=resuming)
+        for hook in self._hooks:
+            try:
+                await hook.on_stream_end(context, resuming=resuming)
+            except Exception:
+                logger.exception("AgentHook.on_stream_end error in {}", type(hook).__name__)
+
+    async def on_retry(
+        self,
+        context: AgentHookContext,
+        *,
+        attempt: int,
+        max_retries: int,
+        delay: float,
+        error: str | None,
+    ) -> None:
+        for hook in self._hooks:
+            try:
+                await hook.on_retry(
+                    context,
+                    attempt=attempt,
+                    max_retries=max_retries,
+                    delay=delay,
+                    error=error,
+                )
+            except Exception:
+                logger.exception("AgentHook.on_retry error in {}", type(hook).__name__)
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
-        await self._for_each_hook_safe("before_execute_tools", context)
+        for hook in self._hooks:
+            try:
+                await hook.before_execute_tools(context)
+            except Exception:
+                logger.exception("AgentHook.before_execute_tools error in {}", type(hook).__name__)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
-        await self._for_each_hook_safe("after_iteration", context)
+        for hook in self._hooks:
+            try:
+                await hook.after_iteration(context)
+            except Exception:
+                logger.exception("AgentHook.after_iteration error in {}", type(hook).__name__)
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
-        for h in self._hooks:
-            content = h.finalize_content(context, content)
+        for hook in self._hooks:
+            content = hook.finalize_content(context, content)
         return content
