@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 
-def _make_loop(*, exec_config=None):
+def _make_workspace() -> Path:
+    return Path(tempfile.mkdtemp(prefix="nanobot-test-workspace-"))
+
+
+def _make_loop(*, exec_config=None, workspace: Path | None = None):
     """Create a minimal AgentLoop with mocked dependencies."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
@@ -17,8 +23,7 @@ def _make_loop(*, exec_config=None):
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    workspace = MagicMock()
-    workspace.__truediv__ = MagicMock(return_value=MagicMock())
+    workspace = workspace or _make_workspace()
 
     with (
         patch("nanobot.agent.loop.ContextBuilder"),
@@ -473,7 +478,7 @@ class TestSubagentCancellation:
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
-        mgr = SubagentManager(provider=provider, workspace=MagicMock(), bus=bus)
+        mgr = SubagentManager(provider=provider, workspace=_make_workspace(), bus=bus)
 
         cancelled = asyncio.Event()
 
@@ -501,7 +506,7 @@ class TestSubagentCancellation:
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
-        mgr = SubagentManager(provider=provider, workspace=MagicMock(), bus=bus)
+        mgr = SubagentManager(provider=provider, workspace=_make_workspace(), bus=bus)
         assert await mgr.cancel_by_session("nonexistent") == 0
 
     @pytest.mark.asyncio
