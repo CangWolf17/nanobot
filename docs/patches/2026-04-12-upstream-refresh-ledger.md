@@ -74,6 +74,7 @@ These remain useful for intent/history, but they are not the current operational
 - `docs/patches/2026-04-12-subagent-simplification-review.md`
 - `docs/patches/2026-04-13-subagent-cleanup-review.md`
 - `docs/patches/2026-04-13-subagent-compatibility-inventory.md`
+- `docs/patches/2026-04-13-standard-tier-compatibility-assessment.md`
 - `docs/patches/2026-04-02-self-use-runtime-patch-playbook.md`
 - `docs/patches/2026-04-03-runtime-control-plane-followups.md`
 - `docs/patches/2026-04-11-runtime-subagent-v3-cleanup-execution-plan.md`
