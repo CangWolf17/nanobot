@@ -68,11 +68,19 @@ async def _cancel_session_work(ctx: CommandContext) -> tuple[int, int, int]:
 async def _read_workspace_harness_status_summary(
     *,
     workspace_root: Path | None = None,
+    session_key: str = "",
 ) -> str | None:
     workspace_root = workspace_root or _resolve_workspace_root()
-    summary = HarnessService.for_workspace(workspace_root).render_status_summary()
+    service = HarnessService.for_workspace(workspace_root)
+    bound_session_key = session_key.strip()
+    if bound_session_key:
+        summary = service.render_status_summary_for_session(bound_session_key)
+    else:
+        summary = service.render_status_summary()
     if summary is not None:
         return summary
+    if bound_session_key:
+        return None
 
     task_path = workspace_root / "TASK.md"
     if not task_path.exists():
@@ -195,7 +203,8 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     interrupt_state = metadata.get("interrupt_state") or {}
     interrupt_summary = str(interrupt_state.get("summary") or "").strip() or None
     harness_summary = await _read_workspace_harness_status_summary(
-        workspace_root=_resolve_workspace_root(loop)
+        workspace_root=_resolve_workspace_root(loop),
+        session_key=ctx.msg.session_key,
     )
     return OutboundMessage(
         channel=ctx.msg.channel,
@@ -218,10 +227,14 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     """Start a fresh session."""
     loop = ctx.loop
+    msg = ctx.msg
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     snapshot = session.messages[session.last_consolidated :]
     session.clear()
     session.metadata.pop("interrupt_state", None)
+    HarnessService.for_workspace(_resolve_workspace_root(loop)).clear_session_binding(
+        msg.session_key
+    )
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
     if snapshot:
@@ -230,8 +243,8 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
             archive = loop.memory_consolidator.archive_messages
         loop._schedule_background(archive(snapshot))
     return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
+        channel=msg.channel,
+        chat_id=msg.chat_id,
         content="New session started.",
     )
 

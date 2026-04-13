@@ -331,14 +331,22 @@ class TestHandleStop:
         from nanobot.bus.events import InboundMessage
         from nanobot.command.builtin import cmd_new
         from nanobot.command.router import CommandContext
+        from nanobot.harness.service import HarnessService
 
-        loop, _bus = _make_loop()
+        loop, _bus = _make_loop(workspace=tmp_path)
         session = MagicMock()
         session.messages = []
         session.last_consolidated = 0
         session.metadata = {"interrupt_state": {"status": "interrupted"}}
         session.clear = MagicMock()
         loop.sessions.get_or_create.return_value = session
+        service = HarnessService.for_workspace(tmp_path)
+        service.handle_command(
+            "/harness 修复 interrupt 的真实接线",
+            session_key="test:c1",
+            sender_id="u1",
+        )
+        service.interrupt_active("interrupted — waiting for redirect", session_key="test:c1")
 
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/new")
         ctx = CommandContext(msg=msg, session=session, key=msg.session_key, raw="/new", loop=loop)
@@ -349,6 +357,30 @@ class TestHandleStop:
         assert "interrupt_state" not in session.metadata
         assert "new session started" in out.content.lower()
         mock_run.assert_not_called()
+        snapshot = service.store.load()
+        record = next(iter(snapshot.records.values()))
+        assert record.status == "interrupted"
+        assert record.runtime_state.session_key == ""
+
+    def test_extract_runtime_metadata_ignores_unbound_global_harness_for_plain_messages(
+        self, tmp_path
+    ):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.harness.service import HarnessService
+
+        loop, _bus = _make_loop(workspace=tmp_path)
+        service = HarnessService.for_workspace(tmp_path)
+        service.handle_command(
+            "/harness 修复 interrupt 的真实接线",
+            session_key="test:c2",
+            sender_id="u2",
+        )
+
+        runtime_meta = loop._extract_runtime_metadata(
+            InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="新的话题")
+        )
+
+        assert runtime_meta["has_active_harness"] is False
 
     @pytest.mark.asyncio
     async def test_stop_no_active_task(self):

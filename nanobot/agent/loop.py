@@ -177,11 +177,19 @@ class AgentLoop:
             runtime_meta["work_mode"] = work_mode
 
         try:
-            service_meta = HarnessService.for_workspace(self.workspace).runtime_metadata(
-                requested_auto=bool(meta.get("workspace_harness_auto")),
-                session_key=msg.session_key,
-                harness_id=str(meta.get("workspace_harness_id") or "").strip(),
-            )
+            service = HarnessService.for_workspace(self.workspace)
+            harness_id = str(meta.get("workspace_harness_id") or "").strip()
+            if harness_id or meta.get("workspace_agent_cmd") == "harness":
+                service_meta = service.runtime_metadata(
+                    requested_auto=bool(meta.get("workspace_harness_auto")),
+                    session_key=msg.session_key,
+                    harness_id=harness_id,
+                )
+            else:
+                service_meta = service.runtime_metadata_for_session(
+                    requested_auto=bool(meta.get("workspace_harness_auto")),
+                    session_key=msg.session_key,
+                )
         except Exception:
             service_meta = {"has_active_harness": False}
         if bool(service_meta.get("has_active_harness")):

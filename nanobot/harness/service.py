@@ -180,6 +180,15 @@ class HarnessService:
             return f"{active.status} / {active.phase} — {active.summary}"
         return f"{active.status} / {active.phase}"
 
+    def render_status_summary_for_session(self, session_key: str) -> str | None:
+        snapshot = self.store.load()
+        active = self._get_session_bound_record(snapshot, session_key=session_key)
+        if active is None:
+            return None
+        if active.summary:
+            return f"{active.status} / {active.phase} — {active.summary}"
+        return f"{active.status} / {active.phase}"
+
     def render_list(self) -> str:
         snapshot = self.store.load()
         records = [record for record in snapshot.records.values() if record.kind != "workflow"]
@@ -252,6 +261,61 @@ class HarnessService:
                 break
             if payload["next_runnable_child"] is None and not self._is_completed(child):
                 payload["next_runnable_child"] = self._runtime_child_payload(child)
+        return payload
+
+    def runtime_metadata_for_session(
+        self,
+        *,
+        requested_auto: bool = False,
+        session_key: str = "",
+    ) -> dict[str, Any]:
+        bound_session_key = session_key.strip()
+        if not bound_session_key:
+            return {"has_active_harness": False}
+        snapshot = self.store.load()
+        active = self._get_session_bound_record(snapshot, session_key=bound_session_key)
+        if active is None:
+            return {"has_active_harness": False}
+
+        active_payload = self._runtime_payload(active, requested_auto=requested_auto)
+        main = active
+        if active.parent_id:
+            parent = snapshot.records.get(active.parent_id)
+            if parent is not None:
+                main = parent
+
+        main_payload = self._runtime_payload(main, requested_auto=active_payload["auto"])
+        payload: dict[str, Any] = {
+            "has_active_harness": True,
+            "active_harness": active_payload,
+            "main_harness": main_payload,
+            "next_runnable_child": None,
+            "stop_gate_child": None,
+        }
+
+        if main.type != "project":
+            return payload
+
+        children = [record for record in snapshot.records.values() if record.parent_id == main.id]
+        children.sort(
+            key=lambda item: (
+                self._record_queue_order(item),
+                item.created_at or item.updated_at,
+                item.id,
+            )
+        )
+        main_payload["has_open_children"] = any(
+            not self._is_completed(record) for record in children
+        )
+        for child in children:
+            if payload["stop_gate_child"] is None and self._is_stop_gate(child):
+                payload["stop_gate_child"] = self._runtime_payload(
+                    child, requested_auto=requested_auto
+                )
+            if payload["next_runnable_child"] is None and self._is_runnable(child):
+                payload["next_runnable_child"] = self._runtime_payload(
+                    child, requested_auto=requested_auto
+                )
         return payload
 
     def decide_auto_continue(
@@ -384,6 +448,20 @@ class HarnessService:
     def redirect_active(self, user_input: str) -> bool:
         return self.redirect_after_interrupt(user_input)
 
+    def clear_session_binding(self, session_key: str) -> bool:
+        bound_session_key = session_key.strip()
+        if not bound_session_key:
+            return False
+        snapshot = self.store.load()
+        changed = False
+        for record in snapshot.records.values():
+            if record.runtime_state.session_key == bound_session_key:
+                record.runtime_state.session_key = ""
+                changed = True
+        if changed:
+            self._save_snapshot(snapshot)
+        return changed
+
     def apply_agent_update(
         self,
         content: str,
@@ -464,10 +542,24 @@ class HarnessService:
             return snapshot.records.get(target_id)
         bound_session_key = session_key.strip()
         if bound_session_key:
-            for record in snapshot.records.values():
-                if record.runtime_state.session_key == bound_session_key:
-                    return record
+            record = self._get_session_bound_record(snapshot, session_key=bound_session_key)
+            if record is not None:
+                return record
         return self._get_active_record(snapshot)
+
+    @staticmethod
+    def _get_session_bound_record(
+        snapshot: HarnessSnapshot,
+        *,
+        session_key: str,
+    ) -> HarnessRecord | None:
+        bound_session_key = session_key.strip()
+        if not bound_session_key:
+            return None
+        for record in snapshot.records.values():
+            if record.runtime_state.session_key == bound_session_key:
+                return record
+        return None
 
     @staticmethod
     def _bind_session(

@@ -146,6 +146,48 @@ def test_status_summary_helper_reads_from_explicit_workspace_root(tmp_path: Path
     assert result == "interrupted / planning — waiting for redirect"
 
 
+def test_status_summary_helper_prefers_session_bound_harness_when_session_key_provided(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "runtime-workspace"
+    service = HarnessService.for_workspace(workspace_root)
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    service.interrupt_active("interrupted — waiting for redirect", session_key="feishu:c1")
+
+    result = asyncio.run(
+        _read_workspace_harness_status_summary(
+            workspace_root=workspace_root,
+            session_key="feishu:c1",
+        )
+    )
+
+    assert result == "interrupted / interrupted — interrupted — waiting for redirect"
+
+
+def test_status_summary_helper_hides_unbound_harness_for_other_sessions(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "runtime-workspace"
+    service = HarnessService.for_workspace(workspace_root)
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:c1",
+        sender_id="u1",
+    )
+    service.interrupt_active("interrupted — waiting for redirect", session_key="feishu:c1")
+
+    result = asyncio.run(
+        _read_workspace_harness_status_summary(
+            workspace_root=workspace_root,
+            session_key="feishu:c2",
+        )
+    )
+
+    assert result is None
+
+
 def test_interrupt_command_updates_harness_using_explicit_workspace_root(tmp_path: Path) -> None:
     workspace_root = tmp_path / "runtime-workspace"
     service = HarnessService.for_workspace(workspace_root)
