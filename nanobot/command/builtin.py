@@ -176,13 +176,23 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     ctx_est = 0
-    try:
-        ctx_est, _ = loop.memory_consolidator.estimate_session_prompt_tokens(session)
-    except Exception:
-        pass
+    for consolidator in (
+        getattr(loop, "consolidator", None),
+        getattr(loop, "memory_consolidator", None),
+    ):
+        if consolidator is None:
+            continue
+        try:
+            ctx_est, _ = consolidator.estimate_session_prompt_tokens(session)
+        except Exception:
+            continue
+        if isinstance(ctx_est, int) and ctx_est > 0:
+            break
+        ctx_est = 0
     if ctx_est <= 0:
         ctx_est = loop._last_usage.get("prompt_tokens", 0)
-    interrupt_state = session.metadata.get("interrupt_state") or {}
+    metadata = session.metadata if isinstance(getattr(session, "metadata", None), dict) else {}
+    interrupt_state = metadata.get("interrupt_state") or {}
     interrupt_summary = str(interrupt_state.get("summary") or "").strip() or None
     harness_summary = await _read_workspace_harness_status_summary(
         workspace_root=_resolve_workspace_root(loop)
