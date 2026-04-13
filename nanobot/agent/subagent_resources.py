@@ -900,6 +900,37 @@ def _probe_reasoning_effort(raw: dict[str, Any]) -> str | None:
     return effort
 
 
+def _merge_extra_headers(
+    headers: dict[str, str],
+    extra_headers: dict[str, Any],
+) -> dict[str, str]:
+    merged = dict(headers)
+    for key, value in extra_headers.items():
+        key_clean = str(key or "").strip()
+        value_clean = str(value or "").strip()
+        if key_clean:
+            merged[key_clean] = value_clean
+    return merged
+
+
+
+def _probe_user_messages() -> list[dict[str, str]]:
+    return [{"role": "user", "content": "reply with OK only"}]
+
+
+
+def _apply_probe_reasoning_effort(
+    payload: dict[str, Any],
+    *,
+    raw: dict[str, Any],
+) -> dict[str, Any]:
+    enriched = dict(payload)
+    reasoning_effort = _probe_reasoning_effort(raw)
+    if reasoning_effort:
+        enriched["reasoning_effort"] = reasoning_effort
+    return enriched
+
+
 
 def _response_error_reason(response: Any) -> str:
     try:
@@ -947,22 +978,16 @@ def _build_openai_compat_probe_request(
     headers: dict[str, str] = {"content-type": "application/json"}
     if api_key:
         headers["authorization"] = f"Bearer {api_key}"
-    for key, value in extra_headers.items():
-        key_clean = str(key or "").strip()
-        value_clean = str(value or "").strip()
-        if key_clean:
-            headers[key_clean] = value_clean
-
-    payload: dict[str, Any] = {
-        "model": provider_model,
-        "messages": [{"role": "user", "content": "reply with OK only"}],
-        "max_tokens": 8,
-        "temperature": 0,
-    }
-    reasoning_effort = _probe_reasoning_effort(raw)
-    if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
-    return api_base.rstrip("/") + "/chat/completions", headers, payload
+    payload = _apply_probe_reasoning_effort(
+        {
+            "model": provider_model,
+            "messages": _probe_user_messages(),
+            "max_tokens": 8,
+            "temperature": 0,
+        },
+        raw=raw,
+    )
+    return api_base.rstrip("/") + "/chat/completions", _merge_extra_headers(headers, extra_headers), payload
 
 
 
@@ -979,13 +1004,13 @@ def _build_azure_openai_probe_request(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["api-key"] = api_key
-    payload: dict[str, Any] = {
-        "messages": [{"role": "user", "content": "reply with OK only"}],
-        "max_completion_tokens": 8,
-    }
-    reasoning_effort = _probe_reasoning_effort(raw)
-    if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
+    payload = _apply_probe_reasoning_effort(
+        {
+            "messages": _probe_user_messages(),
+            "max_completion_tokens": 8,
+        },
+        raw=raw,
+    )
     return url, headers, payload
 
 
@@ -1012,18 +1037,13 @@ def _build_anthropic_probe_request(
     }
     if api_key:
         headers["x-api-key"] = api_key
-    for key, value in extra_headers.items():
-        key_clean = str(key or "").strip()
-        value_clean = str(value or "").strip()
-        if key_clean:
-            headers[key_clean] = value_clean
 
     payload: dict[str, Any] = {
         "model": model_name,
-        "messages": [{"role": "user", "content": "reply with OK only"}],
+        "messages": _probe_user_messages(),
         "max_tokens": 8,
     }
-    return url, headers, payload
+    return url, _merge_extra_headers(headers, extra_headers), payload
 
 
 
@@ -1047,19 +1067,14 @@ def _build_github_copilot_probe_request(
         "Editor-Plugin-Version": EDITOR_PLUGIN_VERSION,
         "User-Agent": USER_AGENT,
     }
-    for key, value in extra_headers.items():
-        key_clean = str(key or "").strip()
-        value_clean = str(value or "").strip()
-        if key_clean:
-            headers[key_clean] = value_clean
 
     payload: dict[str, Any] = {
         "model": provider_model,
-        "messages": [{"role": "user", "content": "reply with OK only"}],
+        "messages": _probe_user_messages(),
         "max_tokens": 8,
         "temperature": 0,
     }
-    return api_base.rstrip("/") + "/chat/completions", headers, payload
+    return api_base.rstrip("/") + "/chat/completions", _merge_extra_headers(headers, extra_headers), payload
 
 
 
