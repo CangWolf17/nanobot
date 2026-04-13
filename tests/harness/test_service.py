@@ -112,6 +112,7 @@ def test_service_renderers_use_canonical_store_views(tmp_path: Path) -> None:
     service = HarnessService.for_workspace(tmp_path)
 
     assert "no active harness" in service.render_status().lower()
+    assert "no active harness" in service.render_status_for_session(session_key="feishu:c1").lower()
 
     work_result = service.handle_command(
         "/harness 修复 interrupt 的真实接线",
@@ -121,10 +122,12 @@ def test_service_renderers_use_canonical_store_views(tmp_path: Path) -> None:
     service.start_workflow("cleanup", origin_command="/harness cleanup")
 
     status_text = service.render_status()
+    session_status_text = service.render_status_for_session(session_key="feishu:c1")
     list_text = service.render_list()
     workflows_text = service.render_workflows()
 
     assert "har_cleanup" in status_text
+    assert work_result.active_harness_id in session_status_text
     assert work_result.active_harness_id in list_text
     assert "cleanup" not in list_text.lower()
     assert "har_cleanup" in workflows_text

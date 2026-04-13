@@ -72,7 +72,10 @@ class HarnessService:
 
         goal = command[len("/harness") :].strip()
         if goal.lower() == "status":
-            return HarnessCommandResult(response_mode="text", text=self.render_status())
+            return HarnessCommandResult(
+                response_mode="text",
+                text=self.render_status_for_session(session_key=session_key),
+            )
         if goal.lower() == "list":
             return HarnessCommandResult(response_mode="text", text=self.render_list())
         if goal.lower() == "workflows":
@@ -159,6 +162,21 @@ class HarnessService:
     def render_status(self) -> str:
         snapshot = self.store.load()
         active = self._get_active_record(snapshot)
+        if active is None:
+            return "No active harness."
+        return "\n".join(
+            [
+                f"Active harness: {active.id}",
+                f"Title: {active.title or '[untitled]'}",
+                f"Kind: {active.kind}",
+                f"Status: {active.status}",
+                f"Phase: {active.phase}",
+            ]
+        )
+
+    def render_status_for_session(self, *, session_key: str) -> str:
+        snapshot = self.store.load()
+        active = self._get_session_bound_record(snapshot, session_key=session_key)
         if active is None:
             return "No active harness."
         return "\n".join(

@@ -53,13 +53,15 @@ def test_runtime_harness_command_returns_text_response_for_status() -> None:
     register_builtin_commands(router)
     ctx = _make_ctx("/harness status")
 
-    fake_service = SimpleNamespace(
-        handle_command=lambda *args, **kwargs: SimpleNamespace(
+    def _handle_command(raw: str, *, session_key: str, sender_id: str):
+        assert session_key == "feishu:c1"
+        return SimpleNamespace(
             response_mode="text",
             text="Active harness: har_0001",
             prepared_input="",
         )
-    )
+
+    fake_service = SimpleNamespace(handle_command=_handle_command)
 
     with patch("nanobot.command.harness.HarnessService.for_workspace", return_value=fake_service):
         result = asyncio.run(router.dispatch(ctx))
@@ -74,6 +76,27 @@ def test_runtime_harness_command_accepts_uppercase_prefix_for_status(tmp_path: P
     router = CommandRouter()
     register_builtin_commands(router)
     ctx = _make_ctx("/HARNESS status")
+
+    with patch("nanobot.command.harness.get_workspace_path", return_value=tmp_path):
+        result = asyncio.run(router.dispatch(ctx))
+
+    assert result is not None
+    assert result.content == "No active harness."
+    assert result.metadata == {"render_as": "text"}
+
+
+def test_runtime_harness_status_hides_unbound_global_active_for_other_session(
+    tmp_path: Path,
+) -> None:
+    router = CommandRouter()
+    register_builtin_commands(router)
+    ctx = _make_ctx("/harness status")
+    service = HarnessService.for_workspace(tmp_path)
+    service.handle_command(
+        "/harness 修复 interrupt 的真实接线",
+        session_key="feishu:other",
+        sender_id="u2",
+    )
 
     with patch("nanobot.command.harness.get_workspace_path", return_value=tmp_path):
         result = asyncio.run(router.dispatch(ctx))
