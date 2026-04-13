@@ -296,9 +296,14 @@ class SubagentResourceManager:
             return []
 
         preferred = self._clean(preferred_route)
-        healthy: list[tuple[int, str]] = []
-        transient: list[tuple[int, str]] = []
-        unhealthy: list[tuple[int, str]] = []
+        ordered_routes: list[str] = []
+        for policy in self.tier_policies.values():
+            for item in policy.route_preferences:
+                route = self._clean(item)
+                if route and route not in ordered_routes:
+                    ordered_routes.append(route)
+
+        ranked: list[tuple[int, int, str]] = []
         for model_id, raw in models.items():
             if not isinstance(raw, dict):
                 continue
@@ -310,34 +315,24 @@ class SubagentResourceManager:
                 continue
             route = self._clean(raw.get("route"))
             policy = self.route_policies.get(route, RoutePolicy())
-            route_rank = self._route_preference_rank(route, preferred_route=preferred)
-            if policy.availability in {"hard_unavailable", "manual_outage"}:
-                unhealthy.append((route_rank, model_id))
-            elif policy.availability == "transient_unavailable":
-                transient.append((route_rank, model_id))
-            else:
-                healthy.append((route_rank, model_id))
-
-        healthy.sort()
-        transient.sort()
-        unhealthy.sort()
-        return [model_id for _, model_id in healthy + transient + unhealthy]
-
-    def has_eligible_candidates(self, candidates: list[str] | tuple[str, ...]) -> bool:
-        for model_id in candidates:
-            if not isinstance(model_id, str) or not model_id.strip():
-                continue
-            raw = self._model_record(model_id)
-            if not isinstance(raw, dict):
-                continue
-            route = str(raw.get("route") or "").strip()
-            if not route:
-                continue
-            policy = self.route_policies.get(route, RoutePolicy())
             availability = str(policy.availability or "available").strip()
-            if availability not in {"hard_unavailable", "manual_outage"}:
-                return True
-        return False
+            if availability in {"hard_unavailable", "manual_outage"}:
+                availability_rank = 2
+            elif availability == "transient_unavailable":
+                availability_rank = 1
+            else:
+                availability_rank = 0
+            if preferred and route == preferred:
+                route_rank = -1
+            else:
+                try:
+                    route_rank = ordered_routes.index(route)
+                except ValueError:
+                    route_rank = len(ordered_routes) + 100
+            ranked.append((availability_rank, route_rank, model_id))
+
+        ranked.sort()
+        return [model_id for _, _, model_id in ranked]
 
     def resolve_spawn_request(
         self,
@@ -414,22 +409,6 @@ class SubagentResourceManager:
                 )
 
         raise ValueError("spawn requires `type` or `model`")
-
-    def _route_preference_rank(self, route: str, *, preferred_route: str | None = None) -> int:
-        route_clean = self._clean(route)
-        preferred = self._clean(preferred_route)
-        if preferred and route_clean == preferred:
-            return -1
-        routes: list[str] = []
-        for policy in self.tier_policies.values():
-            for item in policy.route_preferences:
-                cleaned = self._clean(item)
-                if cleaned and cleaned not in routes:
-                    routes.append(cleaned)
-        try:
-            return routes.index(route_clean)
-        except ValueError:
-            return len(routes) + 100
 
     def _reserved_quota_exhausted(self, policy: RoutePolicy, state: RouteState) -> bool:
         limit = int(policy.window_request_limit or 0)
