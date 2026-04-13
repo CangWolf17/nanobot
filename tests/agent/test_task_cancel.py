@@ -633,7 +633,7 @@ class TestSubagentCancellation:
 
         spawn_tool = SpawnTool(manager=mgr)
         spawn_tool.set_context("telegram", "chat-1")
-        result = await spawn_tool.execute(task="do task", label="bg", tier="standard")
+        result = await spawn_tool.execute(task="do task", name="bg", tier="standard")
 
         assert "started" in result.lower()
         running = list(mgr._running_tasks.values())
@@ -678,7 +678,7 @@ class TestSubagentCancellation:
                 "_origin_sender_id": "user1",
             },
         )
-        result = await spawn_tool.execute(task="do task", label="bg", tier="standard")
+        result = await spawn_tool.execute(task="do task", name="bg", tier="standard")
 
         assert "started" in result.lower()
         running = list(mgr._running_tasks.values())
@@ -725,7 +725,7 @@ class TestSubagentCancellation:
                 },
             },
         )
-        result = await spawn_tool.execute(task="do task", label="bg", tier="standard")
+        result = await spawn_tool.execute(task="do task", name="bg", tier="standard")
 
         assert "blocked" in result.lower()
         assert "subagent_allowed=false" in result
@@ -764,7 +764,7 @@ class TestSubagentCancellation:
         mgr.resource_manager = resource_manager
         mgr._run_subagent = AsyncMock()
 
-        result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
+        result = await mgr.spawn(task="do task", name="bg", tier="standard", session_key="test:c1")
 
         assert "started" in result.lower()
         request = resource_manager.resolve_spawn_request.call_args.args[0]
@@ -794,6 +794,23 @@ class TestSubagentCancellation:
         kwargs = mgr.spawn.await_args.kwargs
         assert kwargs["name"] == "bg-worker"
         assert kwargs["subagent_type"] == "worker"
+        assert "label" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_spawn_tool_ignores_legacy_label_passthrough(self):
+        from nanobot.agent.tools.spawn import SpawnTool
+
+        mgr = MagicMock()
+        mgr.spawn = AsyncMock(return_value="started")
+        tool = SpawnTool(manager=mgr)
+
+        result = await tool.execute(task="do task", type="worker", label="legacy-name")
+
+        assert result == "started"
+        kwargs = mgr.spawn.await_args.kwargs
+        assert kwargs["name"] is None
+        assert kwargs["subagent_type"] == "worker"
+        assert "label" not in kwargs
 
     def test_spawn_tool_exposes_canonical_name_type_and_model_parameters(self):
         from nanobot.agent.tools.spawn import SpawnTool
@@ -809,7 +826,7 @@ class TestSubagentCancellation:
         assert "label" not in props
         assert "tier" not in props
         assert "Preferred call shapes" in tool.description
-        assert "Legacy label/tier inputs" in tool.description
+        assert "Legacy tier input" in tool.description
 
     @pytest.mark.asyncio
     async def test_spawn_tool_rejects_calls_without_type_model_or_tier(self):
@@ -819,7 +836,7 @@ class TestSubagentCancellation:
         mgr.spawn = AsyncMock(return_value="Subagent request rejected: missing selector. Provide `type` or `model` (or deprecated compatibility `tier`).")
         tool = SpawnTool(manager=mgr)
 
-        result = await tool.execute(task="do task", label="bg")
+        result = await tool.execute(task="do task")
 
         assert "missing selector" in result.lower()
         mgr.spawn.assert_awaited_once()
@@ -850,7 +867,7 @@ class TestSubagentCancellation:
         mgr.resource_manager = resource_manager
         mgr._run_subagent = AsyncMock()
 
-        result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
+        result = await mgr.spawn(task="do task", name="bg", tier="standard", session_key="test:c1")
 
         assert "rejected" in result.lower()
         assert "queue_limit" in result
@@ -867,7 +884,7 @@ class TestSubagentCancellation:
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
 
         request = mgr._build_spawn_request(
-            label="bg",
+            name="bg",
             origin={"channel": "feishu", "chat_id": "c1", "metadata": {}},
         )
 
@@ -883,7 +900,7 @@ class TestSubagentCancellation:
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
 
         request = mgr._build_spawn_request(
-            label="bg",
+            name="bg",
             tier="standard",
             origin={"channel": "feishu", "chat_id": "c1", "metadata": {}},
         )
@@ -903,13 +920,13 @@ class TestSubagentCancellation:
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
         mgr._run_subagent = AsyncMock()
 
-        result = await mgr.spawn(task="do task", label="bg", session_key="test:c1")
+        result = await mgr.spawn(task="do task", session_key="test:c1")
 
         assert "missing selector" in result.lower()
         mgr._run_subagent.assert_not_awaited()
         assert mgr._running_tasks == {}
 
-    def test_build_spawn_request_prefers_name_over_label_and_captures_main_route(self, tmp_path):
+    def test_build_spawn_request_captures_name_and_main_route(self, tmp_path):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
 
@@ -952,7 +969,6 @@ class TestSubagentCancellation:
         request = mgr._build_spawn_request(
             name="real-name",
             subagent_type="worker",
-            label="compat-label",
             origin={"channel": "feishu", "chat_id": "c1", "metadata": {}},
         )
 
@@ -2140,7 +2156,7 @@ class TestSubagentCancellation:
             )
         )
 
-        result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
+        result = await mgr.spawn(task="do task", name="bg", tier="standard", session_key="test:c1")
         assert "started" in result.lower()
         running = list(mgr._running_tasks.values())
         assert len(running) == 1
@@ -2179,7 +2195,7 @@ class TestSubagentCancellation:
         mgr._announce_result = AsyncMock()
         mgr.runner.run = AsyncMock(side_effect=RuntimeError("boom"))
 
-        result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
+        result = await mgr.spawn(task="do task", name="bg", tier="standard", session_key="test:c1")
         assert "started" in result.lower()
         running = list(mgr._running_tasks.values())
         assert len(running) == 1
@@ -2237,7 +2253,7 @@ class TestSubagentCancellation:
 
         monkeypatch.setattr("nanobot.agent.tools.registry.ToolRegistry.execute", fake_execute)
 
-        result = await mgr.spawn(task="do task", label="bg", tier="standard", session_key="test:c1")
+        result = await mgr.spawn(task="do task", name="bg", tier="standard", session_key="test:c1")
         assert "started" in result.lower()
         running = list(mgr._running_tasks.values())
         assert len(running) == 1

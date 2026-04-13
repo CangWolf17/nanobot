@@ -19,8 +19,8 @@ from each other.
 Current reality is:
 
 1. the **preferred public spawn surface is already `task + type` or `task + model`**
-2. `label` / `tier` are **still accepted as compatibility inputs**
-3. the remaining live compatibility logic is **small in runtime code but broad in tests**
+2. legacy `label` compatibility has now been retired from runtime spawn handling
+3. `tier` is **still accepted as the remaining compatibility input**
 4. current truth docs are **mostly aligned** with that reality
 5. the main retirement decision is **not** "remove everything called `tier`"
 6. the real decision is:
@@ -45,36 +45,34 @@ Current state:
 But runtime compatibility still exists because:
 
 - `execute(..., **kwargs)` still reads:
-  - `label = kwargs.get("label")`
   - `tier = kwargs.get("tier")`
-- then forwards them into `SubagentManager.spawn(...)`
+- legacy `label` kwargs are ignored rather than forwarded into `SubagentManager.spawn(...)`
 
 Interpretation:
 
 - `label` / `tier` are no longer first-class schema fields
-- they still work if an older caller or prompt payload sends them anyway
+- `label` no longer changes runtime behavior
+- `tier` still works if an older caller or prompt payload sends it anyway
 
 This means the public API is already mostly cleaned up.
-The remaining compatibility here is passthrough, not front-door design.
+The remaining compatibility here is now just `tier` passthrough, not front-door design.
 
 ### 2. `nanobot/agent/subagent.py`
 
 Current live compatibility points:
 
 - `SubagentManager.spawn(...)` still accepts:
-  - `label`
   - `tier`
 - selector validation still allows the legacy path:
   - request is valid if it has `type` or `model` or deprecated `tier`
 - `_build_spawn_request(...)` still converts:
-  - `name or label -> request.name`
   - `tier -> compatibility_tier`
 - special normalization still exists:
   - if no `type/model` and `tier == "standard"`, set `subagent_type = "worker"`
 
 Interpretation:
 
-- `label` is now mostly a display-name compatibility input
+- `label` is no longer part of manager-level spawn compatibility
 - `tier=standard` is no longer a separate primary route; it is first normalized toward `worker`
 - the manager still preserves old behavior in case worker candidates are not usable
 
@@ -118,29 +116,30 @@ Recommendation:
 
 Targeted files and rough identifier frequency:
 
-- `nanobot/agent/tools/spawn.py`: `label=6`, `tier=5`
-- `nanobot/agent/subagent.py`: `label=26`, `tier=8`, `compatibility_tier=4`
+- `nanobot/agent/tools/spawn.py`: `tier=5`
+- `nanobot/agent/subagent.py`: `tier=8`, `compatibility_tier=4`
 - `nanobot/agent/subagent_resources.py`: `tier=23`, `compatibility_tier=9`
 
 Interpretation:
 
 - most remaining real compatibility behavior is concentrated in:
-  - `subagent.py`
   - `subagent_resources.py`
-- `spawn.py` is already mostly presenting the new surface
+- `subagent.py` now mainly carries the standard-tier normalization bridge
+- `spawn.py` is now just the new surface plus legacy tier passthrough
 
 ### Test footprint
 
 Compatibility references remain much broader in tests:
 
-- `tests/agent/test_task_cancel.py`: `label=26`, `tier=46`, `compatibility_tier=8`
+- `tests/agent/test_task_cancel.py`: mostly `tier` / `compatibility_tier` coverage plus one regression test that legacy `label` is ignored
 - `tests/agent/test_subagent_resources.py`: `tier=20`
-- `tests/agent/test_subagent_queue.py`: `label=2`, `tier=1`
+- `tests/agent/test_subagent_queue.py`: `tier`-shaped queue coverage only
 
 Interpretation:
 
-- compatibility is still heavily protected by tests
-- removing it is not blocked by hidden runtime callers so much as by an intentional test contract
+- remaining compatibility is still heavily protected by tests
+- `label` is no longer blocked by runtime or compatibility tests
+- the real protected compatibility contract is now mostly tier-shaped
 
 ## What The Tests Say About The Current Design
 
@@ -150,18 +149,18 @@ The tests show the intended present-day contract very clearly:
 
 - spawn tool exposes `name`, `type`, `model`
 - spawn tool hides `label`, `tier` from the schema
+- legacy `label` no longer passes through into manager spawn handling
 - `tier=standard` is normalized toward `type=worker`
 - typed resolution is preferred when worker candidates exist
 
 ### Still intentionally supported
 
-- calls with legacy `label`
 - calls with legacy `tier="standard"`
 - compatibility-only resolution when typed worker candidates do not exist
 - compatibility-only resolution when typed worker candidates are unusable because of route status
 
 This means current tests are not just preserving old syntax accidentally.
-They are preserving a deliberate fallback story.
+They are preserving a deliberate remaining fallback story around `tier`, not around `label`.
 
 ## Are The Existing Docs Aligned With Reality?
 
@@ -173,10 +172,12 @@ The current truth docs already describe the live shape correctly:
   - says resolution chooses from explicit model, typed subagent role, then compatibility tier
 - `docs/patches/2026-04-12-subagent-simplification-review.md`
   - says the preferred surface is `type/model`
-  - says `label` / `tier` remain compatibility inputs
+  - reflects the earlier cleanup checkpoint before `label` retirement
 - `docs/patches/2026-04-13-subagent-cleanup-review.md`
   - says the public spawn surface is narrower
   - says standard-tier compatibility now points earlier toward worker
+- this inventory
+  - records the post-cleanup, post-label-retirement state
 
 So for the **current-truth document set**, reality and docs are aligned.
 
@@ -194,22 +195,19 @@ The problem, if any, is only that older docs must keep being treated as historic
 
 ## Practical Retirement Options
 
-### Option A — retire `label` first
+### Option A — `label` is done
 
-Lowest-risk retirement target:
+This was the lowest-risk retirement target, and it is now complete:
 
-- stop accepting legacy `label` in manager/tool internals
+- `SpawnTool` no longer forwards `label`
+- `SubagentManager.spawn(...)` no longer accepts `label`
+- `_build_spawn_request(...)` no longer maps `label -> name`
 
-Why this is the easiest:
+Why this was the easiest:
 
 - schema already prefers `name`
-- runtime behavior already treats `label` mostly as display-name compatibility
+- runtime behavior had already reduced `label` to mostly display-name compatibility
 - this would mainly touch compatibility tests and manager plumbing
-
-Risk:
-
-- some callers may still send `label` out of habit
-- if that matters, this change needs a migration message rather than silent removal
 
 ### Option B — retire `standard` compatibility only after caller inventory
 
@@ -236,9 +234,8 @@ Why:
 Recommendation:
 
 - if compatibility retirement starts, do it in this order:
-  1. `label`
-  2. maybe `standard`
-  3. `lite` last
+  1. maybe `standard`
+  2. `lite` last
 
 ## Bottom Line
 
@@ -247,10 +244,11 @@ The compatibility story is already narrower than it may feel from reading the co
 In plain language:
 
 - the **front door is already new-style**
-- the **middle layer still accepts old keys**
-- the **real legacy behavior mostly survives inside resource resolution and tests**
+- the **`label` compatibility layer is gone**
+- the **remaining old key with real behavior is `tier`**
+- the **real remaining legacy behavior mostly survives inside resource resolution and tests**
 
 So the next useful move is not a blind cleanup.
 It is this:
 
-> decide explicitly whether we still need `standard` and `lite` compatibility behavior in real runtime scenarios, then retire the remaining layers in that order instead of treating every `tier` string as equal technical debt.
+> decide explicitly whether we still need `standard` and `lite` compatibility behavior in real runtime scenarios, then retire the remaining tier-shaped layers in order instead of treating every `tier` string as equal technical debt.

@@ -114,7 +114,6 @@ class SubagentManager:
         task: str,
         name: str | None = None,
         subagent_type: str | None = None,
-        label: str | None = None,
         tier: str | None = None,
         model: str | None = None,
         origin_channel: str = "cli",
@@ -135,7 +134,7 @@ class SubagentManager:
                 "Subagent request rejected: missing selector. "
                 "Provide `type` or `model` (or deprecated compatibility `tier`)."
             )
-        display_name = (name or label or "").strip()
+        display_name = (name or "").strip()
         display_label = display_name or task[:30] + ("..." if len(task) > 30 else "")
         origin = {
             "channel": origin_channel,
@@ -157,7 +156,6 @@ class SubagentManager:
             spawn_request = self._build_spawn_request(
                 name=name,
                 subagent_type=subagent_type,
-                label=label,
                 tier=tier,
                 model=model,
                 origin=origin,
@@ -860,13 +858,12 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
         *,
         name: str | None = None,
         subagent_type: str | None = None,
-        label: str | None = None,
         tier: str | None = None,
         model: str | None = None,
         origin: dict[str, Any],
     ) -> RuntimeSubagentSpawnRequest:
         preferred_route = self._resolve_preferred_route(origin)
-        effective_name = (name or label or "").strip() or None
+        effective_name = (name or "").strip() or None
         effective_type = (subagent_type or "").strip() or None
         effective_model = (model or "").strip() or None
         compatibility_tier = (tier or "").strip() or None

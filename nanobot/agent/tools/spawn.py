@@ -61,7 +61,7 @@ class SpawnTool(Tool):
             "Preferred call shapes: (task + type) or (task + model). "
             "Use type=worker for implementation/execution and type=explorer for reconnaissance/search. "
             "Do not omit both type and model. "
-            "Legacy label/tier inputs are still accepted for compatibility, but they are not part of the preferred surface. "
+            "Legacy tier input is still accepted for compatibility, but it is not part of the preferred surface. "
             "For deliverables or existing projects, inspect the workspace first "
             "and use a dedicated subdirectory when helpful."
         )
@@ -77,7 +77,7 @@ class SpawnTool(Tool):
                 },
                 "name": {
                     "type": "string",
-                    "description": "Optional short identifier for the subagent. Prefer `name` over deprecated `label`.",
+                    "description": "Optional short identifier for the subagent.",
                 },
                 "type": {
                     "type": "string",
@@ -101,13 +101,11 @@ class SpawnTool(Tool):
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
-        label = kwargs.get("label")
         tier = kwargs.get("tier")
         return await self._manager.spawn(
             task=task,
             name=name,
             subagent_type=type,
-            label=label,
             tier=tier,
             model=model,
             origin_channel=self._origin_channel,

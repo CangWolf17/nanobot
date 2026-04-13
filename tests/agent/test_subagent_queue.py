@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -40,7 +38,7 @@ async def test_spawn_returns_queued_and_starts_after_drain(tmp_path) -> None:
     mgr.resource_manager = resource_manager
     mgr._run_subagent = AsyncMock()
 
-    result = await mgr.spawn(task="do task", label="bg", subagent_type="worker", session_key="test:c1")
+    result = await mgr.spawn(task="do task", name="bg", subagent_type="worker", session_key="test:c1")
 
     assert "queued" in result.lower()
     assert mgr.get_pending_count() == 1
@@ -83,10 +81,10 @@ async def test_cancel_by_session_removes_pending_tasks(tmp_path) -> None:
     resource_manager.release_waiting_route = MagicMock()
     mgr.resource_manager = resource_manager
 
-    result = await mgr.spawn(task="do task", label="bg", subagent_type="worker", session_key="test:c1")
+    result = await mgr.spawn(task="do task", name="bg", subagent_type="worker", session_key="test:c1")
 
     assert "queued" in result.lower()
-    count = await mgr.cancel_by_session("test:c1")
+    await mgr.cancel_by_session("test:c1")
 
 
 
