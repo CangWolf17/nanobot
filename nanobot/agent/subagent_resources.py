@@ -663,6 +663,79 @@ def _normalize_status(value: object) -> tuple[str, str]:
     return "available", ""
 
 
+def _route_policy_with_status(
+    base: RoutePolicy,
+    *,
+    availability: str,
+    reason: str,
+) -> RoutePolicy:
+    return RoutePolicy(
+        max_concurrency=base.max_concurrency,
+        availability=str(availability or base.availability or "available").strip() or "available",
+        unavailable_reason=str(reason or "").strip(),
+        window_request_limit=base.window_request_limit,
+        reserved_requests=base.reserved_requests,
+    )
+
+
+def _apply_route_status(
+    route_policies: dict[str, RoutePolicy],
+    *,
+    route: str,
+    availability: str,
+    reason: str,
+) -> bool:
+    route_clean = str(route or "").strip()
+    if not route_clean:
+        return False
+    base = route_policies.get(route_clean, RoutePolicy())
+    route_policies[route_clean] = _route_policy_with_status(
+        base,
+        availability=availability,
+        reason=reason,
+    )
+    return True
+
+
+def _load_registry_for_status_update(workspace: Path) -> tuple[Path, dict[str, Any]]:
+    registry_path = workspace / "model_registry.json"
+    data = _load_json(registry_path)
+    if not isinstance(data, dict):
+        data = {}
+    return registry_path, data
+
+
+def _provider_status_bucket(data: dict[str, Any]) -> dict[str, Any]:
+    provider_status = data.setdefault("provider_status", {})
+    if not isinstance(provider_status, dict):
+        provider_status = {}
+        data["provider_status"] = provider_status
+    return provider_status
+
+
+def _persist_provider_status_entry(
+    *,
+    registry_path: Path,
+    data: dict[str, Any],
+    route: str,
+    availability: str,
+    reason: str,
+    source: str,
+    updated_at: str,
+) -> None:
+    route_clean = str(route or "").strip()
+    if not route_clean:
+        return
+    provider_status = _provider_status_bucket(data)
+    provider_status[route_clean] = {
+        "availability": str(availability or "available").strip() or "available",
+        "reason": str(reason or "").strip(),
+        "source": str(source or "").strip(),
+        "updated_at": str(updated_at or "").strip(),
+    }
+    registry_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def record_provider_failure(
     *,
     workspace: Path,
@@ -675,21 +748,17 @@ def record_provider_failure(
     if not route_clean:
         return None
     status = classify_provider_failure(error_text)
-    registry_path = workspace / "model_registry.json"
-    data = _load_json(registry_path)
-    if not isinstance(data, dict):
-        data = {}
-    provider_status = data.setdefault("provider_status", {})
-    if not isinstance(provider_status, dict):
-        provider_status = {}
-        data["provider_status"] = provider_status
-    provider_status[route_clean] = {
-        "availability": status.availability,
-        "reason": status.reason,
-        "source": str(source or _provider_status_runtime_error_source(data)).strip() or _provider_status_runtime_error_source(data),
-        "updated_at": str(updated_at or _utc_now_iso()).strip() or _utc_now_iso(),
-    }
-    registry_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    registry_path, data = _load_registry_for_status_update(workspace)
+    _persist_provider_status_entry(
+        registry_path=registry_path,
+        data=data,
+        route=route_clean,
+        availability=status.availability,
+        reason=status.reason,
+        source=str(source or _provider_status_runtime_error_source(data)).strip()
+        or _provider_status_runtime_error_source(data),
+        updated_at=str(updated_at or _utc_now_iso()).strip() or _utc_now_iso(),
+    )
     return status
 
 
@@ -704,21 +773,17 @@ def refresh_provider_status(
     route_clean = str(route or "").strip()
     if not route_clean:
         return
-    registry_path = workspace / "model_registry.json"
-    data = _load_json(registry_path)
-    if not isinstance(data, dict):
-        data = {}
-    provider_status = data.setdefault("provider_status", {})
-    if not isinstance(provider_status, dict):
-        provider_status = {}
-        data["provider_status"] = provider_status
-    provider_status[route_clean] = {
-        "availability": "available",
-        "reason": "",
-        "source": str(source or _provider_status_refresh_source(data)).strip() or _provider_status_refresh_source(data),
-        "updated_at": str(updated_at or _utc_now_iso()).strip() or _utc_now_iso(),
-    }
-    registry_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    registry_path, data = _load_registry_for_status_update(workspace)
+    _persist_provider_status_entry(
+        registry_path=registry_path,
+        data=data,
+        route=route_clean,
+        availability="available",
+        reason="",
+        source=str(source or _provider_status_refresh_source(data)).strip()
+        or _provider_status_refresh_source(data),
+        updated_at=str(updated_at or _utc_now_iso()).strip() or _utc_now_iso(),
+    )
 
 
 
@@ -1340,16 +1405,11 @@ def refresh_provider_in_manager(
     *,
     route: str,
 ) -> None:
-    route_clean = str(route or "").strip()
-    if not route_clean:
-        return
-    base = manager.route_policies.get(route_clean, RoutePolicy())
-    manager.route_policies[route_clean] = RoutePolicy(
-        max_concurrency=base.max_concurrency,
+    _apply_route_status(
+        manager.route_policies,
+        route=route,
         availability="available",
-        unavailable_reason="",
-        window_request_limit=base.window_request_limit,
-        reserved_requests=base.reserved_requests,
+        reason="",
     )
 
 
@@ -1360,17 +1420,14 @@ def apply_provider_failure_to_manager(
     route: str,
     error_text: str | None,
 ) -> ProviderFailureStatus | None:
-    route_clean = str(route or "").strip()
-    if not route_clean:
+    if not str(route or "").strip():
         return None
     status = classify_provider_failure(error_text)
-    base = manager.route_policies.get(route_clean, RoutePolicy())
-    manager.route_policies[route_clean] = RoutePolicy(
-        max_concurrency=base.max_concurrency,
+    _apply_route_status(
+        manager.route_policies,
+        route=route,
         availability=status.availability,
-        unavailable_reason=status.reason,
-        window_request_limit=base.window_request_limit,
-        reserved_requests=base.reserved_requests,
+        reason=status.reason,
     )
     return status
 
@@ -1443,13 +1500,11 @@ def build_manager_from_workspace_snapshot(
             if _status_is_stale(status, now=now, transient_ttl_seconds=transient_ttl_seconds):
                 continue
             availability, reason = _normalize_status(status)
-            base = route_policies[route_clean]
-            route_policies[route_clean] = RoutePolicy(
-                max_concurrency=base.max_concurrency,
+            _apply_route_status(
+                route_policies,
+                route=route_clean,
                 availability=availability,
-                unavailable_reason=reason,
-                window_request_limit=base.window_request_limit,
-                reserved_requests=base.reserved_requests,
+                reason=reason,
             )
 
     for route, status in (provider_status or {}).items():
@@ -1457,13 +1512,11 @@ def build_manager_from_workspace_snapshot(
         if route_clean not in route_policies:
             continue
         availability, reason = _normalize_status(status)
-        base = route_policies[route_clean]
-        route_policies[route_clean] = RoutePolicy(
-            max_concurrency=base.max_concurrency,
+        _apply_route_status(
+            route_policies,
+            route=route_clean,
             availability=availability,
-            unavailable_reason=reason,
-            window_request_limit=base.window_request_limit,
-            reserved_requests=base.reserved_requests,
+            reason=reason,
         )
 
     tier_policies = {
