@@ -17,6 +17,7 @@ from nanobot.command.workspace_bridge import cmd_workspace_bridge
 from nanobot.config.paths import get_workspace_path
 from nanobot.harness.service import HarnessService
 from nanobot.utils.helpers import build_status_content
+from nanobot.utils.restart import set_restart_notice_to_env
 
 
 def build_help_text() -> str:
@@ -170,6 +171,7 @@ async def cmd_interrupt(ctx: CommandContext) -> OutboundMessage:
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
     """Restart the process in-place via os.execv."""
     msg = ctx.msg
+    set_restart_notice_to_env(channel=msg.channel, chat_id=msg.chat_id)
 
     async def _do_restart():
         await asyncio.sleep(1)
