@@ -1238,26 +1238,52 @@ def _runtime_probe_strategy(
 
 
 
+def _probe_runner_for_strategy(strategy: str):
+    if strategy == "runtime":
+        return run_runtime_quick_provider_probe
+    if strategy == "workspace_fallback":
+        return run_legacy_workspace_provider_probe
+    return None
+
+
+
+def _unsupported_probe_result(*, strategy: str, reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "provider": "",
+        "api_base": "",
+        "route": "",
+        "reason": reason,
+        "strategy": strategy,
+    }
+
+
+
+def _annotate_probe_result(
+    probe: dict[str, Any] | None,
+    *,
+    strategy: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    if not isinstance(probe, dict):
+        return None
+    result = dict(probe)
+    result.setdefault("strategy", strategy)
+    result.setdefault("reason", reason if not result.get("reason") else result.get("reason"))
+    return result
+
+
+
 def run_default_provider_probe(workspace: Path, *, ref: str) -> dict[str, Any] | None:
     strategy, reason = _runtime_probe_strategy(workspace, ref=ref)
-    if strategy == "runtime":
-        probe = run_runtime_quick_provider_probe(workspace, ref=ref)
-    elif strategy == "workspace_fallback":
-        probe = run_legacy_workspace_provider_probe(workspace, ref=ref)
-    else:
-        return {
-            "ok": False,
-            "provider": "",
-            "api_base": "",
-            "route": "",
-            "reason": reason,
-            "strategy": strategy,
-        }
-    if isinstance(probe, dict):
-        probe = dict(probe)
-        probe.setdefault("strategy", strategy)
-        probe.setdefault("reason", reason if not probe.get("reason") else probe.get("reason"))
-    return probe
+    runner = _probe_runner_for_strategy(strategy)
+    if runner is None:
+        return _unsupported_probe_result(strategy=strategy, reason=reason)
+    return _annotate_probe_result(
+        runner(workspace, ref=ref),
+        strategy=strategy,
+        reason=reason,
+    )
 
 
 
@@ -1367,6 +1393,27 @@ def probe_due_provider_routes(
 
 
 
+def _probe_route_status_result(
+    *,
+    status: str,
+    reason: str,
+    route: str,
+    ref: str | None = None,
+    probe: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "route": route,
+    }
+    if ref:
+        result["ref"] = ref
+    if isinstance(probe, dict):
+        result["probe"] = probe
+    return result
+
+
+
 def probe_provider_route_status(
     *,
     workspace: Path,
@@ -1379,10 +1426,10 @@ def probe_provider_route_status(
     route_clean = str(route or "").strip()
     last_updated_at = _provider_status_last_updated_at(registry, route_clean)
     if not _is_probe_due(last_updated_at, now=now, probe_interval_seconds=probe_interval_seconds):
-        return {"status": "skipped", "reason": "not_due", "route": route_clean}
+        return _probe_route_status_result(status="skipped", reason="not_due", route=route_clean)
     ref = _probe_ref_for_route(registry, route_clean)
     if not ref:
-        return {"status": "skipped", "reason": "no_probe_ref", "route": route_clean}
+        return _probe_route_status_result(status="skipped", reason="no_probe_ref", route=route_clean)
     runner = probe_runner or run_default_provider_probe
     probe = runner(workspace, ref=ref)
     applied_route = apply_provider_probe_result(
@@ -1390,13 +1437,13 @@ def probe_provider_route_status(
         probe=probe,
         updated_at=now,
     )
-    return {
-        "status": "updated" if applied_route else "skipped",
-        "reason": "applied" if applied_route else "unknown_route",
-        "route": applied_route or route_clean,
-        "ref": ref,
-        "probe": probe if isinstance(probe, dict) else None,
-    }
+    return _probe_route_status_result(
+        status="updated" if applied_route else "skipped",
+        reason="applied" if applied_route else "unknown_route",
+        route=applied_route or route_clean,
+        ref=ref,
+        probe=probe if isinstance(probe, dict) else None,
+    )
 
 
 
