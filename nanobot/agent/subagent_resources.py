@@ -103,6 +103,16 @@ class AcquireDecision:
     queue_tier: str = ""
 
 
+@dataclass(frozen=True)
+class RuntimeProbeRequest:
+    url: str
+    headers: dict[str, str]
+    payload: dict[str, Any]
+    provider: str
+    api_base: str
+    route: str
+
+
 class SubagentResourceManager:
     def __init__(
         self,
@@ -1087,7 +1097,7 @@ def _build_runtime_probe_request(
     *,
     resolved: str,
     raw: dict[str, Any],
-) -> tuple[str, dict[str, str], dict[str, Any], str, str, str] | None:
+) -> RuntimeProbeRequest | None:
     backend = _runtime_probe_backend(raw)
     connection = raw.get("connection") if isinstance(raw.get("connection"), dict) else {}
     api_base = str(connection.get("api_base") or "").strip()
@@ -1108,7 +1118,14 @@ def _build_runtime_probe_request(
             extra_headers=extra_headers,
             raw=raw,
         )
-        return url, headers, payload, provider_name, api_base, route
+        return RuntimeProbeRequest(
+            url=url,
+            headers=headers,
+            payload=payload,
+            provider=provider_name,
+            api_base=api_base,
+            route=route,
+        )
 
     if backend == "azure_openai":
         if not api_base:
@@ -1119,7 +1136,14 @@ def _build_runtime_probe_request(
             api_key=api_key,
             raw=raw,
         )
-        return url, headers, payload, provider_name, api_base, route
+        return RuntimeProbeRequest(
+            url=url,
+            headers=headers,
+            payload=payload,
+            provider=provider_name,
+            api_base=api_base,
+            route=route,
+        )
 
     if backend == "anthropic":
         api_base = api_base or _ANTHROPIC_DEFAULT_API_BASE
@@ -1129,7 +1153,14 @@ def _build_runtime_probe_request(
             api_key=api_key,
             extra_headers=extra_headers,
         )
-        return url, headers, payload, provider_name, api_base, route
+        return RuntimeProbeRequest(
+            url=url,
+            headers=headers,
+            payload=payload,
+            provider=provider_name,
+            api_base=api_base,
+            route=route,
+        )
 
     if backend == "github_copilot":
         api_base = api_base or _GITHUB_COPILOT_DEFAULT_API_BASE
@@ -1138,7 +1169,14 @@ def _build_runtime_probe_request(
             api_base=api_base,
             extra_headers=extra_headers,
         )
-        return url, headers, payload, provider_name, api_base, route
+        return RuntimeProbeRequest(
+            url=url,
+            headers=headers,
+            payload=payload,
+            provider=provider_name,
+            api_base=api_base,
+            route=route,
+        )
 
     return None
 
@@ -1160,6 +1198,38 @@ def _resolve_runtime_probe_target(
 
 
 
+def _default_probe_request_runner(
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+):
+    return httpx.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+    )
+
+
+
+def _runtime_probe_result(
+    request: RuntimeProbeRequest,
+    *,
+    ok: bool,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "ok": ok,
+        "provider": request.provider,
+        "api_base": request.api_base,
+        "route": request.route,
+        "reason": reason,
+    }
+
+
+
 def run_runtime_quick_provider_probe(
     workspace: Path,
     *,
@@ -1174,49 +1244,23 @@ def run_runtime_quick_provider_probe(
     request = _build_runtime_probe_request(resolved=resolved, raw=raw)
     if request is None:
         return None
-    url, headers, payload, provider_name, api_base, route = request
 
-    runner = request_runner or (
-        lambda *, url, headers, payload, timeout: httpx.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=timeout,
-        )
-    )
+    runner = request_runner or _default_probe_request_runner
     try:
         response = runner(
-            url=url,
-            headers=headers,
-            payload=payload,
+            url=request.url,
+            headers=request.headers,
+            payload=request.payload,
             timeout=60.0,
         )
     except Exception as exc:
-        return {
-            "ok": False,
-            "provider": provider_name,
-            "api_base": api_base,
-            "route": route,
-            "reason": f"{type(exc).__name__}: {exc}",
-        }
+        return _runtime_probe_result(request, ok=False, reason=f"{type(exc).__name__}: {exc}")
 
     status_code = int(getattr(response, "status_code", 0) or 0)
     if 200 <= status_code < 300:
-        return {
-            "ok": True,
-            "provider": provider_name,
-            "api_base": api_base,
-            "route": route,
-            "reason": "OK",
-        }
+        return _runtime_probe_result(request, ok=True, reason="OK")
 
-    return {
-        "ok": False,
-        "provider": provider_name,
-        "api_base": api_base,
-        "route": route,
-        "reason": _response_error_reason(response),
-    }
+    return _runtime_probe_result(request, ok=False, reason=_response_error_reason(response))
 
 
 
