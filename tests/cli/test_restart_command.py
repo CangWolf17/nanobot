@@ -179,6 +179,30 @@ class TestRestartCommand:
         assert "session interrupt summary" not in response.content
 
     @pytest.mark.asyncio
+    async def test_status_labels_active_workspace_harness_summary_as_harness(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.metadata = {}
+        session.get_history.return_value = [{"role": "user"}] * 3
+        loop.sessions.get_or_create.return_value = session
+        loop._start_time = time.time() - 125
+        loop._last_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        loop.memory_consolidator.estimate_session_prompt_tokens = MagicMock(
+            return_value=(20500, "tiktoken")
+        )
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/status")
+        with patch(
+            "nanobot.command.builtin._read_workspace_harness_status_summary",
+            return_value="active / planning",
+        ):
+            response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "Harness: active / planning" in response.content
+        assert "Interrupt: active / planning" not in response.content
+
+    @pytest.mark.asyncio
     async def test_status_falls_back_to_session_interrupt_summary_when_workspace_harness_missing(
         self,
     ):

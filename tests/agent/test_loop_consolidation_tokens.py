@@ -11,6 +11,7 @@ from nanobot.providers.base import LLMResponse
 
 def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -> AgentLoop:
     from nanobot.providers.base import GenerationSettings
+
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     provider.generation = GenerationSettings(max_tokens=0)
@@ -35,7 +36,9 @@ def test_prompt_estimate_includes_session_compact_state(tmp_path) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
     seen: dict[str, str | None] = {}
 
-    def _build_messages(*, history, current_message, channel=None, chat_id=None, compact_state=None, **kwargs):
+    def _build_messages(
+        *, history, current_message, channel=None, chat_id=None, compact_state=None, **kwargs
+    ):
         seen["compact_state"] = compact_state
         return [{"role": "system", "content": compact_state or ""}]
 
@@ -52,7 +55,9 @@ def test_prompt_estimate_omits_session_compact_state_when_disabled(tmp_path) -> 
     loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
     seen: dict[str, str | None] = {}
 
-    def _build_messages(*, history, current_message, channel=None, chat_id=None, compact_state=None, **kwargs):
+    def _build_messages(
+        *, history, current_message, channel=None, chat_id=None, compact_state=None, **kwargs
+    ):
         seen["compact_state"] = compact_state
         return [{"role": "system", "content": compact_state or ""}]
 
@@ -64,6 +69,130 @@ def test_prompt_estimate_omits_session_compact_state_when_disabled(tmp_path) -> 
     loop.memory_consolidator.estimate_session_prompt_tokens(session)
 
     assert seen["compact_state"] is None
+
+
+def test_prompt_estimate_includes_runtime_metadata_from_active_protocol(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    seen: dict[str, object] = {}
+
+    def _build_messages(
+        *,
+        history,
+        current_message,
+        channel=None,
+        chat_id=None,
+        compact_state=None,
+        runtime_metadata=None,
+        workspace_work_mode=None,
+        **kwargs,
+    ):
+        seen["runtime_metadata"] = runtime_metadata
+        seen["workspace_work_mode"] = workspace_work_mode
+        return [{"role": "system", "content": compact_state or ""}]
+
+    session_root = tmp_path / "sessions" / "ses_0001"
+    session_root.mkdir(parents=True)
+    (tmp_path / "sessions" / "control.json").write_text(
+        '{"active_session_id":"ses_0001"}', encoding="utf-8"
+    )
+    (tmp_path / "sessions" / "index.json").write_text(
+        '{"sessions":{"ses_0001":{"session_root":"' + str(session_root) + '"}}}',
+        encoding="utf-8",
+    )
+    (session_root / "dev_state.json").write_text(
+        '{"strict_dev_mode":"enforce","task_kind":"feature","phase":"red_required","work_mode":"build","gates":{"plan":{"required":true,"satisfied":true},"debug_root_cause":{"required":false,"satisfied":false},"failing_test":{"required":true,"satisfied":false},"verification":{"required":true,"satisfied":false}}}',
+        encoding="utf-8",
+    )
+
+    session = loop.sessions.get_or_create("cli:test")
+    loop.memory_consolidator._build_messages = _build_messages  # type: ignore[method-assign]
+
+    loop.memory_consolidator.estimate_session_prompt_tokens(session)
+
+    assert seen["runtime_metadata"] == {"work_mode": "build", "has_active_harness": False}
+    assert seen["workspace_work_mode"] == "build"
+
+
+@pytest.mark.asyncio
+async def test_process_direct_includes_workspace_work_mode_from_runtime_protocol(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    seen: dict[str, object] = {}
+
+    session_root = tmp_path / "sessions" / "ses_0001"
+    session_root.mkdir(parents=True)
+    (tmp_path / "sessions" / "control.json").write_text(
+        '{"active_session_id":"ses_0001"}', encoding="utf-8"
+    )
+    (tmp_path / "sessions" / "index.json").write_text(
+        '{"sessions":{"ses_0001":{"session_root":"' + str(session_root) + '"}}}',
+        encoding="utf-8",
+    )
+    (session_root / "dev_state.json").write_text(
+        '{"strict_dev_mode":"enforce","task_kind":"feature","phase":"red_required","work_mode":"build","gates":{"plan":{"required":true,"satisfied":true},"debug_root_cause":{"required":false,"satisfied":false},"failing_test":{"required":true,"satisfied":false},"verification":{"required":true,"satisfied":false}}}',
+        encoding="utf-8",
+    )
+
+    real_build_messages = loop.context.build_messages
+
+    def _build_messages(*args, **kwargs):
+        seen["workspace_work_mode"] = kwargs.get("workspace_work_mode")
+        seen["runtime_metadata"] = kwargs.get("runtime_metadata")
+        return real_build_messages(*args, **kwargs)
+
+    loop.context.build_messages = _build_messages  # type: ignore[method-assign]
+
+    await loop.process_direct("hello", session_key="cli:test")
+
+    assert seen["runtime_metadata"] == {"work_mode": "build", "has_active_harness": False}
+    assert seen["workspace_work_mode"] == "build"
+
+
+@pytest.mark.asyncio
+async def test_process_direct_uses_explicit_session_key_for_runtime_metadata(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    seen: dict[str, str] = {}
+
+    real_extract_runtime_metadata = loop._extract_runtime_metadata
+
+    def _extract_runtime_metadata(msg):
+        seen["session_key"] = msg.session_key
+        return real_extract_runtime_metadata(msg)
+
+    loop._extract_runtime_metadata = _extract_runtime_metadata  # type: ignore[method-assign]
+
+    await loop.process_direct(
+        "hello",
+        session_key="api:session-one",
+        channel="api",
+        chat_id="completions",
+    )
+
+    assert seen["session_key"] == "api:session-one"
+
+
+@pytest.mark.asyncio
+async def test_prompt_estimate_uses_transport_route_for_override_backed_session(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    seen: dict[str, str | None] = {}
+
+    def _build_messages(
+        *, history, current_message, channel=None, chat_id=None, compact_state=None, **kwargs
+    ):
+        seen["channel"] = channel
+        seen["chat_id"] = chat_id
+        return [{"role": "system", "content": compact_state or ""}]
+
+    loop.memory_consolidator._build_messages = _build_messages  # type: ignore[method-assign]
+
+    await loop.process_direct(
+        "hello",
+        session_key="api:session-one",
+        channel="api",
+        chat_id="completions",
+    )
+
+    assert seen["channel"] == "api"
+    assert seen["chat_id"] == "completions"
 
 
 @pytest.mark.asyncio
@@ -116,7 +245,9 @@ async def test_prompt_above_threshold_triggers_consolidation(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_prompt_above_threshold_archives_until_next_user_boundary(tmp_path, monkeypatch) -> None:
+async def test_prompt_above_threshold_archives_until_next_user_boundary(
+    tmp_path, monkeypatch
+) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=1000, context_window_tokens=200)
     loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
@@ -131,7 +262,9 @@ async def test_prompt_above_threshold_archives_until_next_user_boundary(tmp_path
     loop.sessions.save(session)
 
     token_map = {"u1": 120, "a1": 120, "u2": 120, "a2": 120, "u3": 120}
-    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda message: token_map[message["content"]])
+    monkeypatch.setattr(
+        memory_module, "estimate_message_tokens", lambda message: token_map[message["content"]]
+    )
 
     await loop.memory_consolidator.maybe_consolidate_by_tokens(session)
 
@@ -159,6 +292,7 @@ async def test_consolidation_loops_until_target_met(tmp_path, monkeypatch) -> No
     loop.sessions.save(session)
 
     call_count = [0]
+
     def mock_estimate(_session):
         call_count[0] += 1
         if call_count[0] == 1:
@@ -177,7 +311,9 @@ async def test_consolidation_loops_until_target_met(tmp_path, monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_consolidation_continues_below_trigger_until_half_target(tmp_path, monkeypatch) -> None:
+async def test_consolidation_continues_below_trigger_until_half_target(
+    tmp_path, monkeypatch
+) -> None:
     """Once triggered, consolidation should continue until it drops below half threshold."""
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
     loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
@@ -220,14 +356,16 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
 
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
 
-    async def track_preflight(session):
+    async def track_preflight(session, *, runtime_metadata=None):
         order.append("consolidate")
         return True
+
     loop._run_pre_reply_consolidation = track_preflight  # type: ignore[method-assign]
 
     async def track_llm(*args, **kwargs):
         order.append("llm")
         return LLMResponse(content="ok", tool_calls=[])
+
     loop.provider.chat_with_retry = track_llm
     loop.provider.chat_stream_with_retry = track_llm
 
@@ -241,9 +379,11 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
     monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 500)
 
     call_count = [0]
-    def mock_estimate(_session, *, max_history_messages=0):
+
+    def mock_estimate(_session, *, max_history_messages=0, runtime_metadata=None):
         call_count[0] += 1
         return (1000 if call_count[0] <= 1 else 80, "test")
+
     loop.memory_consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
 
     await loop.process_direct("hello", session_key="cli:test")
@@ -253,15 +393,19 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
     assert order.index("consolidate") < order.index("llm")
 
 
-
-
 @pytest.mark.asyncio
 async def test_pre_reply_consolidation_skips_when_prompt_under_budget(tmp_path) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
     _session = loop.sessions.get_or_create("cli:test")
 
     loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
-    loop.memory_consolidator.is_over_budget = lambda _session, max_history_messages=0: (False, 80, "test")  # type: ignore[method-assign]
+    loop.memory_consolidator.is_over_budget = (
+        lambda _session, max_history_messages=0, runtime_metadata=None: (
+            False,
+            80,
+            "test",
+        )
+    )  # type: ignore[method-assign]
 
     result = await loop.process_direct("hello", session_key="cli:test")
 
@@ -275,8 +419,9 @@ async def test_pre_reply_consolidation_timeout_fail_open_still_replies(tmp_path)
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
     loop.memory_config.pre_reply_timeout_seconds = 0.01
 
-    async def slow_consolidation(_session):
+    async def slow_consolidation(_session, *, runtime_metadata=None):
         await asyncio.sleep(0.05)
+
     loop.memory_consolidator.maybe_consolidate_by_tokens = slow_consolidation  # type: ignore[method-assign]
 
     result = await loop.process_direct("hello", session_key="cli:test")
@@ -303,7 +448,9 @@ async def test_pre_reply_consolidation_timeout_records_failure_count(tmp_path, m
         return True
 
     loop.memory_consolidator.consolidate_messages = hanging_archive  # type: ignore[method-assign]
-    loop.memory_consolidator.estimate_session_prompt_tokens = lambda _session, *, max_history_messages=0: (1000, "test")  # type: ignore[method-assign]
+    loop.memory_consolidator.estimate_session_prompt_tokens = (
+        lambda _session, *, max_history_messages=0, runtime_metadata=None: (1000, "test")
+    )  # type: ignore[method-assign]
     loop.memory_consolidator._SAFETY_BUFFER = 0
     monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 500)
 
@@ -316,7 +463,9 @@ async def test_pre_reply_consolidation_timeout_records_failure_count(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_repeated_timeout_cancellation_degrades_to_raw_archive_and_advances_offset(tmp_path, monkeypatch) -> None:
+async def test_repeated_timeout_cancellation_degrades_to_raw_archive_and_advances_offset(
+    tmp_path, monkeypatch
+) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
 
     session = loop.sessions.get_or_create("cli:test")
@@ -334,13 +483,17 @@ async def test_repeated_timeout_cancellation_degrades_to_raw_archive_and_advance
         return True
 
     loop.memory_consolidator.consolidate_messages = hanging_archive  # type: ignore[method-assign]
-    loop.memory_consolidator.estimate_session_prompt_tokens = lambda _session, *, max_history_messages=0: (1000, "test")  # type: ignore[method-assign]
+    loop.memory_consolidator.estimate_session_prompt_tokens = (
+        lambda _session, *, max_history_messages=0: (1000, "test")
+    )  # type: ignore[method-assign]
     loop.memory_consolidator._SAFETY_BUFFER = 0
     monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 500)
 
     for _ in range(loop.memory_consolidator.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
         try:
-            await asyncio.wait_for(loop.memory_consolidator.maybe_consolidate_by_tokens(session), timeout=0.01)
+            await asyncio.wait_for(
+                loop.memory_consolidator.maybe_consolidate_by_tokens(session), timeout=0.01
+            )
         except asyncio.TimeoutError:
             pytest.fail("timeout should be absorbed into consolidation failure accounting")
 
@@ -357,8 +510,9 @@ async def test_failed_preflight_over_budget_uses_recent_history_fallback(tmp_pat
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
     loop.memory_config.recent_history_fallback_messages = 2
 
-    async def fail_preflight(_session):
+    async def fail_preflight(_session, *, runtime_metadata=None):
         return False
+
     loop._run_pre_reply_consolidation = fail_preflight  # type: ignore[method-assign]
 
     session = loop.sessions.get_or_create("cli:test")
@@ -378,7 +532,13 @@ async def test_failed_preflight_over_budget_uses_recent_history_fallback(tmp_pat
         return "ok", None, messages + [{"role": "assistant", "content": "ok"}]
 
     loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
-    loop.memory_consolidator.is_over_budget = lambda _session, max_history_messages=0: (True, 999, "test")  # type: ignore[method-assign]
+    loop.memory_consolidator.is_over_budget = (
+        lambda _session, max_history_messages=0, runtime_metadata=None: (
+            True,
+            999,
+            "test",
+        )
+    )  # type: ignore[method-assign]
 
     result = await loop.process_direct("hello", session_key="cli:test")
 

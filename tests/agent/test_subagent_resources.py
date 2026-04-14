@@ -99,6 +99,64 @@ def _registry() -> dict:
     }
 
 
+def _v2_subagent_registry() -> dict:
+    return {
+        "version": 2,
+        "profile_defaults": {
+            "chat": {"ref": "standard-gpt-5.4-high-tokenx"},
+            "subagent": {"ref": "subagent-gpt-5.4-high-tokenx"},
+        },
+        "routes": {
+            "tokenx": {"config_provider_ref": "custom", "adapter": "openai_compat"},
+        },
+        "models": {
+            "standard-gpt-5.4-high-tokenx": {
+                "family": "gpt-5.4",
+                "tier": "standard",
+                "effort": "high",
+                "route_ref": "tokenx",
+                "provider_model": "gpt-5.4",
+                "enabled": True,
+                "template": False,
+                "capabilities": {"chat": True, "tool_calls": True},
+            },
+            "subagent-gpt-5.4-high-tokenx": {
+                "family": "gpt-5.4",
+                "tier": "standard",
+                "effort": "high",
+                "route_ref": "tokenx",
+                "provider_model": "gpt-5.4",
+                "enabled": True,
+                "template": False,
+                "capabilities": {"subagent": True, "tool_calls": True},
+            },
+        },
+    }
+
+
+def _v2_chat_only_registry() -> dict:
+    return {
+        "version": 2,
+        "profile_defaults": {
+            "chat": {"ref": "standard-gpt-5.4-high-tokenx"},
+        },
+        "routes": {
+            "tokenx": {"config_provider_ref": "custom", "adapter": "openai_compat"},
+        },
+        "models": {
+            "standard-gpt-5.4-high-tokenx": {
+                "family": "gpt-5.4",
+                "tier": "standard",
+                "effort": "high",
+                "route_ref": "tokenx",
+                "provider_model": "gpt-5.4",
+                "enabled": True,
+                "template": False,
+                "capabilities": {"chat": True, "tool_calls": True},
+            },
+        },
+    }
+
 
 def _manager():
     from nanobot.agent.subagent_resources import (
@@ -145,7 +203,6 @@ def _manager():
     )
 
 
-
 def test_explicit_model_overrides_harness_and_manager_defaults():
     from nanobot.agent.subagent_resources import SubagentRequest
 
@@ -161,7 +218,6 @@ def test_explicit_model_overrides_harness_and_manager_defaults():
     assert decision.status == "granted"
     assert decision.lease is not None
     assert decision.lease.model_id == "standard-gpt-5.4-xhigh-aizhiwen-top"
-
 
 
 def test_standard_tier_defaults_to_high_and_skips_exhausted_tokenx():
@@ -183,19 +239,20 @@ def test_standard_tier_defaults_to_high_and_skips_exhausted_tokenx():
     assert decision.lease.route == "aizhiwen-top"
 
 
-
 def test_lite_request_can_queue_when_waiting_below_threshold():
     from nanobot.agent.subagent_resources import RouteState, SubagentRequest
 
     manager = _manager()
     manager.route_states["minimax"] = RouteState(inflight=1, waiting=4, window_used_requests=100)
 
+    # This slice only makes queued a first-class acquire result at the API boundary.
+    # It does not introduce persistent pending-task storage or dequeue/promotion logic.
     decision = manager.acquire(SubagentRequest(tier="lite"))
 
     assert decision.status == "queued"
     assert decision.reason == "queue_wait"
+    assert decision.lease is None
     assert manager.route_states["minimax"].waiting == 5
-
 
 
 def test_lite_request_is_rejected_when_queue_threshold_is_full():
@@ -210,7 +267,6 @@ def test_lite_request_is_rejected_when_queue_threshold_is_full():
     assert decision.reason == "queue_limit"
 
 
-
 def test_minimax_reserve_blocks_new_lite_allocation_once_window_floor_is_hit():
     from nanobot.agent.subagent_resources import RouteState, SubagentRequest
 
@@ -221,7 +277,6 @@ def test_minimax_reserve_blocks_new_lite_allocation_once_window_floor_is_hit():
 
     assert decision.status == "rejected"
     assert decision.reason == "reserved_quota_exhausted"
-
 
 
 def test_release_frees_inflight_slot_for_granted_lease():
@@ -238,6 +293,22 @@ def test_release_frees_inflight_slot_for_granted_lease():
     assert manager.route_states["aizhiwen-top"].inflight == 0
 
 
+def test_release_only_frees_inflight_and_does_not_mutate_waiting_counter():
+    from nanobot.agent.subagent_resources import SubagentRequest
+
+    manager = _manager()
+    granted = manager.acquire(SubagentRequest(tier="standard"))
+
+    assert granted.status == "granted"
+    assert granted.lease is not None
+
+    manager.route_states[granted.lease.route].waiting = 3
+
+    manager.release(granted.lease)
+
+    assert manager.route_states[granted.lease.route].inflight == 0
+    assert manager.route_states[granted.lease.route].waiting == 3
+
 
 def test_classify_provider_failure_distinguishes_transient_from_hard_unavailable():
     from nanobot.agent.subagent_resources import classify_provider_failure
@@ -249,7 +320,6 @@ def test_classify_provider_failure_distinguishes_transient_from_hard_unavailable
     assert transient.reason == "http_502"
     assert hard.availability == "hard_unavailable"
     assert hard.reason == "quota_exhausted"
-
 
 
 def test_build_manager_from_workspace_snapshot_uses_workspace_truth(tmp_path):
@@ -282,7 +352,8 @@ def test_build_manager_from_workspace_snapshot_uses_workspace_truth(tmp_path):
             },
             ensure_ascii=False,
             indent=2,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -292,7 +363,9 @@ def test_build_manager_from_workspace_snapshot_uses_workspace_truth(tmp_path):
 
     manager = build_manager_from_workspace_snapshot(
         workspace=tmp_path,
-        provider_status={"tokenx": {"availability": "hard_unavailable", "reason": "exhausted_today"}},
+        provider_status={
+            "tokenx": {"availability": "hard_unavailable", "reason": "exhausted_today"}
+        },
     )
 
     request = manager.default_request()
@@ -304,7 +377,6 @@ def test_build_manager_from_workspace_snapshot_uses_workspace_truth(tmp_path):
     assert decision.lease is not None
     assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
     assert decision.lease.effort == "high"
-
 
 
 def test_build_manager_snapshot_reads_v2_route_names_and_profile_defaults(tmp_path):
@@ -343,7 +415,10 @@ def test_build_manager_snapshot_reads_v2_route_names_and_profile_defaults(tmp_pa
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -362,12 +437,433 @@ def test_build_manager_snapshot_reads_v2_route_names_and_profile_defaults(tmp_pa
     assert decision.lease.route == "responses"
 
 
+def test_build_manager_snapshot_prefers_v2_subagent_profile_over_current_chat_model(tmp_path):
+    from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(_v2_subagent_registry(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_state.json").write_text(
+        json.dumps({"current_model": "standard-gpt-5.4-high-tokenx"}, ensure_ascii=False, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    request = manager.default_request()
+    decision = manager.acquire(request)
+
+    assert getattr(request, "profile", None) == "subagent"
+    assert request.manager_model == "subagent-gpt-5.4-high-tokenx"
+    assert request.manager_tier == "standard"
+    assert decision.status == "granted"
+    assert decision.lease is not None
+    assert decision.lease.model_id == "subagent-gpt-5.4-high-tokenx"
+
+
+def test_subagent_profile_filters_standard_tier_candidates_to_subagent_capable_models(tmp_path):
+    from nanobot.agent.subagent_resources import (
+        SubagentRequest,
+        build_manager_from_workspace_snapshot,
+    )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(_v2_subagent_registry(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    request = SubagentRequest(tier="standard", profile="subagent")
+    decision = manager.acquire(request)
+
+    assert decision.status == "granted"
+    assert decision.lease is not None
+    assert decision.lease.model_id == "subagent-gpt-5.4-high-tokenx"
+
+
+def test_legacy_snapshot_ignores_subagent_profile_capability_filter(tmp_path):
+    from nanobot.agent.subagent_resources import (
+        SubagentRequest,
+        build_manager_from_workspace_snapshot,
+    )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(_registry(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    decision = manager.acquire(SubagentRequest(tier="standard", profile="subagent"))
+
+    assert decision.status == "granted"
+    assert decision.lease is not None
+    assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
+
+
+def test_subagent_profile_requires_tool_calls_capability_on_v2_snapshot(tmp_path):
+    from nanobot.agent.subagent_resources import (
+        SubagentRequest,
+        build_manager_from_workspace_snapshot,
+    )
+
+    registry = _v2_subagent_registry()
+    registry["models"]["subagent-gpt-5.4-high-tokenx"]["capabilities"] = {"subagent": True}
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    decision = manager.acquire(SubagentRequest(tier="standard", profile="subagent"))
+
+    assert decision.status == "rejected"
+    assert decision.reason == "no_candidate"
+
+
+def test_subagent_profile_coerces_string_capability_flags_like_schema(tmp_path):
+    from nanobot.agent.subagent_resources import (
+        SubagentRequest,
+        build_manager_from_workspace_snapshot,
+    )
+
+    registry = _v2_subagent_registry()
+    registry["models"]["subagent-gpt-5.4-high-tokenx"]["capabilities"] = {
+        "subagent": "false",
+        "tool_calls": "false",
+    }
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    decision = manager.acquire(SubagentRequest(tier="standard", profile="subagent"))
+
+    assert decision.status == "rejected"
+    assert decision.reason == "no_candidate"
+
+
+def test_subagent_profile_rejects_chat_only_explicit_model_on_v2_snapshot(tmp_path):
+    from nanobot.agent.subagent_resources import (
+        SubagentRequest,
+        build_manager_from_workspace_snapshot,
+    )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(_v2_chat_only_registry(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    decision = manager.acquire(
+        SubagentRequest(model="standard-gpt-5.4-high-tokenx", profile="subagent")
+    )
+
+    assert decision.status == "rejected"
+    assert decision.reason == "no_candidate"
+
+
+def test_subagent_profile_rejects_chat_only_harness_default_model_on_v2_snapshot(tmp_path):
+    from nanobot.agent.subagent_resources import (
+        SubagentRequest,
+        build_manager_from_workspace_snapshot,
+    )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(_v2_chat_only_registry(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    decision = manager.acquire(
+        SubagentRequest(harness_model="standard-gpt-5.4-high-tokenx", profile="subagent")
+    )
+
+    assert decision.status == "rejected"
+    assert decision.reason == "no_candidate"
+
+
+def test_subagent_profile_rejects_non_selectable_explicit_model_on_v2_snapshot(tmp_path):
+    from nanobot.agent.subagent_resources import (
+        SubagentRequest,
+        build_manager_from_workspace_snapshot,
+    )
+
+    cases = [
+        ("disabled", {"enabled": False}),
+        ("template", {"template": True}),
+    ]
+
+    for label, overrides in cases:
+        case_dir = tmp_path / label
+        case_dir.mkdir()
+        registry = _v2_subagent_registry()
+        registry["models"]["subagent-gpt-5.4-high-tokenx"].update(overrides)
+
+        (case_dir / "config.json").write_text(
+            json.dumps(
+                {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (case_dir / "model_registry.json").write_text(
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        manager = build_manager_from_workspace_snapshot(workspace=case_dir)
+        decision = manager.acquire(
+            SubagentRequest(model="subagent-gpt-5.4-high-tokenx", profile="subagent")
+        )
+
+        assert decision.status == "rejected"
+        assert decision.reason == "no_candidate"
+
+
+def test_subagent_profile_coerces_string_selectability_flags_like_schema(tmp_path):
+    from nanobot.agent.subagent_resources import (
+        SubagentRequest,
+        build_manager_from_workspace_snapshot,
+    )
+
+    disabled_dir = tmp_path / "enabled-false"
+    disabled_dir.mkdir()
+    disabled_registry = _v2_subagent_registry()
+    disabled_registry["models"]["subagent-gpt-5.4-high-tokenx"]["enabled"] = "false"
+
+    (disabled_dir / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (disabled_dir / "model_registry.json").write_text(
+        json.dumps(disabled_registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    disabled_manager = build_manager_from_workspace_snapshot(workspace=disabled_dir)
+    disabled_decision = disabled_manager.acquire(
+        SubagentRequest(model="subagent-gpt-5.4-high-tokenx", profile="subagent")
+    )
+
+    assert disabled_decision.status == "rejected"
+    assert disabled_decision.reason == "no_candidate"
+
+    template_dir = tmp_path / "template-false"
+    template_dir.mkdir()
+    template_registry = _v2_subagent_registry()
+    template_registry["models"]["subagent-gpt-5.4-high-tokenx"]["template"] = "false"
+
+    (template_dir / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (template_dir / "model_registry.json").write_text(
+        json.dumps(template_registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    template_manager = build_manager_from_workspace_snapshot(workspace=template_dir)
+    template_decision = template_manager.acquire(
+        SubagentRequest(model="subagent-gpt-5.4-high-tokenx", profile="subagent")
+    )
+
+    assert template_decision.status == "granted"
+    assert template_decision.lease is not None
+    assert template_decision.lease.model_id == "subagent-gpt-5.4-high-tokenx"
+
+
+def test_manager_default_request_prefers_exact_v2_subagent_profile_default(tmp_path):
+    from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
+
+    registry = {
+        "version": 2,
+        "profile_defaults": {
+            "chat": {"ref": "standard-gpt-5.4-high-aizhiwen-top"},
+            "subagent": {"ref": "subagent-gpt-5.4-high-tokenx"},
+        },
+        "routes": {
+            "aizhiwen-top": {"config_provider_ref": "custom", "adapter": "openai_compat"},
+            "tokenx": {"config_provider_ref": "custom", "adapter": "openai_compat"},
+        },
+        "models": {
+            "standard-gpt-5.4-high-aizhiwen-top": {
+                "family": "gpt-5.4",
+                "tier": "standard",
+                "effort": "high",
+                "route_ref": "aizhiwen-top",
+                "provider_model": "gpt-5.4",
+                "enabled": True,
+                "template": False,
+                "capabilities": {"chat": True, "tool_calls": True},
+            },
+            "subagent-gpt-5.4-high-aizhiwen-top": {
+                "family": "gpt-5.4",
+                "tier": "standard",
+                "effort": "high",
+                "route_ref": "aizhiwen-top",
+                "provider_model": "gpt-5.4",
+                "enabled": True,
+                "template": False,
+                "capabilities": {"subagent": True, "tool_calls": True},
+            },
+            "subagent-gpt-5.4-high-tokenx": {
+                "family": "gpt-5.4",
+                "tier": "standard",
+                "effort": "high",
+                "route_ref": "tokenx",
+                "provider_model": "gpt-5.4",
+                "enabled": True,
+                "template": False,
+                "capabilities": {"subagent": True, "tool_calls": True},
+            },
+        },
+    }
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    decision = manager.acquire(manager.default_request())
+
+    assert decision.status == "granted"
+    assert decision.lease is not None
+    assert decision.lease.model_id == "subagent-gpt-5.4-high-tokenx"
+
+
+def test_build_manager_snapshot_uses_extended_v2_subagent_profile_model(tmp_path):
+    from nanobot.agent.subagent_resources import (
+        SubagentRequest,
+        build_manager_from_workspace_snapshot,
+    )
+
+    registry = {
+        "version": 2,
+        "profile_defaults": {
+            "subagent": {"ref": "subagent-gpt-5.4-high-tokenx"},
+        },
+        "routes": {
+            "tokenx": {"config_provider_ref": "custom", "adapter": "openai_compat"},
+        },
+        "models": {
+            "gpt-5.4-subagent-base": {
+                "family": "gpt-5.4",
+                "tier": "standard",
+                "effort": "high",
+                "route_ref": "tokenx",
+                "provider_model": "gpt-5.4",
+                "enabled": True,
+                "template": True,
+                "capabilities": {"subagent": True, "tool_calls": True},
+            },
+            "subagent-gpt-5.4-high-tokenx": {
+                "extends": "gpt-5.4-subagent-base",
+                "template": False,
+            },
+        },
+    }
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "model_registry.json").write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    manager = build_manager_from_workspace_snapshot(workspace=tmp_path)
+    explicit = manager.acquire(
+        SubagentRequest(model="subagent-gpt-5.4-high-tokenx", profile="subagent")
+    )
+    defaulted = manager.acquire(manager.default_request())
+
+    assert explicit.status == "granted"
+    assert explicit.lease is not None
+    assert explicit.lease.model_id == "subagent-gpt-5.4-high-tokenx"
+    assert defaulted.status == "granted"
+    assert defaulted.lease is not None
+    assert defaulted.lease.model_id == "subagent-gpt-5.4-high-tokenx"
+
 
 def test_build_manager_snapshot_keeps_legacy_registry_path_working(tmp_path):
     from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -383,12 +879,14 @@ def test_build_manager_snapshot_keeps_legacy_registry_path_working(tmp_path):
     assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
 
 
-
 def test_build_manager_snapshot_prefers_current_model_from_model_state(tmp_path):
     from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -396,7 +894,8 @@ def test_build_manager_snapshot_prefers_current_model_from_model_state(tmp_path)
         encoding="utf-8",
     )
     (tmp_path / "model_state.json").write_text(
-        json.dumps({"current_model": "standard-gpt-5.4-xhigh-tokenx"}, ensure_ascii=False, indent=2) + "\n",
+        json.dumps({"current_model": "standard-gpt-5.4-xhigh-tokenx"}, ensure_ascii=False, indent=2)
+        + "\n",
         encoding="utf-8",
     )
 
@@ -407,12 +906,14 @@ def test_build_manager_snapshot_prefers_current_model_from_model_state(tmp_path)
     assert request.manager_tier == "standard"
 
 
-
 def test_build_manager_snapshot_ignores_stale_current_model_in_model_state(tmp_path):
     from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -432,12 +933,14 @@ def test_build_manager_snapshot_ignores_stale_current_model_in_model_state(tmp_p
     assert "stale-corrupt-model" not in manager.registry["models"]
 
 
-
 def test_build_manager_snapshot_defaults_lite_to_minimax_archive_route(tmp_path):
     from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -453,7 +956,6 @@ def test_build_manager_snapshot_defaults_lite_to_minimax_archive_route(tmp_path)
     assert decision.lease.model_id == "lite-minimax-m2.7-high-minimax"
 
 
-
 def test_build_manager_snapshot_uses_persisted_provider_status_for_candidate_selection(tmp_path):
     from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
 
@@ -464,7 +966,10 @@ def test_build_manager_snapshot_uses_persisted_provider_status_for_candidate_sel
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -480,8 +985,9 @@ def test_build_manager_snapshot_uses_persisted_provider_status_for_candidate_sel
     assert decision.lease.model_id == "standard-gpt-5.4-high-tokenx"
 
 
-
-def test_build_manager_snapshot_uses_registry_policy_overrides_instead_of_hardcoded_defaults(tmp_path):
+def test_build_manager_snapshot_uses_registry_policy_overrides_instead_of_hardcoded_defaults(
+    tmp_path,
+):
     from nanobot.agent.subagent_resources import RouteState, build_manager_from_workspace_snapshot
 
     registry = _registry()
@@ -502,7 +1008,10 @@ def test_build_manager_snapshot_uses_registry_policy_overrides_instead_of_hardco
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -520,9 +1029,6 @@ def test_build_manager_snapshot_uses_registry_policy_overrides_instead_of_hardco
     assert decision.reason == "reserved_quota_exhausted"
 
 
-
-
-
 def test_record_provider_failure_persists_hard_status_and_future_snapshot_skips_route(tmp_path):
     from nanobot.agent.subagent_resources import (
         build_manager_from_workspace_snapshot,
@@ -530,7 +1036,10 @@ def test_record_provider_failure_persists_hard_status_and_future_snapshot_skips_
     )
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -561,15 +1070,19 @@ def test_record_provider_failure_persists_hard_status_and_future_snapshot_skips_
     assert decision.lease.model_id == "standard-gpt-5.4-high-tokenx"
 
 
-
-def test_record_provider_failure_persists_transient_status_without_shrinking_candidate_pool(tmp_path):
+def test_record_provider_failure_persists_transient_status_without_shrinking_candidate_pool(
+    tmp_path,
+):
     from nanobot.agent.subagent_resources import (
         build_manager_from_workspace_snapshot,
         record_provider_failure,
     )
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -599,7 +1112,6 @@ def test_record_provider_failure_persists_transient_status_without_shrinking_can
     assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
 
 
-
 def test_build_manager_snapshot_ignores_stale_transient_provider_status(tmp_path):
     from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
 
@@ -614,7 +1126,10 @@ def test_build_manager_snapshot_ignores_stale_transient_provider_status(tmp_path
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -631,9 +1146,6 @@ def test_build_manager_snapshot_ignores_stale_transient_provider_status(tmp_path
     assert decision.status == "granted"
     assert decision.lease is not None
     assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
-
-
-
 
 
 def test_refresh_provider_status_restores_route_for_future_snapshot(tmp_path):
@@ -653,7 +1165,10 @@ def test_refresh_provider_status_restores_route_for_future_snapshot(tmp_path):
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -681,7 +1196,6 @@ def test_refresh_provider_status_restores_route_for_future_snapshot(tmp_path):
     assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
 
 
-
 def test_build_manager_snapshot_uses_registry_configured_transient_ttl_seconds(tmp_path):
     from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
 
@@ -697,7 +1211,10 @@ def test_build_manager_snapshot_uses_registry_configured_transient_ttl_seconds(t
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -716,7 +1233,6 @@ def test_build_manager_snapshot_uses_registry_configured_transient_ttl_seconds(t
     assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
 
 
-
 def test_record_provider_failure_uses_registry_default_runtime_error_source(tmp_path):
     from nanobot.agent.subagent_resources import record_provider_failure
 
@@ -724,7 +1240,10 @@ def test_record_provider_failure_uses_registry_default_runtime_error_source(tmp_
     registry["provider_status_policy"] = {"runtime_error_source": "lease_runtime"}
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -743,9 +1262,6 @@ def test_record_provider_failure_uses_registry_default_runtime_error_source(tmp_
     assert updated["provider_status"]["aizhiwen-top"]["source"] == "lease_runtime"
 
 
-
-
-
 def test_refresh_provider_status_uses_registry_default_refresh_source(tmp_path):
     from nanobot.agent.subagent_resources import refresh_provider_status
 
@@ -753,7 +1269,10 @@ def test_refresh_provider_status_uses_registry_default_refresh_source(tmp_path):
     registry["provider_status_policy"] = {"refresh_source": "health_probe"}
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -771,12 +1290,14 @@ def test_refresh_provider_status_uses_registry_default_refresh_source(tmp_path):
     assert updated["provider_status"]["aizhiwen-top"]["source"] == "health_probe"
 
 
-
 def test_apply_provider_probe_result_refreshes_status_from_api_base(tmp_path):
     from nanobot.agent.subagent_resources import apply_provider_probe_result
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -801,12 +1322,14 @@ def test_apply_provider_probe_result_refreshes_status_from_api_base(tmp_path):
     assert updated["provider_status"]["aizhiwen-top"]["source"] == "monitor_refresh"
 
 
-
 def test_apply_provider_probe_result_records_failure_from_api_base(tmp_path):
     from nanobot.agent.subagent_resources import apply_provider_probe_result
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -832,9 +1355,6 @@ def test_apply_provider_probe_result_records_failure_from_api_base(tmp_path):
     assert updated["provider_status"]["tokenx"]["source"] == "runtime_error"
 
 
-
-
-
 def test_run_workspace_quick_provider_probe_loads_workspace_model_runtime(tmp_path):
     from nanobot.agent.subagent_resources import run_workspace_quick_provider_probe
 
@@ -857,9 +1377,6 @@ def test_run_workspace_quick_provider_probe_loads_workspace_model_runtime(tmp_pa
     assert probe is not None
     assert probe["ok"] is True
     assert probe["api_base"] == "https://tokenx24.com/v1"
-
-
-
 
 
 def test_run_workspace_quick_provider_probe_supports_model_runtime_sibling_imports(tmp_path):
@@ -894,10 +1411,9 @@ def test_run_workspace_quick_provider_probe_supports_model_runtime_sibling_impor
     assert probe["reason"] == "tokenx"
 
 
-
-
-
-def test_run_workspace_quick_provider_probe_does_not_reuse_sibling_module_from_previous_workspace(tmp_path):
+def test_run_workspace_quick_provider_probe_does_not_reuse_sibling_module_from_previous_workspace(
+    tmp_path,
+):
     from nanobot.agent.subagent_resources import run_workspace_quick_provider_probe
 
     ws1 = tmp_path / "ws1"
@@ -934,7 +1450,6 @@ def test_run_workspace_quick_provider_probe_does_not_reuse_sibling_module_from_p
     assert second["reason"] == "aizhiwen"
 
 
-
 def test_probe_provider_route_status_skips_when_not_due(tmp_path):
     from nanobot.agent.subagent_resources import probe_provider_route_status
 
@@ -950,7 +1465,10 @@ def test_probe_provider_route_status_skips_when_not_due(tmp_path):
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -962,7 +1480,12 @@ def test_probe_provider_route_status_skips_when_not_due(tmp_path):
 
     def _probe(workspace, *, ref):
         called.append(ref)
-        return {"ok": True, "provider": "custom", "api_base": "https://aizhiwen.top/v1", "reason": "OK"}
+        return {
+            "ok": True,
+            "provider": "custom",
+            "api_base": "https://aizhiwen.top/v1",
+            "reason": "OK",
+        }
 
     result = probe_provider_route_status(
         workspace=tmp_path,
@@ -974,7 +1497,6 @@ def test_probe_provider_route_status_skips_when_not_due(tmp_path):
     assert result["status"] == "skipped"
     assert result["reason"] == "not_due"
     assert called == []
-
 
 
 def test_probe_provider_route_status_runs_probe_when_due_and_refreshes_status(tmp_path):
@@ -992,7 +1514,10 @@ def test_probe_provider_route_status_runs_probe_when_due_and_refreshes_status(tm
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -1004,7 +1529,12 @@ def test_probe_provider_route_status_runs_probe_when_due_and_refreshes_status(tm
 
     def _probe(workspace, *, ref):
         called.append(ref)
-        return {"ok": True, "provider": "custom", "api_base": "https://aizhiwen.top/v1", "reason": "OK"}
+        return {
+            "ok": True,
+            "provider": "custom",
+            "api_base": "https://aizhiwen.top/v1",
+            "reason": "OK",
+        }
 
     result = probe_provider_route_status(
         workspace=tmp_path,
@@ -1019,9 +1549,6 @@ def test_probe_provider_route_status_runs_probe_when_due_and_refreshes_status(tm
     updated = json.loads((tmp_path / "model_registry.json").read_text(encoding="utf-8"))
     assert updated["provider_status"]["aizhiwen-top"]["availability"] == "available"
     assert updated["provider_status"]["aizhiwen-top"]["source"] == "monitor_refresh"
-
-
-
 
 
 def test_probe_provider_route_status_uses_archive_profile_default_for_minimax(tmp_path):
@@ -1039,7 +1566,10 @@ def test_probe_provider_route_status_uses_archive_profile_default_for_minimax(tm
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -1051,7 +1581,12 @@ def test_probe_provider_route_status_uses_archive_profile_default_for_minimax(tm
 
     def _probe(workspace, *, ref):
         called.append(ref)
-        return {"ok": True, "provider": "minimax", "api_base": "https://api.minimaxi.com/v1", "reason": "OK"}
+        return {
+            "ok": True,
+            "provider": "minimax",
+            "api_base": "https://api.minimaxi.com/v1",
+            "reason": "OK",
+        }
 
     result = probe_provider_route_status(
         workspace=tmp_path,
@@ -1062,7 +1597,6 @@ def test_probe_provider_route_status_uses_archive_profile_default_for_minimax(tm
 
     assert result["status"] == "updated"
     assert called == ["lite-minimax-m2.7-high-minimax"]
-
 
 
 def test_probe_due_provider_routes_only_runs_due_routes(tmp_path):
@@ -1086,7 +1620,10 @@ def test_probe_due_provider_routes_only_runs_due_routes(tmp_path):
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -1099,8 +1636,18 @@ def test_probe_due_provider_routes_only_runs_due_routes(tmp_path):
     def _probe(workspace, *, ref):
         called.append(ref)
         if "aizhiwen" in ref:
-            return {"ok": True, "provider": "custom", "api_base": "https://aizhiwen.top/v1", "reason": "OK"}
-        return {"ok": True, "provider": "custom", "api_base": "https://tokenx24.com/v1", "reason": "OK"}
+            return {
+                "ok": True,
+                "provider": "custom",
+                "api_base": "https://aizhiwen.top/v1",
+                "reason": "OK",
+            }
+        return {
+            "ok": True,
+            "provider": "custom",
+            "api_base": "https://tokenx24.com/v1",
+            "reason": "OK",
+        }
 
     results = probe_due_provider_routes(
         workspace=tmp_path,
@@ -1113,7 +1660,6 @@ def test_probe_due_provider_routes_only_runs_due_routes(tmp_path):
     assert results[1]["status"] == "skipped"
     assert results[1]["reason"] == "not_due"
     assert called == ["standard-gpt-5.4-high-aizhiwen-top"]
-
 
 
 def test_probe_due_provider_routes_respects_explicit_route_filter(tmp_path):
@@ -1137,7 +1683,10 @@ def test_probe_due_provider_routes_respects_explicit_route_filter(tmp_path):
     }
 
     (tmp_path / "config.json").write_text(
-        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False
+        )
+        + "\n",
         encoding="utf-8",
     )
     (tmp_path / "model_registry.json").write_text(
@@ -1149,7 +1698,12 @@ def test_probe_due_provider_routes_respects_explicit_route_filter(tmp_path):
 
     def _probe(workspace, *, ref):
         called.append(ref)
-        return {"ok": True, "provider": "minimax", "api_base": "https://api.minimaxi.com/v1", "reason": "OK"}
+        return {
+            "ok": True,
+            "provider": "minimax",
+            "api_base": "https://api.minimaxi.com/v1",
+            "reason": "OK",
+        }
 
     results = probe_due_provider_routes(
         workspace=tmp_path,

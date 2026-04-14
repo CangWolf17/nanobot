@@ -6,7 +6,7 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ChannelsConfig
-from nanobot.harness.service import HarnessService
+from nanobot.harness.service import HarnessApplyResult, HarnessAutoContinueDecision, HarnessService
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
@@ -1203,6 +1203,368 @@ def test_subagent_system_message_preserves_harness_postprocess_and_auto_follow_u
         assert follow_up.metadata["workspace_agent_cmd"] == "harness"
         assert follow_up.metadata["workspace_harness_auto"] is True
         assert follow_up.metadata["_origin_sender_id"] == "user1"
+
+    asyncio.run(run())
+
+
+def test_dispatch_uses_transport_session_key_for_system_message_without_override(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        loop, _bus = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id="feishu:chat1",
+            content="[Subagent result]",
+        )
+
+        loop._process_message = AsyncMock(return_value=None)
+
+        await loop._dispatch(msg)
+
+        assert "feishu:chat1" in loop._session_locks
+        assert "system:feishu:chat1" not in loop._session_locks
+
+    asyncio.run(run())
+
+
+def test_run_tracks_system_followup_under_transport_session_key_without_override(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_dispatch(_msg) -> None:
+            started.set()
+            await release.wait()
+
+        loop._dispatch = fake_dispatch  # type: ignore[method-assign]
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="system",
+                sender_id="subagent",
+                chat_id="feishu:chat1",
+                content="[Subagent result]",
+            )
+        )
+
+        loop._running = True
+        run_task = asyncio.create_task(loop.run())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            assert "feishu:chat1" in loop._active_tasks
+            assert "system:feishu:chat1" not in loop._active_tasks
+        finally:
+            release.set()
+            loop._running = False
+            run_task.cancel()
+            try:
+                await run_task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run())
+
+
+def test_system_message_without_override_uses_transport_session_for_harness_helpers(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        service = MagicMock()
+        service.runtime_metadata.return_value = {"has_active_harness": False}
+        service.apply_agent_update.return_value = HarnessApplyResult(
+            final_content="postprocessed-subagent-summary",
+            closeout_required=False,
+            closeout_summary="",
+        )
+        service.decide_auto_continue.return_value = HarnessAutoContinueDecision(
+            should_fire=True,
+            reason="active",
+            origin_sender_id="user1",
+        )
+        service.build_auto_continue_metadata.return_value = {
+            "workspace_agent_cmd": "harness",
+            "workspace_harness_auto": True,
+            "_auto_continue": True,
+            "_origin_sender_id": "user1",
+        }
+
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id="feishu:chat1",
+            content="[Subagent result]",
+            metadata={
+                "workspace_agent_cmd": "harness",
+                "workspace_harness_auto": True,
+            },
+        )
+
+        loop._maybe_run_pre_reply_consolidation = AsyncMock(return_value=True)
+        loop._save_turn = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._schedule_background = lambda coro: coro.close()
+        loop.tools.get = MagicMock(return_value=None)
+        loop._run_agent_loop = AsyncMock(
+            return_value=(
+                "raw-subagent-summary",
+                [],
+                [{"role": "assistant", "content": "raw-subagent-summary"}],
+            )
+        )
+
+        with patch("nanobot.agent.loop.HarnessService.for_workspace", return_value=service):
+            result = await loop._process_message(msg)
+
+        assert result is not None
+        assert result.content == "postprocessed-subagent-summary"
+        assert service.runtime_metadata.call_args.kwargs["session_key"] == "feishu:chat1"
+        assert service.apply_agent_update.call_args.kwargs["session_key"] == "feishu:chat1"
+        assert (
+            service.build_auto_continue_metadata.call_args.kwargs["session_key"] == "feishu:chat1"
+        )
+        assert all(
+            call.kwargs["session_key"] == "feishu:chat1"
+            for call in service.decide_auto_continue.call_args_list
+        )
+
+        follow_up = await asyncio.wait_for(bus.consume_inbound(), timeout=1.0)
+        assert follow_up.session_key == "feishu:chat1"
+
+    asyncio.run(run())
+
+
+def test_subagent_system_message_sets_spawn_context_with_derived_runtime_policy(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        loop, _bus = _make_loop(tmp_path)
+        service = MagicMock()
+        service.runtime_metadata.return_value = {
+            "has_active_harness": True,
+            "active_harness": {
+                "id": "har_0001",
+                "status": "active",
+                "phase": "executing",
+                "awaiting_user": False,
+                "blocked": False,
+                "auto": False,
+                "subagent_allowed": False,
+            },
+        }
+
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id="feishu:chat1",
+            content="[Subagent result]",
+            metadata={"workspace_agent_cmd": "harness"},
+        )
+
+        loop._maybe_run_pre_reply_consolidation = AsyncMock(return_value=True)
+        loop._save_turn = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._schedule_background = lambda coro: coro.close()
+        loop.tools.get = MagicMock(side_effect=lambda name: loop.tools._tools.get(name))
+
+        async def fake_run_agent_loop(messages, **kwargs):
+            spawn_tool = loop.tools.get("spawn")
+            assert spawn_tool is not None
+            assert (
+                spawn_tool._metadata["workspace_runtime"]["active_harness"]["subagent_allowed"]
+                is False
+            )
+            return "done", [], [{"role": "assistant", "content": "done"}]
+
+        loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+
+        with patch("nanobot.agent.loop.HarnessService.for_workspace", return_value=service):
+            result = await loop._process_message(msg)
+
+        assert result is not None
+
+    asyncio.run(run())
+
+
+def test_normal_message_background_consolidation_receives_runtime_metadata(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        loop, _bus = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="hello",
+            metadata={"workspace_runtime": {"work_mode": "build", "has_active_harness": False}},
+        )
+
+        loop._maybe_run_pre_reply_consolidation = AsyncMock(return_value=True)
+        loop._save_turn = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.tools.get = MagicMock(return_value=None)
+
+        seen: dict[str, object] = {}
+        scheduled: list[asyncio.Task] = []
+
+        async def fake_run_background(session, runtime_metadata=None):
+            seen["runtime_metadata"] = runtime_metadata
+
+        def schedule_background(coro):
+            scheduled.append(asyncio.create_task(coro))
+
+        loop._run_background_consolidation = fake_run_background  # type: ignore[method-assign]
+        loop._schedule_background = schedule_background
+        loop._run_agent_loop = AsyncMock(
+            return_value=(
+                "done",
+                [],
+                [{"role": "assistant", "content": "done"}],
+            )
+        )
+
+        result = await loop._process_message(msg)
+        assert result is not None
+        await scheduled[0]
+
+        assert seen["runtime_metadata"] == {"work_mode": "build", "has_active_harness": False}
+
+    asyncio.run(run())
+
+
+def test_system_message_uses_recent_history_fallback_when_preflight_not_clean(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        loop, _bus = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id="feishu:chat1",
+            content="[Subagent result]",
+            metadata={"workspace_runtime": {"work_mode": "build", "has_active_harness": False}},
+        )
+
+        session = loop.sessions.get_or_create("feishu:chat1")
+        session.messages = [{"role": "assistant", "content": "full-history"}]
+
+        fallback_history = [{"role": "assistant", "content": "fallback-history"}]
+        captured: dict[str, object] = {}
+
+        loop._maybe_run_pre_reply_consolidation = AsyncMock(return_value=False)
+        loop._select_history_for_reply = MagicMock(return_value=fallback_history)
+        loop._save_turn = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._schedule_background = lambda coro: coro.close()
+        loop.tools.get = MagicMock(return_value=None)
+
+        def _build_messages(*, history, current_message, **kwargs):
+            captured["history"] = history
+            return list(history) + [{"role": "assistant", "content": current_message}]
+
+        async def _run_agent_loop(messages, **kwargs):
+            return "done", [], list(messages) + [{"role": "assistant", "content": "done"}]
+
+        loop.context.build_messages = MagicMock(side_effect=_build_messages)
+        loop._run_agent_loop = _run_agent_loop  # type: ignore[method-assign]
+
+        result = await loop._process_message(msg)
+
+        assert result is not None
+        loop._select_history_for_reply.assert_called_once_with(
+            session,
+            preflight_ok=False,
+            runtime_metadata={"work_mode": "build", "has_active_harness": False},
+        )
+        assert captured["history"] == fallback_history
+
+    asyncio.run(run())
+
+
+def test_system_message_background_consolidation_receives_runtime_metadata(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, _bus = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id="feishu:chat1",
+            content="[Subagent result]",
+            metadata={"workspace_runtime": {"work_mode": "build", "has_active_harness": False}},
+        )
+
+        loop._maybe_run_pre_reply_consolidation = AsyncMock(return_value=True)
+        loop._save_turn = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.tools.get = MagicMock(return_value=None)
+
+        seen: dict[str, object] = {}
+        scheduled: list[asyncio.Task] = []
+
+        async def fake_run_background(session, runtime_metadata=None):
+            seen["runtime_metadata"] = runtime_metadata
+
+        def schedule_background(coro):
+            scheduled.append(asyncio.create_task(coro))
+
+        loop._run_background_consolidation = fake_run_background  # type: ignore[method-assign]
+        loop._schedule_background = schedule_background
+        loop._run_agent_loop = AsyncMock(
+            return_value=(
+                "done",
+                [],
+                [{"role": "assistant", "content": "done"}],
+            )
+        )
+
+        result = await loop._process_message(msg)
+        assert result is not None
+        await scheduled[0]
+
+        assert seen["runtime_metadata"] == {"work_mode": "build", "has_active_harness": False}
+
+    asyncio.run(run())
+
+
+def test_system_message_prefers_session_key_override_for_session_lookup(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, _bus = _make_loop(tmp_path)
+        seen: dict[str, str] = {}
+        real_get_or_create = loop.sessions.get_or_create
+
+        def _get_or_create(key: str):
+            seen["session_key"] = key
+            return real_get_or_create(key)
+
+        loop.sessions.get_or_create = _get_or_create  # type: ignore[method-assign]
+        loop._maybe_run_pre_reply_consolidation = AsyncMock(return_value=True)
+        loop._save_turn = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._schedule_background = lambda coro: coro.close()
+        loop.tools.get = MagicMock(return_value=None)
+        loop._run_agent_loop = AsyncMock(
+            return_value=(
+                "done",
+                [],
+                [{"role": "assistant", "content": "done"}],
+            )
+        )
+
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id="api:completions",
+            content="[Subagent result]",
+            session_key_override="api:session-one",
+        )
+
+        result = await loop._process_message(msg)
+
+        assert result is not None
+        assert seen["session_key"] == "api:session-one"
 
     asyncio.run(run())
 

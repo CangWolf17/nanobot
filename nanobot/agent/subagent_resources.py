@@ -27,7 +27,7 @@ class RoutePolicy:
 @dataclass
 class RouteState:
     inflight: int = 0
-    waiting: int = 0
+    waiting: int = 0  # Transient admission counter only; no dequeue/promotion semantics.
     window_used_requests: int = 0
 
 
@@ -43,6 +43,7 @@ class TierPolicy:
 class SubagentRequest:
     model: str | None = None
     tier: str | None = None
+    profile: str | None = None
     harness_tier: str | None = None
     harness_model: str | None = None
     manager_tier: str | None = None
@@ -83,10 +84,13 @@ class SubagentResourceManager:
         self.route_states = dict(route_states or {})
         self.defaults = dict(defaults or {})
 
-    def default_request(self, *, tier: str | None = None, model: str | None = None) -> SubagentRequest:
+    def default_request(
+        self, *, tier: str | None = None, model: str | None = None
+    ) -> SubagentRequest:
         return SubagentRequest(
             model=self._clean(model),
             tier=self._clean(tier),
+            profile=self._clean(self.defaults.get("manager_profile")) or None,
             manager_tier=self.defaults.get("manager_tier") or "",
             manager_model=self.defaults.get("manager_model") or "",
         )
@@ -147,6 +151,8 @@ class SubagentResourceManager:
         if lease is None:
             return
         state = self.route_states.setdefault(lease.route, RouteState())
+        # Releasing only frees active capacity for an issued lease.
+        # This slice intentionally leaves waiting untouched.
         if state.inflight > 0:
             state.inflight -= 1
 
@@ -154,7 +160,15 @@ class SubagentResourceManager:
         explicit_model = self._clean(request.model)
         if explicit_model:
             resolved = self.resolve_model_ref(explicit_model)
-            return [resolved] if resolved else [explicit_model]
+            candidate = resolved or explicit_model
+            return [candidate] if self._candidate_matches_request(candidate, request) else []
+
+        default_model = self._clean(request.harness_model) or self._clean(request.manager_model)
+        if default_model and not self._clean(request.tier) and self._clean(request.profile):
+            resolved = self.resolve_model_ref(default_model)
+            candidate = resolved or default_model
+            if self._candidate_matches_request(candidate, request):
+                return [candidate]
 
         requested_tier = (
             self._clean(request.tier)
@@ -162,17 +176,28 @@ class SubagentResourceManager:
             or self._clean(request.manager_tier)
         )
         if requested_tier:
-            tier_candidates = self._tier_candidates(requested_tier)
+            tier_candidates = self._tier_candidates(requested_tier, request=request)
             if tier_candidates:
                 return tier_candidates
 
-        default_model = self._clean(request.harness_model) or self._clean(request.manager_model)
         if not default_model:
             return []
         resolved = self.resolve_model_ref(default_model)
-        return [resolved] if resolved else [default_model]
+        candidate = resolved or default_model
+        return [candidate] if self._candidate_matches_request(candidate, request) else []
 
-    def _tier_candidates(self, tier: str) -> list[str]:
+    def _candidate_matches_request(self, model_id: str, request: SubagentRequest) -> bool:
+        if int(self.registry.get("version") or 0) < 2:
+            return True
+        raw = self._model_record(model_id)
+        if not _runtime_model_is_selectable(raw):
+            return False
+        required_capabilities = _request_required_capabilities(request)
+        if not required_capabilities:
+            return True
+        return _model_supports_capabilities(raw, required_capabilities)
+
+    def _tier_candidates(self, tier: str, *, request: SubagentRequest | None = None) -> list[str]:
         policy = self.tier_policies.get(tier, TierPolicy())
         models = self.registry.get("models", {}) if isinstance(self.registry, dict) else {}
         if not isinstance(models, dict):
@@ -180,6 +205,11 @@ class SubagentResourceManager:
 
         selected: list[str] = []
         desired_effort = self._clean(policy.default_effort).lower()
+        required_capabilities = (
+            _request_required_capabilities(request)
+            if int(self.registry.get("version") or 0) >= 2
+            else ()
+        )
         for route in policy.route_preferences:
             route_clean = self._clean(route)
             for model_id, raw in models.items():
@@ -193,6 +223,10 @@ class SubagentResourceManager:
                     continue
                 if desired_effort and self._clean(raw.get("effort")).lower() != desired_effort:
                     continue
+                if required_capabilities and not _model_supports_capabilities(
+                    raw, required_capabilities
+                ):
+                    continue
                 selected.append(model_id)
         if selected:
             return selected
@@ -205,6 +239,10 @@ class SubagentResourceManager:
             if not bool(raw.get("enabled", True)) or bool(raw.get("template", False)):
                 continue
             if self._clean(raw.get("tier")) != tier:
+                continue
+            if required_capabilities and not _model_supports_capabilities(
+                raw, required_capabilities
+            ):
                 continue
             route_clean = self._clean(raw.get("route"))
             try:
@@ -321,8 +359,29 @@ def _runtime_models_from_registry(registry: dict[str, Any]) -> dict[str, dict[st
     if not isinstance(models, dict):
         return {}
     if int(registry.get("version") or 0) < 2:
+        return {model_id: raw for model_id, raw in models.items() if isinstance(raw, dict)}
+
+    try:
+        from nanobot.model_registry.schema import ModelRegistry
+
+        parsed = ModelRegistry.from_dict(registry)
+    except Exception:
+        parsed = None
+
+    if parsed is not None:
         return {
-            model_id: raw for model_id, raw in models.items() if isinstance(raw, dict)
+            model_id: {
+                "tier": model.tier,
+                "family": model.family,
+                "effort": model.effort,
+                "route": model.route_ref,
+                "provider_model": model.provider_model,
+                "enabled": model.enabled,
+                "template": model.template,
+                "aliases": list(model.aliases),
+                "capabilities": dict(model.capabilities),
+            }
+            for model_id, model in parsed.models.items()
         }
 
     runtime_models: dict[str, dict[str, Any]] = {}
@@ -338,8 +397,35 @@ def _runtime_models_from_registry(registry: dict[str, Any]) -> dict[str, dict[st
             "enabled": raw.get("enabled", True),
             "template": raw.get("template", False),
             "aliases": list(raw.get("aliases") or []),
+            "capabilities": dict(raw.get("capabilities") or {}),
         }
     return runtime_models
+
+
+def _resolve_v2_profile_default_ref(
+    workspace_registry: dict[str, Any],
+    runtime_models: dict[str, dict[str, Any]],
+    *,
+    profile: str,
+) -> str:
+    if int(workspace_registry.get("version") or 0) < 2:
+        return ""
+
+    try:
+        from nanobot.model_registry.resolver import (
+            ModelRegistryError,
+            ModelRegistrySemanticError,
+            RegistryResolver,
+        )
+        from nanobot.model_registry.schema import ModelRegistry
+
+        spec = RegistryResolver(ModelRegistry.from_dict(workspace_registry)).resolve_profile(
+            profile
+        )
+    except (ModelRegistryError, ModelRegistrySemanticError, ValueError):
+        return ""
+
+    return _resolve_selectable_runtime_model_ref(runtime_models, spec.model_id)
 
 
 def _route_from_api_base(api_base: str, fallback: str) -> str:
@@ -375,7 +461,41 @@ def _manager_model_from_state(state: dict[str, Any]) -> str:
 def _runtime_model_is_selectable(raw: dict[str, Any] | None) -> bool:
     if not isinstance(raw, dict):
         return False
-    return bool(raw.get("enabled", True)) and not bool(raw.get("template", False))
+    return _coerce_capability_bool(raw.get("enabled", True)) and not _coerce_capability_bool(
+        raw.get("template", False)
+    )
+
+
+def _coerce_capability_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+    return False
+
+
+def _model_supports_capabilities(raw: dict[str, Any] | None, capabilities: tuple[str, ...]) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    model_capabilities = raw.get("capabilities")
+    if not isinstance(model_capabilities, dict):
+        return False
+    return all(
+        _coerce_capability_bool(model_capabilities.get(capability)) for capability in capabilities
+    )
+
+
+def _request_required_capabilities(request: SubagentRequest | None) -> tuple[str, ...]:
+    profile = str(getattr(request, "profile", "") or "").strip().lower()
+    if profile == "subagent":
+        return ("subagent", "tool_calls")
+    return ()
 
 
 def _resolve_selectable_runtime_model_ref(
@@ -447,7 +567,6 @@ def _provider_status_policy(data: dict[str, Any] | None) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-
 def _provider_status_probe_interval_seconds(data: dict[str, Any] | None) -> int:
     policy = _provider_status_policy(data)
     value = policy.get("probe_interval_seconds")
@@ -456,7 +575,6 @@ def _provider_status_probe_interval_seconds(data: dict[str, Any] | None) -> int:
     if isinstance(value, str) and value.strip().isdigit():
         return int(value.strip())
     return 6 * 3600
-
 
 
 def _probe_ref_for_route(registry: dict[str, Any], route: str) -> str:
@@ -482,7 +600,6 @@ def _probe_ref_for_route(registry: dict[str, Any], route: str) -> str:
     return ""
 
 
-
 def _provider_status_last_updated_at(data: dict[str, Any] | None, route: str) -> str:
     provider_status = data.get("provider_status") if isinstance(data, dict) else None
     if not isinstance(provider_status, dict):
@@ -491,7 +608,6 @@ def _provider_status_last_updated_at(data: dict[str, Any] | None, route: str) ->
     if not isinstance(status, dict):
         return ""
     return str(status.get("updated_at") or "").strip()
-
 
 
 def _is_probe_due(last_updated_at: str, *, now: str | None, probe_interval_seconds: int) -> bool:
@@ -504,7 +620,6 @@ def _is_probe_due(last_updated_at: str, *, now: str | None, probe_interval_secon
     return (now_dt - last_dt).total_seconds() >= int(probe_interval_seconds)
 
 
-
 def _provider_status_transient_ttl_seconds(data: dict[str, Any] | None) -> int:
     policy = _provider_status_policy(data)
     value = policy.get("transient_ttl_seconds")
@@ -515,12 +630,10 @@ def _provider_status_transient_ttl_seconds(data: dict[str, Any] | None) -> int:
     return 6 * 3600
 
 
-
 def _provider_status_runtime_error_source(data: dict[str, Any] | None) -> str:
     policy = _provider_status_policy(data)
     value = str(policy.get("runtime_error_source") or "").strip()
     return value or "runtime_error"
-
 
 
 def _provider_status_refresh_source(data: dict[str, Any] | None) -> str:
@@ -529,10 +642,8 @@ def _provider_status_refresh_source(data: dict[str, Any] | None) -> str:
     return value or "monitor_refresh"
 
 
-
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 
 def _parse_iso_datetime(value: object) -> datetime | None:
@@ -550,7 +661,6 @@ def _parse_iso_datetime(value: object) -> datetime | None:
         return None
 
 
-
 def _status_is_stale(status: object, *, now: str | None, transient_ttl_seconds: int) -> bool:
     if not isinstance(status, dict):
         return False
@@ -562,7 +672,6 @@ def _status_is_stale(status: object, *, now: str | None, transient_ttl_seconds: 
     if updated_at is None or now_dt is None:
         return False
     return (now_dt - updated_at).total_seconds() >= int(transient_ttl_seconds)
-
 
 
 def _normalize_status(value: object) -> tuple[str, str]:
@@ -596,12 +705,14 @@ def record_provider_failure(
     provider_status[route_clean] = {
         "availability": status.availability,
         "reason": status.reason,
-        "source": str(source or _provider_status_runtime_error_source(data)).strip() or _provider_status_runtime_error_source(data),
+        "source": str(source or _provider_status_runtime_error_source(data)).strip()
+        or _provider_status_runtime_error_source(data),
         "updated_at": str(updated_at or _utc_now_iso()).strip() or _utc_now_iso(),
     }
-    registry_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    registry_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     return status
-
 
 
 def refresh_provider_status(
@@ -625,11 +736,13 @@ def refresh_provider_status(
     provider_status[route_clean] = {
         "availability": "available",
         "reason": "",
-        "source": str(source or _provider_status_refresh_source(data)).strip() or _provider_status_refresh_source(data),
+        "source": str(source or _provider_status_refresh_source(data)).strip()
+        or _provider_status_refresh_source(data),
         "updated_at": str(updated_at or _utc_now_iso()).strip() or _utc_now_iso(),
     }
-    registry_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
+    registry_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def apply_provider_probe_result(
@@ -659,7 +772,6 @@ def apply_provider_probe_result(
     return route
 
 
-
 def run_workspace_quick_provider_probe(workspace: Path, *, ref: str) -> dict[str, Any] | None:
     script_path = workspace / "scripts" / "model_runtime.py"
     if not script_path.exists():
@@ -680,7 +792,9 @@ def run_workspace_quick_provider_probe(workspace: Path, *, ref: str) -> dict[str
         for candidate in (workspace_path, scripts_path):
             if candidate and candidate not in sys.path:
                 sys.path.insert(0, candidate)
-        spec = importlib.util.spec_from_file_location("nanobot_workspace_model_runtime", script_path)
+        spec = importlib.util.spec_from_file_location(
+            "nanobot_workspace_model_runtime", script_path
+        )
         if spec is None or spec.loader is None:
             return None
         module = importlib.util.module_from_spec(spec)
@@ -704,7 +818,6 @@ def run_workspace_quick_provider_probe(workspace: Path, *, ref: str) -> dict[str
         for key in list(sys.modules.keys()):
             if key in tracked_keys and key not in original_module_keys:
                 sys.modules.pop(key, None)
-
 
 
 def probe_due_provider_routes(
@@ -748,7 +861,6 @@ def probe_due_provider_routes(
     ]
 
 
-
 def probe_provider_route_status(
     *,
     workspace: Path,
@@ -781,7 +893,6 @@ def probe_provider_route_status(
     }
 
 
-
 def refresh_provider_in_manager(
     manager: SubagentResourceManager,
     *,
@@ -798,7 +909,6 @@ def refresh_provider_in_manager(
         window_request_limit=base.window_request_limit,
         reserved_requests=base.reserved_requests,
     )
-
 
 
 def apply_provider_failure_to_manager(
@@ -822,18 +932,24 @@ def apply_provider_failure_to_manager(
     return status
 
 
-
 def _merge_route_policy(base: RoutePolicy, override: dict[str, Any] | None) -> RoutePolicy:
     if not isinstance(override, dict):
         return base
     return RoutePolicy(
         max_concurrency=int(override.get("max_concurrency", base.max_concurrency) or 0),
-        availability=str(override.get("availability") or base.availability or "available").strip() or "available",
-        unavailable_reason=str(override.get("unavailable_reason") or override.get("reason") or base.unavailable_reason or "").strip(),
-        window_request_limit=int(override.get("window_request_limit", base.window_request_limit) or 0),
+        availability=str(override.get("availability") or base.availability or "available").strip()
+        or "available",
+        unavailable_reason=str(
+            override.get("unavailable_reason")
+            or override.get("reason")
+            or base.unavailable_reason
+            or ""
+        ).strip(),
+        window_request_limit=int(
+            override.get("window_request_limit", base.window_request_limit) or 0
+        ),
         reserved_requests=int(override.get("reserved_requests", base.reserved_requests) or 0),
     )
-
 
 
 def _merge_tier_policy(base: TierPolicy, override: dict[str, Any] | None) -> TierPolicy:
@@ -845,12 +961,12 @@ def _merge_tier_policy(base: TierPolicy, override: dict[str, Any] | None) -> Tie
     else:
         routes = base.route_preferences
     return TierPolicy(
-        default_effort=str(override.get("default_effort") or base.default_effort or "high").strip() or "high",
+        default_effort=str(override.get("default_effort") or base.default_effort or "high").strip()
+        or "high",
         route_preferences=routes,
         allow_queue=bool(override.get("allow_queue", base.allow_queue)),
         queue_limit=int(override.get("queue_limit", base.queue_limit) or 0),
     )
-
 
 
 def build_manager_from_workspace_snapshot(
@@ -876,14 +992,18 @@ def build_manager_from_workspace_snapshot(
         "tokenx": RoutePolicy(max_concurrency=3),
         "minimax": RoutePolicy(max_concurrency=1, window_request_limit=600, reserved_requests=50),
     }
-    registry_route_policies = registry.get("provider_policies") if isinstance(registry, dict) else None
+    registry_route_policies = (
+        registry.get("provider_policies") if isinstance(registry, dict) else None
+    )
     if isinstance(registry_route_policies, dict):
         for route, override in registry_route_policies.items():
             route_clean = str(route).strip()
             if not route_clean:
                 continue
             base = route_policies.get(route_clean, RoutePolicy())
-            route_policies[route_clean] = _merge_route_policy(base, override if isinstance(override, dict) else None)
+            route_policies[route_clean] = _merge_route_policy(
+                base, override if isinstance(override, dict) else None
+            )
 
     runtime_route_names = {
         str(raw.get("route") or "").strip()
@@ -956,23 +1076,41 @@ def build_manager_from_workspace_snapshot(
             if not tier_clean:
                 continue
             base = tier_policies.get(tier_clean, TierPolicy())
-            tier_policies[tier_clean] = _merge_tier_policy(base, override if isinstance(override, dict) else None)
+            tier_policies[tier_clean] = _merge_tier_policy(
+                base, override if isinstance(override, dict) else None
+            )
 
     subagent_defaults = registry.get("subagent_defaults", {}) if isinstance(registry, dict) else {}
     manager_model = ""
     manager_model_from_state = False
-    state_model = _manager_model_from_state(state)
-    if state_model:
-        manager_model = _resolve_selectable_runtime_model_ref(runtime_models, state_model)
-        manager_model_from_state = bool(manager_model)
+    manager_profile = ""
+    manager_model = _resolve_v2_profile_default_ref(
+        workspace_registry,
+        runtime_models,
+        profile="subagent",
+    )
+    if manager_model:
+        manager_profile = "subagent"
+    else:
+        state_model = _manager_model_from_state(state)
+        if state_model:
+            manager_model = _resolve_selectable_runtime_model_ref(runtime_models, state_model)
+            manager_model_from_state = bool(manager_model)
     if not manager_model:
         manager_model = str((subagent_defaults or {}).get("model") or "").strip()
     if not manager_model:
         manager_model = str(fallback_model or "").strip()
-    manager_tier = _infer_manager_tier_from_ref(manager_model)
+    manager_tier = str(runtime_models.get(manager_model, {}).get("tier") or "").strip()
+    if not manager_tier:
+        manager_tier = _infer_manager_tier_from_ref(manager_model)
 
     models = registry.get("models") if isinstance(registry, dict) else None
-    if isinstance(models, dict) and manager_model and manager_model not in models and not manager_model_from_state:
+    if (
+        isinstance(models, dict)
+        and manager_model
+        and manager_model not in models
+        and not manager_model_from_state
+    ):
         route = _route_from_api_base(
             str((_config.get("providers") or {}).get("custom", {}).get("apiBase") or ""),
             "custom",
@@ -985,9 +1123,16 @@ def build_manager_from_workspace_snapshot(
             "provider": "custom",
             "provider_model": manager_model,
             "connection": {
-                "api_base": str((_config.get("providers") or {}).get("custom", {}).get("apiBase") or "").strip(),
-                "api_key": str((_config.get("providers") or {}).get("custom", {}).get("apiKey") or "").strip(),
-                "extra_headers": (_config.get("providers") or {}).get("custom", {}).get("extraHeaders") or {},
+                "api_base": str(
+                    (_config.get("providers") or {}).get("custom", {}).get("apiBase") or ""
+                ).strip(),
+                "api_key": str(
+                    (_config.get("providers") or {}).get("custom", {}).get("apiKey") or ""
+                ).strip(),
+                "extra_headers": (_config.get("providers") or {})
+                .get("custom", {})
+                .get("extraHeaders")
+                or {},
             },
             "agent": {},
             "enabled": True,
@@ -1003,5 +1148,6 @@ def build_manager_from_workspace_snapshot(
         defaults={
             "manager_model": manager_model,
             "manager_tier": manager_tier,
+            "manager_profile": manager_profile,
         },
     )

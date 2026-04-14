@@ -344,7 +344,9 @@ async def test_handle_message_create_accepts_allowlisted_dm() -> None:
     channel._handle_message = capture_handle  # type: ignore[method-assign]
     channel._start_typing = lambda _channel_id: asyncio.sleep(0)  # type: ignore[method-assign]
 
-    await channel._handle_message_create(_make_payload(author_id=123, channel_id=456, message_id=789))
+    await channel._handle_message_create(
+        _make_payload(author_id=123, channel_id=456, message_id=789)
+    )
 
     assert handled == [
         {
@@ -489,6 +491,37 @@ async def test_handle_message_create_stops_typing_on_handler_error() -> None:
 
     with pytest.raises(RuntimeError, match="boom"):
         await channel._handle_message_create(_make_payload(author_id=123, channel_id=456))
+
+    await asyncio.sleep(0)
+    assert channel._typing_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_message_create_stops_typing_on_cancellation() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, token="token", allow_from=["*"]),
+        MessageBus(),
+    )
+    http = _BlockingTypingHttpClient()
+    channel._running = True
+    channel._http = http
+
+    async def block_handle(**kwargs) -> None:
+        await http.started.wait()
+        await asyncio.Future()
+
+    channel._handle_message = block_handle  # type: ignore[method-assign]
+
+    task = asyncio.create_task(
+        channel._handle_message_create(_make_payload(author_id=123, channel_id=456))
+    )
+    await http.started.wait()
+
+    assert "456" in channel._typing_tasks
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
     await asyncio.sleep(0)
     assert channel._typing_tasks == {}

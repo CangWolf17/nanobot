@@ -239,6 +239,7 @@ class MemoryConsolidator:
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         get_compact_state: Callable[[Session], str | None] | None = None,
+        get_runtime_metadata: Callable[[Session], dict[str, Any] | None] | None = None,
         max_completion_tokens: int = 4096,
         archive_provider: LLMProvider | None = None,
         archive_model: str | None = None,
@@ -254,6 +255,7 @@ class MemoryConsolidator:
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._get_compact_state = get_compact_state
+        self._get_runtime_metadata = get_runtime_metadata
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
@@ -264,14 +266,26 @@ class MemoryConsolidator:
         """Archive a selected message chunk into persistent memory."""
         return await self.store.consolidate(messages, self.archive_provider, self.archive_model)
 
-    async def handle_timeout(self, session: Session, *, phase: str) -> None:
+    async def handle_timeout(
+        self,
+        session: Session,
+        *,
+        phase: str,
+        runtime_metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Record an outer timeout and degrade to raw archive after repeated hangs."""
         if not session.messages or self.context_window_tokens <= 0:
             return
 
         lock = self.get_lock(session.key)
         async with lock:
-            estimated, source = self.estimate_session_prompt_tokens(session)
+            if runtime_metadata is None:
+                estimated, source = self.estimate_session_prompt_tokens(session)
+            else:
+                estimated, source = self.estimate_session_prompt_tokens(
+                    session,
+                    runtime_metadata=runtime_metadata,
+                )
             if estimated <= 0 or estimated < self.prompt_budget():
                 return
 
@@ -340,20 +354,35 @@ class MemoryConsolidator:
         session: Session,
         *,
         max_history_messages: int = 0,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
         history = session.get_history(max_messages=max_history_messages)
-        channel, chat_id = session.key.split(":", 1) if ":" in session.key else (None, None)
+        transport_channel = str(session.metadata.get("transport_channel") or "").strip()
+        transport_chat_id = str(session.metadata.get("transport_chat_id") or "").strip()
+        if transport_channel and transport_chat_id:
+            channel, chat_id = transport_channel, transport_chat_id
+        else:
+            channel, chat_id = session.key.split(":", 1) if ":" in session.key else (None, None)
+        if runtime_metadata is None and self._get_runtime_metadata is not None:
+            runtime_metadata = self._get_runtime_metadata(session)
+        workspace_work_mode = None
+        if isinstance(runtime_metadata, dict):
+            work_mode = runtime_metadata.get("work_mode")
+            if isinstance(work_mode, str) and work_mode in {"plan", "build"}:
+                workspace_work_mode = work_mode
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
             channel=channel,
             chat_id=chat_id,
+            workspace_work_mode=workspace_work_mode,
             compact_state=(
                 self._get_compact_state(session)
                 if self._get_compact_state is not None
                 else session.metadata.get("compact_state")
             ),
+            runtime_metadata=runtime_metadata,
         )
         return estimate_prompt_tokens_chain(
             self.provider,
@@ -366,7 +395,8 @@ class MemoryConsolidator:
         """Prompt token budget for the main conversation path."""
         max_completion_tokens = (
             self.max_completion_tokens
-            if isinstance(self.max_completion_tokens, int) and not isinstance(self.max_completion_tokens, bool)
+            if isinstance(self.max_completion_tokens, int)
+            and not isinstance(self.max_completion_tokens, bool)
             else 4096
         )
         return self.context_window_tokens - max_completion_tokens - self._SAFETY_BUFFER
@@ -376,12 +406,24 @@ class MemoryConsolidator:
         return self.prompt_budget() // 2
 
     def is_over_budget(
-        self, session: Session, *, max_history_messages: int = 0
+        self,
+        session: Session,
+        *,
+        max_history_messages: int = 0,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> tuple[bool, int, str]:
         """Return whether the main conversation prompt is over the safe budget."""
-        estimated, source = self.estimate_session_prompt_tokens(
-            session, max_history_messages=max_history_messages
-        )
+        if runtime_metadata is None:
+            estimated, source = self.estimate_session_prompt_tokens(
+                session,
+                max_history_messages=max_history_messages,
+            )
+        else:
+            estimated, source = self.estimate_session_prompt_tokens(
+                session,
+                max_history_messages=max_history_messages,
+                runtime_metadata=runtime_metadata,
+            )
         return estimated >= self.prompt_budget(), estimated, source
 
     async def archive_messages(self, messages: list[dict[str, object]]) -> bool:
@@ -393,7 +435,12 @@ class MemoryConsolidator:
                 return True
         return True
 
-    async def maybe_consolidate_by_tokens(self, session: Session) -> bool:
+    async def maybe_consolidate_by_tokens(
+        self,
+        session: Session,
+        *,
+        runtime_metadata: dict[str, Any] | None = None,
+    ) -> bool:
         """Loop: archive old messages until prompt fits within safe budget.
 
         Returns True when consolidation completed cleanly (or was unnecessary),
@@ -410,7 +457,13 @@ class MemoryConsolidator:
         async with lock:
             budget = self.prompt_budget()
             target = self.target_prompt_tokens()
-            estimated, source = self.estimate_session_prompt_tokens(session)
+            if runtime_metadata is None:
+                estimated, source = self.estimate_session_prompt_tokens(session)
+            else:
+                estimated, source = self.estimate_session_prompt_tokens(
+                    session,
+                    runtime_metadata=runtime_metadata,
+                )
             if estimated <= 0:
                 return True
             if estimated < budget:
@@ -473,7 +526,13 @@ class MemoryConsolidator:
                     active_end_idx = None
                     active_round = None
 
-                    estimated, source = self.estimate_session_prompt_tokens(session)
+                    if runtime_metadata is None:
+                        estimated, source = self.estimate_session_prompt_tokens(session)
+                    else:
+                        estimated, source = self.estimate_session_prompt_tokens(
+                            session,
+                            runtime_metadata=runtime_metadata,
+                        )
                     if estimated <= 0:
                         return True
                 return True

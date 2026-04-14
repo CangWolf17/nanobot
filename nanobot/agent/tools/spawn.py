@@ -28,12 +28,16 @@ class SpawnTool(Tool):
         self._metadata: dict[str, Any] = {}
 
     def set_context(
-        self, channel: str, chat_id: str, metadata: dict[str, Any] | None = None
+        self,
+        channel: str,
+        chat_id: str,
+        metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
     ) -> None:
         """Set the origin context for subagent announcements."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
-        self._session_key = f"{channel}:{chat_id}"
+        self._session_key = session_key or f"{channel}:{chat_id}"
         filtered: dict[str, Any] = {}
         if isinstance(metadata, dict):
             for key in self._PASSTHROUGH_META_KEYS:

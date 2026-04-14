@@ -109,7 +109,11 @@ def _workspace_v2_resolved_model_spec(
     protocol = str(raw.get("protocol") or "").strip()
     if not protocol:
         normalized_adapter = normalize_lookup_name(adapter)
-        protocol = "responses" if normalized_adapter in {"openairesponses", "openaicodex"} else "chat_completions"
+        protocol = (
+            "responses"
+            if normalized_adapter in {"openairesponses", "openaicodex"}
+            else "chat_completions"
+        )
 
     extra_headers = route.get("extra_headers_override")
     if not isinstance(extra_headers, dict):
@@ -130,7 +134,9 @@ def _workspace_v2_resolved_model_spec(
         tier=str(raw.get("tier") or "").strip(),
         effort=str(raw.get("effort") or "").strip(),
         route_name=route_ref,
-        config_provider_ref=str(route.get("config_provider_ref") or raw.get("provider") or "custom").strip()
+        config_provider_ref=str(
+            route.get("config_provider_ref") or raw.get("provider") or "custom"
+        ).strip()
         or "custom",
         adapter=adapter,
         protocol=protocol,
@@ -197,6 +203,7 @@ class SubagentManager:
         origin = {
             "channel": origin_channel,
             "chat_id": origin_chat_id,
+            "session_key": session_key,
             "metadata": dict(origin_metadata or {}),
         }
         lease: SubagentLease | None = None
@@ -210,6 +217,9 @@ class SubagentManager:
                 origin=origin,
             )
             decision: AcquireDecision = self.resource_manager.acquire(request)
+            if decision.status == "queued":
+                reason = decision.reason or "queue_wait"
+                return f"Subagent [{display_label}] queued: {reason}. It has not started yet."
             if decision.status != "granted" or decision.lease is None:
                 reason = decision.reason or decision.status or "resource_denied"
                 return f"Subagent [{display_label}] rejected: {reason}"
@@ -250,16 +260,22 @@ class SubagentManager:
             tools = ToolRegistry()
             allowed_dir = self.workspace if self.restrict_to_workspace else None
             extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-            tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
+            tools.register(
+                ReadFileTool(
+                    workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read
+                )
+            )
             tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-                path_append=self.exec_config.path_append,
-            ))
+            tools.register(
+                ExecTool(
+                    working_dir=str(self.workspace),
+                    timeout=self.exec_config.timeout,
+                    restrict_to_workspace=self.restrict_to_workspace,
+                    path_append=self.exec_config.path_append,
+                )
+            )
             tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
             context_bundle = self._build_subagent_execution_context_bundle(origin)
@@ -273,25 +289,36 @@ class SubagentManager:
                 async def before_execute_tools(self, context: AgentHookContext) -> None:
                     for tool_call in context.tool_calls:
                         args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
+                        logger.debug(
+                            "Subagent [{}] executing: {} with arguments: {}",
+                            task_id,
+                            tool_call.name,
+                            args_str,
+                        )
 
             run_model = self.model
             run_runner = self.runner
             if lease is not None:
                 leased_provider, leased_model = self._build_provider_for_lease(lease)
                 run_model = leased_model
-                run_runner = self.runner if leased_provider is self.provider else AgentRunner(leased_provider)
-            result = await run_runner.run(AgentRunSpec(
-                initial_messages=messages,
-                tools=tools,
-                model=run_model,
-                max_iterations=15,
-                hook=_SubagentHook(),
-                max_iterations_message="Task completed but no final response was generated.",
-                error_message=None,
-                fail_on_tool_error=True,
-                concurrent_tools=not should_disable_concurrent_tools(self.workspace),
-            ))
+                run_runner = (
+                    self.runner
+                    if leased_provider is self.provider
+                    else AgentRunner(leased_provider)
+                )
+            result = await run_runner.run(
+                AgentRunSpec(
+                    initial_messages=messages,
+                    tools=tools,
+                    model=run_model,
+                    max_iterations=15,
+                    hook=_SubagentHook(),
+                    max_iterations_message="Task completed but no final response was generated.",
+                    error_message=None,
+                    fail_on_tool_error=True,
+                    concurrent_tools=not should_disable_concurrent_tools(self.workspace),
+                )
+            )
             if result.stop_reason == "tool_error":
                 await self._announce_result(
                     task_id,
@@ -319,7 +346,11 @@ class SubagentManager:
                         workspace=self.workspace,
                         probe=probe,
                     )
-                    if probed_route == lease.route and isinstance(probe, dict) and bool(probe.get("ok")):
+                    if (
+                        probed_route == lease.route
+                        and isinstance(probe, dict)
+                        and bool(probe.get("ok"))
+                    ):
                         refresh_provider_in_manager(self.resource_manager, route=lease.route)
                 await self._announce_result(
                     task_id,
@@ -330,7 +361,9 @@ class SubagentManager:
                     "error",
                 )
                 return
-            final_result = result.final_content or "Task completed but no final response was generated."
+            final_result = (
+                result.final_content or "Task completed but no final response was generated."
+            )
             if lease is not None and self.resource_manager is not None:
                 refresh_provider_in_manager(self.resource_manager, route=lease.route)
                 refresh_provider_status(workspace=self.workspace, route=lease.route)
@@ -363,7 +396,7 @@ class SubagentManager:
         label: str,
         task: str,
         result: str,
-        origin: dict[str, str],
+        origin: dict[str, Any],
         status: str,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
@@ -385,10 +418,13 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
             metadata=dict(origin.get("metadata") or {}),
+            session_key_override=(str(origin.get("session_key") or "").strip() or None),
         )
 
         await self.bus.publish_inbound(msg)
-        logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
+        logger.debug(
+            "Subagent [{}] announced result to {}:{}", task_id, origin["channel"], origin["chat_id"]
+        )
 
     @staticmethod
     def _format_partial_progress(result) -> str:
@@ -500,10 +536,12 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
         from nanobot.agent.skills import SkillsLoader
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
-        parts = [f"""# Subagent
+        parts = [
+            f"""# Subagent
 
 {time_ctx}
-"""]
+"""
+        ]
         parts.append(self._build_subagent_execution_context_bundle(origin))
         parts.append(
             f"""You are a subagent spawned by the main agent to complete a specific task.
@@ -517,7 +555,9 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
 
         skills_summary = SkillsLoader(self.workspace).build_skills_summary()
         if skills_summary:
-            parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
+            parts.append(
+                f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}"
+            )
 
         dev_block = format_dev_discipline_block(self.workspace)
         if dev_block:
@@ -538,7 +578,9 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
         """Build the V1 resource request payload from spawn inputs + harness metadata."""
         metadata = origin.get("metadata") if isinstance(origin, dict) else {}
         runtime_meta = metadata.get("workspace_runtime") if isinstance(metadata, dict) else None
-        active_harness = runtime_meta.get("active_harness") if isinstance(runtime_meta, dict) else None
+        active_harness = (
+            runtime_meta.get("active_harness") if isinstance(runtime_meta, dict) else None
+        )
         harness_model = ""
         harness_tier = ""
         harness_id = ""
@@ -546,10 +588,15 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
             harness_model = str(active_harness.get("subagent_model") or "").strip()
             harness_tier = str(active_harness.get("subagent_tier") or "").strip()
             harness_id = str(active_harness.get("id") or "").strip()
-        manager_request = self.resource_manager.default_request() if self.resource_manager is not None else SubagentRequest(manager_model=self.model)
+        manager_request = (
+            self.resource_manager.default_request()
+            if self.resource_manager is not None
+            else SubagentRequest(manager_model=self.model, profile="subagent")
+        )
         return SubagentRequest(
             model=(model or "").strip() or None,
             tier=(tier or "").strip() or None,
+            profile="subagent",
             harness_tier=harness_tier or None,
             harness_model=harness_model or None,
             manager_tier=manager_request.manager_tier,
@@ -571,10 +618,12 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
 
         try:
             registry = ModelRegistryStore(self.workspace / "model_registry.json").load()
-            spec = RegistryResolver(registry).resolve_ref(lease.model_id, profile_hint="chat")
+            spec = RegistryResolver(registry).resolve_ref(lease.model_id, profile_hint="subagent")
             config = load_config(self.workspace / "config.json")
             return build_provider_from_spec(spec, config)
-        except (FileNotFoundError, ModelRegistryError, ModelRegistrySemanticError, ValueError):
+        except ModelRegistrySemanticError:
+            raise
+        except (FileNotFoundError, ModelRegistryError, ValueError):
             pass
 
         if lease.model_id == self.model:
@@ -586,17 +635,30 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
             if not isinstance(workspace_registry, dict):
                 workspace_registry = self.resource_manager.registry
 
-        if isinstance(workspace_registry, dict) and int(workspace_registry.get("version") or 0) >= 2:
-            spec = _workspace_v2_resolved_model_spec(workspace_registry, lease.model_id)
-            if spec is not None:
-                try:
-                    from nanobot.config.loader import load_config
-                    from nanobot.model_registry.provider_factory import build_provider_from_spec
+        if (
+            isinstance(workspace_registry, dict)
+            and int(workspace_registry.get("version") or 0) >= 2
+        ):
+            try:
+                from nanobot.config.loader import load_config
+                from nanobot.model_registry.provider_factory import build_provider_from_spec
+                from nanobot.model_registry.resolver import (
+                    ModelRegistryError,
+                    ModelRegistrySemanticError,
+                    RegistryResolver,
+                )
+                from nanobot.model_registry.schema import ModelRegistry
 
-                    config = load_config(self.workspace / "config.json")
-                    return build_provider_from_spec(spec, config)
-                except (FileNotFoundError, ValueError):
-                    pass
+                spec = RegistryResolver(ModelRegistry.from_dict(workspace_registry)).resolve_ref(
+                    lease.model_id,
+                    profile_hint="subagent",
+                )
+                config = load_config(self.workspace / "config.json")
+                return build_provider_from_spec(spec, config)
+            except ModelRegistrySemanticError:
+                raise
+            except (FileNotFoundError, ModelRegistryError, ValueError):
+                pass
 
         raw = (
             _workspace_legacy_model_record(workspace_registry, lease.model_id)
@@ -611,7 +673,11 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
         provider_name = str(raw.get("provider") or "custom").strip() or "custom"
         api_base = str(connection.get("api_base") or "").strip() or None
         api_key = str(connection.get("api_key") or "").strip()
-        extra_headers = connection.get("extra_headers") if isinstance(connection.get("extra_headers"), dict) else None
+        extra_headers = (
+            connection.get("extra_headers")
+            if isinstance(connection.get("extra_headers"), dict)
+            else None
+        )
         config = load_config(self.workspace / "config.json")
         provider_cfg = getattr(config.providers, provider_name, None)
         if provider_cfg is None:
@@ -619,7 +685,12 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
             provider_name = "custom"
             config.agents.defaults.provider = provider_name
 
-        if not api_base and not api_key and provider_name == "custom" and not getattr(provider_cfg, "api_key", ""):
+        if (
+            not api_base
+            and not api_key
+            and provider_name == "custom"
+            and not getattr(provider_cfg, "api_key", "")
+        ):
             return self.provider, provider_model
 
         config.agents.defaults.model = provider_model
@@ -645,8 +716,11 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
-        tasks = [self._running_tasks[tid] for tid in self._session_tasks.get(session_key, [])
-                 if tid in self._running_tasks and not self._running_tasks[tid].done()]
+        tasks = [
+            self._running_tasks[tid]
+            for tid in self._session_tasks.get(session_key, [])
+            if tid in self._running_tasks and not self._running_tasks[tid].done()
+        ]
         for t in tasks:
             t.cancel()
         if tasks:

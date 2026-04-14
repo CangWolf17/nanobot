@@ -162,6 +162,7 @@ class AgentLoop:
         meta = msg.metadata or {}
         explicit_runtime = meta.get("workspace_runtime")
         runtime_meta: dict[str, Any] = {}
+        effective_session_key = self._effective_session_key(msg)
 
         work_mode = str(meta.get("workspace_work_mode") or "").strip()
         if not work_mode:
@@ -178,7 +179,7 @@ class AgentLoop:
         try:
             service_meta = HarnessService.for_workspace(self.workspace).runtime_metadata(
                 requested_auto=bool(meta.get("workspace_harness_auto")),
-                session_key=msg.session_key,
+                session_key=effective_session_key,
                 harness_id=str(meta.get("workspace_harness_id") or "").strip(),
             )
         except Exception:
@@ -191,6 +192,64 @@ class AgentLoop:
             return runtime_meta
         runtime_meta.update(service_meta)
         return runtime_meta
+
+    def _get_session_runtime_metadata(self, session: Session) -> dict[str, Any]:
+        channel, chat_id = session.key.split(":", 1) if ":" in session.key else ("cli", session.key)
+        persisted_meta = {
+            key: session.metadata[key]
+            for key in (
+                "workspace_runtime",
+                "workspace_work_mode",
+                "workspace_harness_auto",
+                "workspace_harness_id",
+            )
+            if key in session.metadata
+        }
+        probe_msg = InboundMessage(
+            channel=channel,
+            sender_id="system",
+            chat_id=chat_id,
+            content="[token-probe]",
+            metadata=persisted_meta,
+            session_key_override=session.key,
+        )
+        return self._extract_runtime_metadata(probe_msg)
+
+    @staticmethod
+    def _transport_route_from_system_message(msg: InboundMessage) -> tuple[str, str]:
+        if ":" in msg.chat_id:
+            return msg.chat_id.split(":", 1)
+        return "cli", msg.chat_id
+
+    def _effective_session_key(
+        self,
+        msg: InboundMessage,
+        *,
+        session_key: str | None = None,
+    ) -> str:
+        if session_key:
+            return session_key
+        if msg.session_key_override:
+            return msg.session_key_override
+        if msg.channel == "system":
+            channel, chat_id = self._transport_route_from_system_message(msg)
+            return f"{channel}:{chat_id}"
+        return msg.session_key
+
+    @staticmethod
+    def _resolve_workspace_work_mode(
+        metadata: dict[str, Any] | None,
+        runtime_metadata: dict[str, Any] | None,
+    ) -> str | None:
+        if isinstance(runtime_metadata, dict):
+            work_mode = str(runtime_metadata.get("work_mode") or "").strip()
+            if work_mode in {"plan", "build"}:
+                return work_mode
+        if isinstance(metadata, dict):
+            work_mode = str(metadata.get("workspace_work_mode") or "").strip()
+            if work_mode in {"plan", "build"}:
+                return work_mode
+        return None
 
     def _decide_harness_auto_reentry(self, msg: InboundMessage) -> dict[str, Any]:
         meta = msg.metadata or {}
@@ -214,7 +273,7 @@ class AgentLoop:
         service = HarnessService.for_workspace(self.workspace)
         try:
             service_decision = service.decide_auto_continue(
-                session_key=msg.session_key,
+                session_key=self._effective_session_key(msg),
                 sender_id=msg.sender_id,
                 origin_sender_id=origin_sender_id,
                 harness_id=str(meta.get("workspace_harness_id") or "").strip(),
@@ -236,6 +295,7 @@ class AgentLoop:
         if not bool(decision.get("should_fire")):
             return
         meta = dict(msg.metadata or {})
+        effective_session_key = self._effective_session_key(msg)
         follow_up = InboundMessage(
             channel=msg.channel,
             sender_id="system",
@@ -246,10 +306,10 @@ class AgentLoop:
                 origin_sender_id=str(
                     decision.get("origin_sender_id") or msg.sender_id or ""
                 ).strip(),
-                session_key=msg.session_key,
+                session_key=effective_session_key,
                 harness_id=str(meta.get("workspace_harness_id") or "").strip(),
             ),
-            session_key_override=msg.session_key,
+            session_key_override=effective_session_key,
         )
         await self.bus.publish_inbound(follow_up)
 
@@ -429,6 +489,7 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
             get_compact_state=self._get_session_compact_state,
+            get_runtime_metadata=self._get_session_runtime_metadata,
             max_completion_tokens=provider.generation.max_tokens,
             archive_provider=self.archive_provider,
             archive_model=self.archive_model,
@@ -443,8 +504,16 @@ class AgentLoop:
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
-    async def _maybe_consolidate_and_sync_compact_state(self, session: Session) -> bool:
-        completed = await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+    async def _maybe_consolidate_and_sync_compact_state(
+        self,
+        session: Session,
+        *,
+        runtime_metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        completed = await self.memory_consolidator.maybe_consolidate_by_tokens(
+            session,
+            runtime_metadata=runtime_metadata,
+        )
         if not completed or not self.memory_config.compact_state_enabled:
             return completed
         synced = await self.compact_state.sync_session(session)
@@ -516,6 +585,7 @@ class AgentLoop:
         chat_id: str,
         message_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
@@ -524,9 +594,14 @@ class AgentLoop:
                     if name == "message":
                         tool.set_context(channel, chat_id, message_id)
                     elif name == "spawn":
-                        tool.set_context(channel, chat_id, metadata)
+                        tool.set_context(channel, chat_id, metadata, session_key=session_key)
                     else:
                         tool.set_context(channel, chat_id)
+
+    @staticmethod
+    def _persist_session_transport_route(session: Session, *, channel: str, chat_id: str) -> None:
+        session.metadata["transport_channel"] = channel
+        session.metadata["transport_chat_id"] = chat_id
 
     @staticmethod
     def _read_complete_line(text: str, start: int) -> tuple[str | None, int]:
@@ -884,7 +959,8 @@ class AgentLoop:
 
             raw = msg.content.strip()
             if self.commands.is_priority(raw):
-                ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
+                key = self._effective_session_key(msg)
+                ctx = CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
                 result = await self.commands.dispatch_priority(ctx)
                 if result:
                     await self.bus.publish_outbound(result)
@@ -892,10 +968,11 @@ class AgentLoop:
             if fastlane := await try_workspace_fastlane(msg, raw):
                 await self.bus.publish_outbound(fastlane)
                 continue
+            key = self._effective_session_key(msg)
             task = asyncio.create_task(self._dispatch(msg))
-            self._active_tasks.setdefault(msg.session_key, []).append(task)
+            self._active_tasks.setdefault(key, []).append(task)
             task.add_done_callback(
-                lambda t, k=msg.session_key: (
+                lambda t, k=key: (
                     self._active_tasks.get(k, []) and self._active_tasks[k].remove(t)
                     if t in self._active_tasks.get(k, [])
                     else None
@@ -904,7 +981,8 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
-        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        key = self._effective_session_key(msg)
+        lock = self._session_locks.setdefault(key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
             try:
@@ -915,7 +993,7 @@ class AgentLoop:
                 stream_char_count = 0
                 if msg.metadata.get("_wants_stream"):
                     # Split one answer into distinct stream segments.
-                    stream_base_id = f"{msg.session_key}:{time.time_ns()}"
+                    stream_base_id = f"{key}:{time.time_ns()}"
                     stream_segment = 0
 
                     def _current_stream_id() -> str:
@@ -989,11 +1067,11 @@ class AgentLoop:
                         )
                     )
             except asyncio.CancelledError:
-                logger.info("Task cancelled for session {}", msg.session_key)
+                logger.info("Task cancelled for session {}", key)
                 raise
             except Exception:
                 self._discard_inflight_turn(msg.session_key)
-                logger.exception("Error processing message for session {}", msg.session_key)
+                logger.exception("Error processing message for session {}", key)
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         channel=msg.channel,
@@ -1020,7 +1098,12 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
-    async def _run_pre_reply_consolidation(self, session: Session) -> bool:
+    async def _run_pre_reply_consolidation(
+        self,
+        session: Session,
+        *,
+        runtime_metadata: dict[str, Any] | None = None,
+    ) -> bool:
         """Best-effort pre-reply consolidation. Returns True if it completed cleanly."""
         if not self.memory_config.enabled:
             return True
@@ -1033,7 +1116,10 @@ class AgentLoop:
                 self.archive_model,
             )
             completed = await asyncio.wait_for(
-                self._maybe_consolidate_and_sync_compact_state(session),
+                self._maybe_consolidate_and_sync_compact_state(
+                    session,
+                    runtime_metadata=runtime_metadata,
+                ),
                 timeout=timeout,
             )
             return completed
@@ -1042,7 +1128,11 @@ class AgentLoop:
                 "Pre-reply consolidation timed out for {} after {}s", session.key, timeout
             )
             try:
-                await self.memory_consolidator.handle_timeout(session, phase="pre-reply")
+                await self.memory_consolidator.handle_timeout(
+                    session,
+                    phase="pre-reply",
+                    runtime_metadata=runtime_metadata,
+                )
             except Exception:
                 logger.exception(
                     "Failed to record pre-reply consolidation timeout for {}", session.key
@@ -1057,12 +1147,16 @@ class AgentLoop:
         session: Session,
         *,
         msg: InboundMessage | None = None,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         if not self.memory_config.enabled:
             return False, "memory_disabled"
         if msg is not None and bool((msg.metadata or {}).get("workspace_harness_auto")):
             return False, self._PRE_REPLY_CONSOLIDATION_SKIP_REASON_HARNESS_AUTO
-        over_budget, _estimated, _source = self.memory_consolidator.is_over_budget(session)
+        over_budget, _estimated, _source = self.memory_consolidator.is_over_budget(
+            session,
+            runtime_metadata=runtime_metadata,
+        )
         if not over_budget:
             return False, self._PRE_REPLY_CONSOLIDATION_SKIP_REASON_UNDER_BUDGET
         return True, "over_budget"
@@ -1073,20 +1167,36 @@ class AgentLoop:
         *,
         msg: InboundMessage | None = None,
     ) -> bool:
-        should_run, reason = self._should_run_pre_reply_consolidation(session, msg=msg)
+        runtime_metadata = self._extract_runtime_metadata(msg) if msg is not None else None
+        should_run, reason = self._should_run_pre_reply_consolidation(
+            session,
+            msg=msg,
+            runtime_metadata=runtime_metadata,
+        )
         if not should_run:
             logger.debug("Pre-reply consolidation skipped for {}: {}", session.key, reason)
             return True
-        return await self._run_pre_reply_consolidation(session)
+        return await self._run_pre_reply_consolidation(
+            session,
+            runtime_metadata=runtime_metadata,
+        )
 
-    async def _run_background_consolidation(self, session: Session) -> None:
+    async def _run_background_consolidation(
+        self,
+        session: Session,
+        *,
+        runtime_metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Best-effort background consolidation with a looser timeout."""
         if not self.memory_config.enabled:
             return
         timeout = max(0.1, float(self.memory_config.background_timeout_seconds))
         try:
             completed = await asyncio.wait_for(
-                self._maybe_consolidate_and_sync_compact_state(session),
+                self._maybe_consolidate_and_sync_compact_state(
+                    session,
+                    runtime_metadata=runtime_metadata,
+                ),
                 timeout=timeout,
             )
             if not completed:
@@ -1098,7 +1208,11 @@ class AgentLoop:
                 "Background consolidation timed out for {} after {}s", session.key, timeout
             )
             try:
-                await self.memory_consolidator.handle_timeout(session, phase="background")
+                await self.memory_consolidator.handle_timeout(
+                    session,
+                    phase="background",
+                    runtime_metadata=runtime_metadata,
+                )
             except Exception:
                 logger.exception(
                     "Failed to record background consolidation timeout for {}", session.key
@@ -1111,6 +1225,7 @@ class AgentLoop:
         session: Session,
         *,
         preflight_ok: bool,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Choose full vs recent-window history for the main reply."""
         history = session.get_history(max_messages=0)
@@ -1121,7 +1236,10 @@ class AgentLoop:
             return history
 
         fallback_max = max(1, int(self.memory_config.recent_history_fallback_messages))
-        over_budget, estimated, source = self.memory_consolidator.is_over_budget(session)
+        over_budget, estimated, source = self.memory_consolidator.is_over_budget(
+            session,
+            runtime_metadata=runtime_metadata,
+        )
         if not over_budget:
             return history
 
@@ -1193,15 +1311,35 @@ class AgentLoop:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
-            channel, chat_id = (
-                msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
-            )
+            channel, chat_id = self._transport_route_from_system_message(msg)
             logger.info("Processing system message from {}", msg.sender_id)
-            key = f"{channel}:{chat_id}"
+            key = self._effective_session_key(msg, session_key=session_key)
             session = self.sessions.get_or_create(key)
-            await self._maybe_run_pre_reply_consolidation(session, msg=msg)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), msg.metadata)
-            history = session.get_history(max_messages=0)
+            self._persist_session_transport_route(session, channel=channel, chat_id=chat_id)
+            runtime_metadata = self._extract_runtime_metadata(msg)
+            workspace_work_mode = self._resolve_workspace_work_mode(msg.metadata, runtime_metadata)
+            preflight_ok = await self._maybe_run_pre_reply_consolidation(session, msg=msg)
+            tool_metadata = dict(msg.metadata or {})
+            if runtime_metadata:
+                tool_metadata["workspace_runtime"] = runtime_metadata
+            self._set_tool_context(
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                tool_metadata,
+                session_key=key,
+            )
+            if preflight_ok:
+                history = self._select_history_for_reply(
+                    session,
+                    preflight_ok=True,
+                )
+            else:
+                history = self._select_history_for_reply(
+                    session,
+                    preflight_ok=False,
+                    runtime_metadata=runtime_metadata,
+                )
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
@@ -1209,9 +1347,9 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
                 current_role=current_role,
-                workspace_work_mode=(msg.metadata or {}).get("workspace_work_mode"),
+                workspace_work_mode=workspace_work_mode,
                 compact_state=self._get_session_compact_state(session),
-                runtime_metadata=self._extract_runtime_metadata(msg),
+                runtime_metadata=runtime_metadata,
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages,
@@ -1222,7 +1360,12 @@ class AgentLoop:
             final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
-            self._schedule_background(self._run_background_consolidation(session))
+            self._schedule_background(
+                self._run_background_consolidation(
+                    session,
+                    runtime_metadata=runtime_metadata,
+                )
+            )
             if self._should_schedule_harness_auto_continue(msg):
                 await self._schedule_harness_auto_continue(msg)
             return OutboundMessage(
@@ -1235,8 +1378,9 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        key = session_key or msg.session_key
+        key = self._effective_session_key(msg, session_key=session_key)
         session = self.sessions.get_or_create(key)
+        self._persist_session_transport_route(session, channel=msg.channel, chat_id=msg.chat_id)
 
         # Slash commands
         raw = msg.content.strip()
@@ -1251,6 +1395,8 @@ class AgentLoop:
             )
             self.sessions.save(session)
 
+        runtime_metadata = self._extract_runtime_metadata(msg)
+        workspace_work_mode = self._resolve_workspace_work_mode(msg.metadata, runtime_metadata)
         preflight_ok = await self._maybe_run_pre_reply_consolidation(session, msg=msg)
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -1286,17 +1432,30 @@ class AgentLoop:
             await _bus_progress(hint)
 
         tool_metadata = dict(msg.metadata or {})
-        computed_runtime = self._extract_runtime_metadata(msg)
-        if computed_runtime:
-            tool_metadata["workspace_runtime"] = computed_runtime
+        if runtime_metadata:
+            tool_metadata["workspace_runtime"] = runtime_metadata
         self._set_tool_context(
-            msg.channel, msg.chat_id, msg.metadata.get("message_id"), tool_metadata
+            msg.channel,
+            msg.chat_id,
+            msg.metadata.get("message_id"),
+            tool_metadata,
+            session_key=key,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        history = self._select_history_for_reply(session, preflight_ok=preflight_ok)
+        if preflight_ok:
+            history = self._select_history_for_reply(
+                session,
+                preflight_ok=True,
+            )
+        else:
+            history = self._select_history_for_reply(
+                session,
+                preflight_ok=False,
+                runtime_metadata=runtime_metadata,
+            )
         prepared_agent_input = (msg.metadata or {}).get("workspace_agent_input")
         current_message = (
             prepared_agent_input
@@ -1322,9 +1481,9 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
-            workspace_work_mode=(msg.metadata or {}).get("workspace_work_mode"),
+            workspace_work_mode=workspace_work_mode,
             compact_state=self._get_session_compact_state(session),
-            runtime_metadata=self._extract_runtime_metadata(msg),
+            runtime_metadata=runtime_metadata,
         )
         persisted_current_content = None
         if current_message != msg.content:
@@ -1334,9 +1493,9 @@ class AgentLoop:
                 media=msg.media if msg.media else None,
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                workspace_work_mode=(msg.metadata or {}).get("workspace_work_mode"),
+                workspace_work_mode=workspace_work_mode,
                 compact_state=self._get_session_compact_state(session),
-                runtime_metadata=self._extract_runtime_metadata(msg),
+                runtime_metadata=runtime_metadata,
             )
             if persisted_messages:
                 persisted_current_content = persisted_messages[-1].get("content")
@@ -1375,7 +1534,12 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history))
         self._discard_inflight_turn(msg.session_key)
         self.sessions.save(session)
-        self._schedule_background(self._run_background_consolidation(session))
+        self._schedule_background(
+            self._run_background_consolidation(
+                session,
+                runtime_metadata=runtime_metadata,
+            )
+        )
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -1405,7 +1569,7 @@ class AgentLoop:
         if cmd == "harness":
             result = HarnessService.for_workspace(self.workspace).apply_agent_update(
                 final_content,
-                session_key=msg.session_key,
+                session_key=self._effective_session_key(msg),
                 harness_id=str((msg.metadata or {}).get("workspace_harness_id") or "").strip(),
             )
             return result.final_content
@@ -1530,6 +1694,7 @@ class AgentLoop:
             chat_id=chat_id,
             content=content,
             metadata=dict(metadata or {}),
+            session_key_override=session_key,
         )
         return await self._process_message(
             msg,
