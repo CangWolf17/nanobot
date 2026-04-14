@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from nanobot.bus.events import InboundMessage
-from nanobot.command.builtin import cmd_dream_log, cmd_dream_restore
+from nanobot.command.builtin import cmd_dream, cmd_dream_log, cmd_dream_restore
 from nanobot.command.router import CommandContext
 from nanobot.utils.gitstore import CommitInfo
 
@@ -51,6 +51,18 @@ def _make_ctx(raw: str, git: _FakeGit, *, args: str = "", last_dream_cursor: int
     store = _FakeStore(git, last_dream_cursor=last_dream_cursor)
     loop = SimpleNamespace(consolidator=SimpleNamespace(store=store))
     return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop)
+
+
+def _make_dream_ctx(raw: str) -> CommandContext:
+    msg = InboundMessage(channel="cli", sender_id="u1", chat_id="direct", content=raw)
+    store = _FakeStore(_FakeGit())
+    loop = SimpleNamespace(
+        consolidator=SimpleNamespace(store=store),
+        provider=object(),
+        model="test-model",
+        memory_config=SimpleNamespace(max_batch_size=7, max_iterations=9),
+    )
+    return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=loop)
 
 
 @pytest.mark.asyncio
@@ -141,3 +153,44 @@ async def test_dream_restore_success_mentions_files_and_followup() -> None:
     assert "- New safety commit: `eeee9999`" in out.content
     assert "- Restored files: `SOUL.md`, `memory/MEMORY.md`" in out.content
     assert "Use `/dream-log eeee9999` to inspect the restore diff." in out.content
+
+
+@pytest.mark.asyncio
+async def test_dream_runs_immediately_when_invoked(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    class _FakeDream:
+        def __init__(self, *, store, provider, model, max_batch_size, max_iterations):
+            observed["store"] = store
+            observed["provider"] = provider
+            observed["model"] = model
+            observed["max_batch_size"] = max_batch_size
+            observed["max_iterations"] = max_iterations
+
+        async def run(self) -> bool:
+            return True
+
+    monkeypatch.setattr("nanobot.agent.memory.Dream", _FakeDream)
+
+    out = await cmd_dream(_make_dream_ctx("/dream"))
+
+    assert out.content == "Dream ran successfully and updated durable memory."
+    assert observed["model"] == "test-model"
+    assert observed["max_batch_size"] == 7
+    assert observed["max_iterations"] == 9
+
+
+@pytest.mark.asyncio
+async def test_dream_reports_noop_when_nothing_new(monkeypatch) -> None:
+    class _FakeDream:
+        def __init__(self, **kwargs):
+            pass
+
+        async def run(self) -> bool:
+            return False
+
+    monkeypatch.setattr("nanobot.agent.memory.Dream", _FakeDream)
+
+    out = await cmd_dream(_make_dream_ctx("/dream"))
+
+    assert out.content == "Dream had nothing new to consolidate."

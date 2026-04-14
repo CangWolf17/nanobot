@@ -29,6 +29,9 @@ def build_help_text() -> str:
         "/interrupt — Interrupt current execution and keep context",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/dream — Run Dream memory consolidation now",
+        "/dream-log — Inspect the latest Dream memory change",
+        "/dream-restore — List or restore Dream memory versions",
         "/harness — Manage the runtime harness",
         "/help — Show available commands",
     ]
@@ -283,6 +286,182 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+def _get_dream_store(ctx: CommandContext):
+    loop = ctx.loop
+    consolidator = getattr(loop, "consolidator", None) or getattr(loop, "memory_consolidator", None)
+    return getattr(consolidator, "store", None)
+
+
+async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+    """Run Dream immediately for the current workspace."""
+    loop = ctx.loop
+    if loop is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Dream is unavailable in this runtime.",
+        )
+
+    store = _get_dream_store(ctx)
+    if store is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Dream memory store is unavailable in this runtime.",
+        )
+
+    from nanobot.agent.memory import Dream
+
+    provider = getattr(loop, "archive_provider", None) or getattr(loop, "provider", None)
+    model = getattr(loop, "archive_model", None) or getattr(loop, "model", None)
+    max_batch_size = getattr(getattr(loop, "memory_config", None), "max_batch_size", None)
+    max_iterations = getattr(getattr(loop, "memory_config", None), "max_iterations", None)
+
+    dream = Dream(
+        store=store,
+        provider=provider,
+        model=model,
+        max_batch_size=int(max_batch_size or 20),
+        max_iterations=int(max_iterations or 10),
+    )
+    changed = await dream.run()
+    content = (
+        "Dream ran successfully and updated durable memory."
+        if changed
+        else "Dream had nothing new to consolidate."
+    )
+    return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content)
+
+
+def _extract_changed_files(diff: str) -> list[str]:
+    files: list[str] = []
+    for line in diff.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        parts = line.split()
+        if len(parts) >= 4:
+            path = parts[2][2:]
+            if path not in files:
+                files.append(path)
+    return files
+
+
+async def cmd_dream_log(ctx: CommandContext) -> OutboundMessage:
+    """Show the latest Dream commit or a specific Dream diff."""
+    store = _get_dream_store(ctx)
+    git = getattr(store, "git", None)
+    sha = str(ctx.args or "").strip()
+
+    if git is None or not git.is_initialized():
+        if store is not None and int(getattr(store, "get_last_dream_cursor", lambda: 0)() or 0) <= 0:
+            content = "Dream has not run yet. Run `/dream` after new archive entries exist."
+        else:
+            content = "Dream change history is not available yet."
+        return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content)
+
+    latest = git.log(max_entries=1)
+    target = sha or (latest[0].sha if latest else "")
+    if not target:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Dream has not recorded any memory changes yet.",
+        )
+
+    shown = git.show_commit_diff(target)
+    if shown is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Couldn't find Dream change `{target}`. Use `/dream-restore` to list recent versions.",
+        )
+
+    commit, diff = shown
+    changed_files = _extract_changed_files(diff)
+    files_line = ", ".join(f"`{path}`" for path in changed_files) if changed_files else "(no file changes)"
+    content = "\n".join(
+        [
+            "## Dream Update",
+            "Here is the latest Dream memory change." if not sha else f"Here is Dream change `{commit.sha}`.",
+            f"- Commit: `{commit.sha}`",
+            f"- Timestamp: {commit.timestamp}",
+            f"- Changed files: {files_line}",
+            f"- Message: {commit.message}",
+            f"Use `/dream-restore {commit.sha}` to undo this change.",
+            "",
+            "```diff",
+            diff or "(no diff available)",
+            "```",
+        ]
+    )
+    return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content)
+
+
+async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
+    """List Dream versions or restore to the state before a selected commit."""
+    store = _get_dream_store(ctx)
+    git = getattr(store, "git", None)
+    sha = str(ctx.args or "").strip()
+
+    if git is None or not git.is_initialized():
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Dream restore history is not available yet.",
+        )
+
+    if not sha:
+        commits = git.log(max_entries=20)
+        if not commits:
+            content = "## Dream Restore\nNo Dream memory versions are available yet."
+        else:
+            lines = [
+                "## Dream Restore",
+                "Choose a Dream memory version to restore.",
+                "",
+            ]
+            lines.extend(
+                f"`{commit.sha}` {commit.timestamp} - {commit.message}" for commit in commits
+            )
+            lines.extend(
+                [
+                    "",
+                    "Preview a version with `/dream-log <sha>`.",
+                    "Restore a version with `/dream-restore <sha>`.",
+                ]
+            )
+            content = "\n".join(lines)
+        return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content)
+
+    shown = git.show_commit_diff(sha)
+    if shown is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Couldn't find Dream change `{sha}`. Use `/dream-restore` to list recent versions.",
+        )
+    commit, diff = shown
+    new_sha = git.revert(commit.sha)
+    if not new_sha:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Dream restore for `{commit.sha}` failed. Please inspect the memory git store manually.",
+        )
+
+    changed_files = _extract_changed_files(diff)
+    files_line = ", ".join(f"`{path}`" for path in changed_files) if changed_files else "(no file changes)"
+    content = "\n".join(
+        [
+            f"Restored Dream memory to the state before `{commit.sha}`.",
+            f"- New safety commit: `{new_sha}`",
+            f"- Restored files: {files_line}",
+            f"Use `/dream-log {new_sha}` to inspect the restore diff.",
+        ]
+    )
+    return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content)
+
+
 def register_builtin_commands(router: CommandRouter) -> None:
     """Register the default set of slash commands."""
     router.priority("/stop", cmd_stop)
@@ -293,5 +472,11 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
     router.exact("/help", cmd_help)
+    router.exact("/dream", cmd_dream)
+    router.exact("/dream-log", cmd_dream_log)
+    router.exact("/dream-restore", cmd_dream_restore)
     router.prefix("/harness ", cmd_harness)
+    router.prefix("/dream ", cmd_dream)
+    router.prefix("/dream-log ", cmd_dream_log)
+    router.prefix("/dream-restore ", cmd_dream_restore)
     router.intercept(cmd_workspace_bridge)

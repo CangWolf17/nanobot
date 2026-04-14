@@ -6,7 +6,7 @@ import asyncio
 import re
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from loguru import logger
@@ -198,6 +198,9 @@ class TelegramChannel(BaseChannel):
         BotCommand("new", "Start a new conversation"),
         BotCommand("stop", "Stop the current task"),
         BotCommand("interrupt", "Interrupt current execution"),
+        BotCommand("dream", "Run Dream memory consolidation"),
+        BotCommand("dream_log", "Inspect the latest Dream memory change"),
+        BotCommand("dream_restore", "List or restore Dream memory versions"),
         BotCommand("help", "Show available commands"),
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
@@ -283,6 +286,9 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("restart", self._forward_command))
         self._app.add_handler(CommandHandler("status", self._forward_command))
+        self._app.add_handler(CommandHandler("dream", self._forward_command))
+        self._app.add_handler(CommandHandler("dream_log", self._forward_command))
+        self._app.add_handler(CommandHandler("dream_restore", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
 
         # Add message handler for text, photos, voice, documents
@@ -760,13 +766,28 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         self._remember_thread_context(message)
+        content = self._normalize_forwarded_command(message.text or "")
         await self._handle_message(
             sender_id=self._sender_id(user),
             chat_id=str(message.chat_id),
-            content=message.text or "",
+            content=content,
             metadata=self._build_message_metadata(message, user),
             session_key=self._derive_topic_session_key(message),
         )
+
+    @staticmethod
+    def _normalize_forwarded_command(text: str) -> str:
+        """Strip Telegram bot suffixes and normalize safe aliases to runtime command names."""
+        if not text.startswith("/"):
+            return text
+        head, sep, tail = text.partition(" ")
+        command = head.split("@", 1)[0]
+        alias_map = {
+            "/dream_log": "/dream-log",
+            "/dream_restore": "/dream-restore",
+        }
+        command = alias_map.get(command, command)
+        return f"{command}{sep}{tail}".strip()
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
@@ -912,7 +933,7 @@ class TelegramChannel(BaseChannel):
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
         from telegram.error import NetworkError, TimedOut
-        
+
         if isinstance(context.error, (NetworkError, TimedOut)):
             logger.warning("Telegram network issue: {}", str(context.error))
         else:
