@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import time
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
@@ -31,7 +32,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import EMPTY_MODEL_RESPONSE_ERROR, LLMProvider
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.helpers import image_placeholder_text, truncate_text
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
@@ -71,11 +72,9 @@ class _LoopHook(AgentHook):
         return self._on_stream is not None
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
-        from nanobot.utils.helpers import strip_think
-
-        prev_clean = strip_think(self._stream_buf)
+        prev_clean = self._loop._sanitize_visible_output(self._stream_buf, streaming=True) or ""
         self._stream_buf += delta
-        new_clean = strip_think(self._stream_buf)
+        new_clean = self._loop._sanitize_visible_output(self._stream_buf, streaming=True) or ""
         incremental = new_clean[len(prev_clean):]
         if incremental and self._on_stream:
             await self._on_stream(incremental)
@@ -88,7 +87,7 @@ class _LoopHook(AgentHook):
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         if self._on_progress:
             if not self._on_stream:
-                thought = self._loop._strip_think(
+                thought = self._loop._sanitize_visible_output(
                     context.response.content if context.response else None
                 )
                 if thought:
@@ -110,7 +109,7 @@ class _LoopHook(AgentHook):
         )
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
-        return self._loop._strip_think(content)
+        return self._loop._sanitize_visible_output(content)
 
 class AgentLoop:
     """
@@ -125,6 +124,23 @@ class AgentLoop:
     """
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
+    _LEGACY_RUNTIME_CONTEXT_PREFIX = "Current Time:"
+    _RUNTIME_CONTEXT_ECHO_RE = re.compile(
+        rf"^{re.escape(ContextBuilder._RUNTIME_CONTEXT_TAG)}\n"
+        r"(?:(?:Rules:\n(?:- [^\n]*\n)+\n))?"
+        r"Current Time: [^\n]*\n"
+        r"(?:Channel: [^\n]*\n)?"
+        r"(?:Chat ID: `?[^\n]*`?\n)?"
+        r"(?:Runtime Metadata:\n(?:[^\n]*\n)*)?"
+        r"\n*"
+    )
+    _LEGACY_RUNTIME_CONTEXT_ECHO_RE = re.compile(
+        r"^Current Time: [^\n]*\n"
+        r"(?:Channel: [^\n]*\n)?"
+        r"(?:Chat ID: `?[^\n]*`?\n)?"
+        r"(?:Runtime Metadata:\n(?:[^\n]*\n)*)?"
+        r"\n*"
+    )
 
     def __init__(
         self,
@@ -275,12 +291,232 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    if name == "message":
+                        tool.set_context(channel, chat_id, message_id)
+                    else:
+                        try:
+                            tool.set_context(channel, chat_id, metadata)
+                        except TypeError:
+                            tool.set_context(channel, chat_id)
+
+    def _context_build_kwargs(
+        self,
+        metadata: dict[str, Any],
+        *,
+        session: Session | None = None,
+    ) -> dict[str, Any]:
+        runtime_metadata = metadata.get("runtime_metadata")
+        if not isinstance(runtime_metadata, dict):
+            runtime_metadata = metadata.get("workspace_runtime")
+        merged_runtime: dict[str, Any] | None = dict(runtime_metadata) if isinstance(runtime_metadata, dict) else None
+        work_mode = str(metadata.get("workspace_work_mode") or "").strip()
+        if not work_mode:
+            try:
+                from nanobot.agent.policy.dev_discipline import load_runtime_protocol
+
+                protocol = load_runtime_protocol(self.workspace)
+                work_mode = str((protocol or {}).get("work_mode") or "").strip()
+            except Exception:
+                work_mode = ""
+        if work_mode:
+            if merged_runtime is None:
+                merged_runtime = {}
+            merged_runtime.setdefault("work_mode", work_mode)
+        compact_state = str(metadata.get("compact_state") or "").strip()
+        if not compact_state and session is not None:
+            compact_state = str(session.metadata.get("compact_state") or "").strip()
+        return {
+            "workspace_work_mode": work_mode or None,
+            "compact_state": compact_state or None,
+            "runtime_metadata": merged_runtime,
+        }
+
+    @staticmethod
+    def _workspace_progress_text(metadata: dict[str, Any]) -> str:
+        command = str(metadata.get("workspace_agent_cmd") or "").strip()
+        return {
+            "小结": "正在生成小结…",
+            "plan": "正在进入规划讨论…",
+            "笔记": "正在整理笔记草稿…",
+            "诊断": "正在诊断问题…",
+        }.get(command, "")
+
+    @staticmethod
+    def _read_complete_line(text: str, start: int) -> tuple[str | None, int]:
+        end = text.find("\n", start)
+        if end == -1:
+            return None, start
+        return text[start : end + 1], end + 1
+
+    @classmethod
+    def _consume_exact_line(
+        cls,
+        text: str,
+        start: int,
+        expected: str,
+    ) -> tuple[bool, bool, int]:
+        line, next_idx = cls._read_complete_line(text, start)
+        if line is None:
+            fragment = text[start:]
+            if not fragment or expected.startswith(fragment):
+                return False, True, start
+            return False, False, start
+        if line == expected:
+            return True, False, next_idx
+        return False, False, start
+
+    @classmethod
+    def _consume_prefixed_line(
+        cls,
+        text: str,
+        start: int,
+        prefix: str,
+    ) -> tuple[bool, bool, int]:
+        line, next_idx = cls._read_complete_line(text, start)
+        if line is None:
+            fragment = text[start:]
+            if not fragment or prefix.startswith(fragment) or fragment.startswith(prefix):
+                return False, True, start
+            return False, False, start
+        if line.startswith(prefix):
+            return True, False, next_idx
+        return False, False, start
+
+    @classmethod
+    def _consume_optional_prefixed_line(
+        cls,
+        text: str,
+        start: int,
+        prefix: str,
+    ) -> tuple[bool, bool, int]:
+        consumed, pending, next_idx = cls._consume_prefixed_line(text, start, prefix)
+        if consumed or pending:
+            return consumed, pending, next_idx
+        return False, False, start
+
+    @classmethod
+    def _maybe_consume_runtime_context_prefix(
+        cls,
+        text: str,
+    ) -> tuple[str | None, bool] | None:
+        cleaned = text.lstrip()
+        tag = ContextBuilder._RUNTIME_CONTEXT_TAG
+
+        def _consume_after_current_time(start: int) -> tuple[str | None, bool] | None:
+            idx = start
+            consumed_runtime_metadata = False
+
+            consumed, pending, next_idx = cls._consume_optional_prefixed_line(
+                cleaned, idx, "Channel: "
+            )
+            if pending:
+                return None, True
+            if consumed:
+                idx = next_idx
+
+            consumed, pending, next_idx = cls._consume_optional_prefixed_line(
+                cleaned, idx, "Chat ID: "
+            )
+            if pending:
+                return None, True
+            if consumed:
+                idx = next_idx
+
+            consumed, pending, next_idx = cls._consume_optional_prefixed_line(
+                cleaned, idx, "Runtime Metadata:\n"
+            )
+            if pending:
+                return None, True
+            if consumed:
+                consumed_runtime_metadata = True
+                idx = next_idx
+                while True:
+                    line, next_idx = cls._read_complete_line(cleaned, idx)
+                    if line is None:
+                        fragment = cleaned[idx:]
+                        if not fragment or not fragment.startswith("\n"):
+                            return None, True
+                        return None
+                    if line == "\n":
+                        idx = next_idx
+                        break
+                    if line.startswith(" ") or (":" in line and not line.startswith("- ")):
+                        idx = next_idx
+                        continue
+                    return None
+
+            if consumed_runtime_metadata:
+                return cleaned[idx:], False
+
+            if idx >= len(cleaned):
+                return None, True
+            if cleaned[idx] != "\n":
+                return None
+            while idx < len(cleaned) and cleaned[idx] == "\n":
+                idx += 1
+            return cleaned[idx:], False
+
+        if tag.startswith(cleaned) and not cleaned.startswith(tag):
+            return None, True
+        if cleaned.startswith(tag):
+            idx = len(tag)
+            if idx == len(cleaned):
+                return None, True
+            if cleaned[idx] != "\n":
+                return None
+            idx += 1
+
+            consumed, pending, next_idx = cls._consume_exact_line(cleaned, idx, "Rules:\n")
+            if pending:
+                return None, True
+            if consumed:
+                idx = next_idx
+                saw_bullet = False
+                while True:
+                    line, next_idx = cls._read_complete_line(cleaned, idx)
+                    if line is None:
+                        fragment = cleaned[idx:]
+                        if not fragment or fragment.startswith("-") or "- ".startswith(fragment):
+                            return None, True
+                        return None
+                    if line == "\n":
+                        if not saw_bullet:
+                            return None
+                        idx = next_idx
+                        break
+                    if not line.startswith("- "):
+                        return None
+                    saw_bullet = True
+                    idx = next_idx
+
+            consumed, pending, next_idx = cls._consume_prefixed_line(cleaned, idx, "Current Time: ")
+            if pending:
+                return None, True
+            if not consumed:
+                return None
+            return _consume_after_current_time(next_idx)
+
+        if cls._LEGACY_RUNTIME_CONTEXT_PREFIX.startswith(cleaned) and not cleaned.startswith(
+            cls._LEGACY_RUNTIME_CONTEXT_PREFIX
+        ):
+            return None, True
+        consumed, pending, next_idx = cls._consume_prefixed_line(cleaned, 0, "Current Time: ")
+        if pending:
+            return None, True
+        if consumed:
+            return _consume_after_current_time(next_idx)
+        return None
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -289,6 +525,24 @@ class AgentLoop:
             return None
         from nanobot.utils.helpers import strip_think
         return strip_think(text) or None
+
+    @classmethod
+    def _sanitize_visible_output(cls, text: str | None, *, streaming: bool = False) -> str | None:
+        """Remove internal-only visible noise like think blocks and runtime metadata echoes."""
+        cleaned = cls._strip_think(text)
+        if not cleaned:
+            return None
+        parsed = cls._maybe_consume_runtime_context_prefix(cleaned)
+        if parsed is not None:
+            remainder, pending = parsed
+            if pending:
+                return None if streaming else cleaned
+            return remainder or None
+        for pattern in (cls._RUNTIME_CONTEXT_ECHO_RE, cls._LEGACY_RUNTIME_CONTEXT_ECHO_RE):
+            updated = pattern.sub("", cleaned.lstrip(), count=1)
+            if updated != cleaned.lstrip():
+                return updated.lstrip() or None
+        return cleaned or None
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
@@ -497,13 +751,18 @@ class AgentLoop:
             if self._restore_runtime_checkpoint(session):
                 self.sessions.save(session)
             await self.consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            tool_metadata = dict(msg.metadata or {})
+            context_kwargs = self._context_build_kwargs(tool_metadata, session=session)
+            if isinstance(context_kwargs.get("runtime_metadata"), dict):
+                tool_metadata.setdefault("workspace_runtime", context_kwargs["runtime_metadata"])
+            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), metadata=tool_metadata)
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
+                **context_kwargs,
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
@@ -532,7 +791,29 @@ class AgentLoop:
 
         await self.consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        progress_text = self._workspace_progress_text(msg.metadata or {})
+        if progress_text:
+            progress_meta = dict(msg.metadata or {})
+            progress_meta["_progress"] = True
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=progress_text,
+                    metadata=progress_meta,
+                )
+            )
+
+        tool_metadata = dict(msg.metadata or {})
+        context_kwargs = self._context_build_kwargs(tool_metadata, session=session)
+        if isinstance(context_kwargs.get("runtime_metadata"), dict):
+            tool_metadata.setdefault("workspace_runtime", context_kwargs["runtime_metadata"])
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.metadata.get("message_id"),
+            metadata=tool_metadata,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -543,6 +824,7 @@ class AgentLoop:
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            **context_kwargs,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -564,7 +846,11 @@ class AgentLoop:
         )
 
         if final_content is None or not final_content.strip():
-            final_content = EMPTY_FINAL_RESPONSE_MESSAGE
+            final_content = AgentRunner._user_facing_error_message(
+                EMPTY_MODEL_RESPONSE_ERROR,
+                retry_count=0,
+                fallback=EMPTY_FINAL_RESPONSE_MESSAGE,
+            )
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self._clear_runtime_checkpoint(session)
@@ -737,13 +1023,20 @@ class AgentLoop:
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        metadata: dict[str, Any] | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata or {},
+        )
         return await self._process_message(
             msg, session_key=session_key, on_progress=on_progress,
             on_stream=on_stream, on_stream_end=on_stream_end,

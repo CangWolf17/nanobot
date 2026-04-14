@@ -9,6 +9,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.policy.dev_discipline import format_dev_discipline_block
 from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
@@ -71,17 +72,24 @@ class SubagentManager:
         self,
         task: str,
         label: str | None = None,
+        tier: str | None = None,
+        model: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        origin_metadata: dict[str, Any] | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
-        origin = {"channel": origin_channel, "chat_id": origin_chat_id}
+        origin = {
+            "channel": origin_channel,
+            "chat_id": origin_chat_id,
+            "metadata": dict(origin_metadata or {}),
+        }
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin, model=model)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -104,7 +112,8 @@ class SubagentManager:
         task_id: str,
         task: str,
         label: str,
-        origin: dict[str, str],
+        origin: dict[str, Any],
+        model: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -131,16 +140,16 @@ class SubagentManager:
             if self.web_config.enable:
                 tools.register(WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy))
                 tools.register(WebFetchTool(proxy=self.web_config.proxy))
-            system_prompt = self._build_subagent_prompt()
+            system_prompt = self._build_subagent_prompt(origin=origin)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
+                {"role": "user", "content": self._build_subagent_task_payload(task=task, origin=origin)},
             ]
 
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
-                model=self.model,
+                model=model or self.model,
                 max_iterations=15,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=_SubagentHook(task_id),
@@ -184,7 +193,7 @@ class SubagentManager:
         label: str,
         task: str,
         result: str,
-        origin: dict[str, str],
+        origin: dict[str, Any],
         status: str,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
@@ -204,6 +213,7 @@ class SubagentManager:
             sender_id="subagent",
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
+            metadata=dict(origin.get("metadata") or {}),
         )
 
         await self.bus.publish_inbound(msg)
@@ -230,19 +240,44 @@ class SubagentManager:
             lines.append(f"- {result.error}")
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
 
-    def _build_subagent_prompt(self) -> str:
+    def _build_subagent_prompt(self, *, origin: dict[str, Any] | None = None) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder
         from nanobot.agent.skills import SkillsLoader
 
-        time_ctx = ContextBuilder._build_runtime_context(None, None)
+        runtime_meta = self._runtime_metadata_from_origin(origin)
+        time_ctx = ContextBuilder._build_runtime_context(None, None, runtime_metadata=runtime_meta)
+        parts = [
+            render_template(
+                "agent/subagent_system.md",
+                time_ctx=time_ctx,
+                workspace=str(self.workspace),
+                skills_summary="",
+            )
+        ]
         skills_summary = SkillsLoader(self.workspace).build_skills_summary()
-        return render_template(
-            "agent/subagent_system.md",
-            time_ctx=time_ctx,
-            workspace=str(self.workspace),
-            skills_summary=skills_summary or "",
-        )
+        if skills_summary:
+            parts.append(skills_summary)
+        dev_block = format_dev_discipline_block(self.workspace)
+        if dev_block:
+            parts.append(dev_block)
+        return "\n\n".join(part for part in parts if part)
+
+    def _build_subagent_task_payload(self, *, task: str, origin: dict[str, Any] | None = None) -> str:
+        runtime_meta = self._runtime_metadata_from_origin(origin)
+        if not runtime_meta:
+            return task
+        return f"Runtime Metadata:\n{json.dumps(runtime_meta, ensure_ascii=False, indent=2)}\n\nAssigned Task:\n{task}"
+
+    @staticmethod
+    def _runtime_metadata_from_origin(origin: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(origin, dict):
+            return {}
+        metadata = origin.get("metadata")
+        if not isinstance(metadata, dict):
+            return {}
+        runtime = metadata.get("workspace_runtime")
+        return dict(runtime) if isinstance(runtime, dict) else {}
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""

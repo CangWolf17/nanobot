@@ -14,6 +14,8 @@ from loguru import logger
 
 from nanobot.utils.helpers import image_placeholder_text
 
+EMPTY_MODEL_RESPONSE_ERROR = "empty model response"
+
 
 @dataclass
 class ToolCallRequest:
@@ -278,6 +280,34 @@ class LLMProvider(ABC):
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
+
+    @staticmethod
+    def _classify_response_error(response: LLMResponse) -> str | None:
+        if response.finish_reason == "error":
+            return response.content or "Error calling LLM"
+        if response.has_tool_calls:
+            return None
+        if isinstance(response.content, str) and response.content.strip():
+            return None
+        return EMPTY_MODEL_RESPONSE_ERROR
+
+    @staticmethod
+    def _as_error_response(response: LLMResponse, error: str) -> LLMResponse:
+        return LLMResponse(
+            content=error,
+            tool_calls=list(response.tool_calls),
+            finish_reason="error",
+            usage=dict(response.usage),
+            retry_after=response.retry_after,
+            reasoning_content=response.reasoning_content,
+            thinking_blocks=response.thinking_blocks,
+            error_status_code=response.error_status_code,
+            error_kind=response.error_kind,
+            error_type=response.error_type,
+            error_code=response.error_code,
+            error_retry_after_s=response.error_retry_after_s,
+            error_should_retry=response.error_should_retry,
+        )
 
     @classmethod
     def _is_transient_response(cls, response: LLMResponse) -> bool:
@@ -644,17 +674,19 @@ class LLMProvider(ABC):
         while True:
             attempt += 1
             response = await call(**kw)
-            if response.finish_reason != "error":
+            error = self._classify_response_error(response)
+            if error is None:
                 return response
+            response = self._as_error_response(response, error)
             last_response = response
-            error_key = ((response.content or "").strip().lower() or None)
+            error_key = (error.strip().lower() or None)
             if error_key and error_key == last_error_key:
                 identical_error_count += 1
             else:
                 last_error_key = error_key
                 identical_error_count = 1 if error_key else 0
 
-            if not self._is_transient_response(response):
+            if error != EMPTY_MODEL_RESPONSE_ERROR and not self._is_transient_response(response):
                 stripped = self._strip_image_content(original_messages)
                 if stripped is not None and stripped != kw["messages"]:
                     logger.warning(
@@ -669,7 +701,7 @@ class LLMProvider(ABC):
                 logger.warning(
                     "Stopping persistent retry after {} identical transient errors: {}",
                     identical_error_count,
-                    (response.content or "")[:120].lower(),
+                    error[:120].lower(),
                 )
                 return response
 
@@ -686,7 +718,7 @@ class LLMProvider(ABC):
                 attempt,
                 "+" if persistent and attempt > len(delays) else f"/{len(delays)}",
                 int(round(delay)),
-                (response.content or "")[:120].lower(),
+                error[:120].lower(),
             )
             await self._sleep_with_heartbeat(
                 delay,

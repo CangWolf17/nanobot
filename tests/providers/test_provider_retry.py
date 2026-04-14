@@ -46,6 +46,50 @@ async def test_chat_with_retry_retries_transient_error_then_succeeds(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_chat_with_retry_retries_empty_success_then_succeeds(monkeypatch) -> None:
+    provider = ScriptedProvider([
+        LLMResponse(content=None),
+        LLMResponse(content="ok"),
+    ])
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.finish_reason == "stop"
+    assert response.content == "ok"
+    assert provider.calls == 2
+    assert delays == [1]
+
+
+@pytest.mark.asyncio
+async def test_chat_with_retry_returns_empty_model_response_after_retries(monkeypatch) -> None:
+    provider = ScriptedProvider([
+        LLMResponse(content=None),
+        LLMResponse(content=""),
+        LLMResponse(content="   "),
+        LLMResponse(content=None),
+    ])
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.finish_reason == "error"
+    assert response.content == "empty model response"
+    assert provider.calls == 4
+    assert delays == [1, 2, 4]
+
+
+@pytest.mark.asyncio
 async def test_chat_with_retry_does_not_retry_non_transient_error(monkeypatch) -> None:
     provider = ScriptedProvider([
         LLMResponse(content="401 unauthorized", finish_reason="error"),

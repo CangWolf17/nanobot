@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ from loguru import logger
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.providers.base import LLMProvider, ToolCallRequest
+from nanobot.providers.base import EMPTY_MODEL_RESPONSE_ERROR, LLMProvider, ToolCallRequest
 from nanobot.utils.helpers import (
     build_assistant_message,
     estimate_message_tokens,
@@ -22,8 +23,6 @@ from nanobot.utils.helpers import (
     truncate_text,
 )
 from nanobot.utils.runtime import (
-    EMPTY_FINAL_RESPONSE_MESSAGE,
-    build_finalization_retry_message,
     build_length_recovery_message,
     ensure_nonempty_tool_result,
     is_blank_text,
@@ -31,11 +30,12 @@ from nanobot.utils.runtime import (
 )
 
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
-_MAX_EMPTY_RETRIES = 2
+_MAX_TOOLCHAIN_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _SNIP_SAFETY_BUFFER = 1024
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
+_RETRY_ATTEMPT_RE = re.compile(r"attempt\s+(\d+)", re.IGNORECASE)
 _COMPACTABLE_TOOLS = frozenset({
     "read_file", "exec", "grep", "glob",
     "web_search", "web_fetch", "list_dir",
@@ -86,6 +86,51 @@ class AgentRunner:
     def __init__(self, provider: LLMProvider):
         self.provider = provider
 
+    @staticmethod
+    def _user_facing_error_message(
+        raw_error: str | None,
+        *,
+        retry_count: int,
+        fallback: str,
+    ) -> str:
+        text = (raw_error or "").lower()
+        is_timeout = "timeout" in text or "timed out" in text
+        is_transient = bool(text) and LLMProvider._is_transient_error(raw_error)
+
+        if retry_count > 0 and is_timeout:
+            return f"模型响应超时，已自动重试 {retry_count} 次仍失败。请稍后重试，或切换模型。"
+        if raw_error == EMPTY_MODEL_RESPONSE_ERROR:
+            if retry_count > 0:
+                return (
+                    f"模型返回了空响应，已自动重试 {retry_count} 次仍失败。请稍后重试，或切换模型。"
+                )
+            return "模型返回了空响应。请稍后重试，或切换模型。"
+        if retry_count > 0 and is_transient:
+            return f"模型服务临时异常，已自动重试 {retry_count} 次仍失败。请稍后重试。"
+        if is_timeout:
+            return "模型响应超时。请稍后重试，或切换模型。"
+        return fallback
+
+    @staticmethod
+    def _has_tool_history(messages: list[dict[str, Any]]) -> bool:
+        return any(
+            message.get("role") == "tool"
+            or (
+                message.get("role") == "assistant"
+                and bool(message.get("tool_calls"))
+            )
+            for message in messages
+        )
+
+    @staticmethod
+    def _retry_attempt_from_progress(message: str | None) -> int | None:
+        if not message:
+            return None
+        match = _RETRY_ATTEMPT_RE.search(message)
+        if match is None:
+            return None
+        return int(match.group(1))
+
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
@@ -96,7 +141,7 @@ class AgentRunner:
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
-        empty_content_retries = 0
+        toolchain_empty_retries = 0
         length_recovery_count = 0
 
         for iteration in range(spec.max_iterations):
@@ -115,7 +160,7 @@ class AgentRunner:
                 messages_for_model = messages
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
-            response = await self._request_model(spec, messages_for_model, hook, context)
+            response, retry_count = await self._request_model(spec, messages_for_model, hook, context)
             raw_usage = self._usage_dict(response.usage)
             context.response = response
             context.usage = dict(raw_usage)
@@ -192,42 +237,34 @@ class AgentRunner:
                         "pending_tool_calls": [],
                     },
                 )
-                empty_content_retries = 0
+                toolchain_empty_retries = 0
                 length_recovery_count = 0
                 await hook.after_iteration(context)
                 continue
 
             clean = hook.finalize_content(context, response.content)
             if response.finish_reason != "error" and is_blank_text(clean):
-                empty_content_retries += 1
-                if empty_content_retries < _MAX_EMPTY_RETRIES:
+                can_retry_blank = self._has_tool_history(messages) or not is_blank_text(response.content)
+                if can_retry_blank and toolchain_empty_retries < _MAX_TOOLCHAIN_EMPTY_RETRIES:
+                    toolchain_empty_retries += 1
                     logger.warning(
-                        "Empty response on turn {} for {} ({}/{}); retrying",
+                        "Empty sanitized response on turn {} for {} ({}/{}); retrying",
                         iteration,
                         spec.session_key or "default",
-                        empty_content_retries,
-                        _MAX_EMPTY_RETRIES,
+                        toolchain_empty_retries,
+                        _MAX_TOOLCHAIN_EMPTY_RETRIES,
                     )
                     if hook.wants_streaming():
                         await hook.on_stream_end(context, resuming=False)
                     await hook.after_iteration(context)
                     continue
-                logger.warning(
-                    "Empty response on turn {} for {} after {} retries; attempting finalization",
-                    iteration,
-                    spec.session_key or "default",
-                    empty_content_retries,
+                response = replace(
+                    response,
+                    content=EMPTY_MODEL_RESPONSE_ERROR,
+                    finish_reason="error",
                 )
-                if hook.wants_streaming():
-                    await hook.on_stream_end(context, resuming=False)
-                response = await self._request_finalization_retry(spec, messages_for_model)
-                retry_usage = self._usage_dict(response.usage)
-                self._accumulate_usage(usage, retry_usage)
-                raw_usage = self._merge_usage(raw_usage, retry_usage)
                 context.response = response
-                context.usage = dict(raw_usage)
-                context.tool_calls = list(response.tool_calls)
-                clean = hook.finalize_content(context, response.content)
+                clean = EMPTY_MODEL_RESPONSE_ERROR
 
             if response.finish_reason == "length" and not is_blank_text(clean):
                 length_recovery_count += 1
@@ -254,19 +291,18 @@ class AgentRunner:
                 await hook.on_stream_end(context, resuming=False)
 
             if response.finish_reason == "error":
-                final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
+                fallback = (
+                    spec.error_message
+                    if spec.error_message is not None
+                    else clean or _DEFAULT_ERROR_MESSAGE
+                )
+                final_content = self._user_facing_error_message(
+                    clean,
+                    retry_count=retry_count,
+                    fallback=fallback,
+                )
                 stop_reason = "error"
-                error = final_content
-                self._append_final_message(messages, final_content)
-                context.final_content = final_content
-                context.error = error
-                context.stop_reason = stop_reason
-                await hook.after_iteration(context)
-                break
-            if is_blank_text(clean):
-                final_content = EMPTY_FINAL_RESPONSE_MESSAGE
-                stop_reason = "empty_final_response"
-                error = final_content
+                error = clean or fallback
                 self._append_final_message(messages, final_content)
                 context.final_content = final_content
                 context.error = error
@@ -325,13 +361,14 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None,
+        on_retry_wait: Any | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "messages": messages,
             "tools": tools,
             "model": spec.model,
             "retry_mode": spec.provider_retry_mode,
-            "on_retry_wait": spec.progress_callback,
+            "on_retry_wait": on_retry_wait,
         }
         if spec.temperature is not None:
             kwargs["temperature"] = spec.temperature
@@ -347,11 +384,22 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         hook: AgentHook,
         context: AgentHookContext,
-    ):
+    ) -> tuple[Any, int]:
+        retry_count = 0
+
+        async def _progress(message: str) -> None:
+            nonlocal retry_count
+            attempt = self._retry_attempt_from_progress(message)
+            if attempt is not None:
+                retry_count = max(retry_count, attempt)
+            if spec.progress_callback is not None:
+                await spec.progress_callback(message)
+
         kwargs = self._build_request_kwargs(
             spec,
             messages,
             tools=spec.tools.get_definitions(),
+            on_retry_wait=_progress,
         )
         if hook.wants_streaming():
             async def _stream(delta: str) -> None:
@@ -360,18 +408,8 @@ class AgentRunner:
             return await self.provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream,
-            )
-        return await self.provider.chat_with_retry(**kwargs)
-
-    async def _request_finalization_retry(
-        self,
-        spec: AgentRunSpec,
-        messages: list[dict[str, Any]],
-    ):
-        retry_messages = list(messages)
-        retry_messages.append(build_finalization_retry_message())
-        kwargs = self._build_request_kwargs(spec, retry_messages, tools=None)
-        return await self.provider.chat_with_retry(**kwargs)
+            ), retry_count
+        return await self.provider.chat_with_retry(**kwargs), retry_count
 
     @staticmethod
     def _usage_dict(usage: dict[str, Any] | None) -> dict[str, int]:
@@ -720,4 +758,3 @@ class AgentRunner:
         if current:
             batches.append(current)
         return batches
-

@@ -403,11 +403,13 @@ class Consolidator:
         """Estimate current prompt size for the normal session history view."""
         history = session.get_history(max_messages=0)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        compact_state = str(session.metadata.get("compact_state") or "").strip() or None
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
             channel=channel,
             chat_id=chat_id,
+            compact_state=compact_state,
         )
         return estimate_prompt_tokens_chain(
             self.provider,

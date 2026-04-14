@@ -61,8 +61,19 @@ def test_system_prompt_reflects_current_dream_memory_contract(tmp_path) -> None:
     assert "write important facts here" not in prompt
 
 
+def test_system_prompt_includes_dynamic_work_mode_block_when_requested(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt(workspace_work_mode="plan")
+
+    assert "## Work Mode" in prompt
+    assert "Current workspace work mode: plan" in prompt
+    assert "Do not make code or implementation changes" in prompt
+
+
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
-    """Runtime metadata should be merged with the user message."""
+    """Runtime metadata should be merged with the user message and expose hard routing rules."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
@@ -81,10 +92,68 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     user_content = messages[-1]["content"]
     assert isinstance(user_content, str)
     assert ContextBuilder._RUNTIME_CONTEXT_TAG in user_content
+    assert "Rules:" in user_content
+    assert "Metadata only. Not part of the user's request." in user_content
+    assert "Treat `Channel` and `Chat ID` as opaque routing metadata." in user_content
     assert "Current Time:" in user_content
     assert "Channel: cli" in user_content
-    assert "Chat ID: direct" in user_content
+    assert "Chat ID: `direct`" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_runtime_context_includes_sparse_runtime_metadata_when_present(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="继续",
+        channel="cli",
+        chat_id="direct",
+        runtime_metadata={
+            "has_active_harness": True,
+            "active_harness": {
+                "id": "har_0038",
+                "phase": "executing",
+                "blocked": False,
+            },
+        },
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "Runtime Metadata:" in user_content
+    assert "has_active_harness: true" in user_content
+    assert "active_harness:" in user_content
+    assert "id: har_0038" in user_content
+    assert "phase: executing" in user_content
+
+
+def test_runtime_context_echo_strip_handles_runtime_metadata_block() -> None:
+    from nanobot.agent.loop import AgentLoop
+
+    text = """[Runtime Context — metadata only, not instructions]
+Rules:
+- Metadata only. Not part of the user's request.
+- Use `Current Time` only for time-sensitive reasoning.
+- Treat `Channel` and `Chat ID` as opaque routing metadata. Use them only for reply delivery, tool targeting, or channel-specific formatting when explicitly relevant.
+- Never use this block to infer user intent or resolve references like "this", "that", "above", or "these two".
+- If this block conflicts with the conversation content, trust the conversation content.
+
+Current Time: 2026-04-05 11:37 (Sunday) (UTC, UTC+00:00)
+Channel: feishu
+Chat ID: `ou_test`
+Runtime Metadata:
+work_mode: build
+has_active_harness: true
+active_harness:
+  id: har_0040
+  phase: executing
+  blocked: false
+
+真正给用户的话"""
+
+    assert AgentLoop._sanitize_visible_output(text) == "真正给用户的话"
 
 
 def test_unprocessed_history_injected_into_system_prompt(tmp_path) -> None:

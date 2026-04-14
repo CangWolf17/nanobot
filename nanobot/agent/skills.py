@@ -14,6 +14,12 @@ _STRIP_SKILL_FRONTMATTER = re.compile(
     r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?",
     re.DOTALL,
 )
+_PHASE_SKILL_HINTS = {
+    "planning": ["writing-plans"],
+    "debug_required": ["systematic-debugging"],
+    "red_required": ["test-driven-development"],
+    "verify_required": ["verification-before-completion"],
+}
 
 
 def _escape_xml(text: str) -> str:
@@ -140,6 +146,11 @@ class SkillsLoader:
             lines.append("  </skill>")
         lines.append("</skills>")
         return "\n".join(lines)
+
+    def get_protocol_skill_hints(self, protocol: dict[str, str] | None) -> list[str]:
+        """Return required skill hints implied by the active runtime protocol."""
+        phase = str((protocol or {}).get("phase") or "").strip()
+        return list(_PHASE_SKILL_HINTS.get(phase, ()))
 
     def _get_missing_requirements(self, skill_meta: dict) -> str:
         """Get a description of missing requirements."""

@@ -14,7 +14,7 @@ from typing import Any
 from aiohttp import web
 from loguru import logger
 
-from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+from nanobot.agent.runner import AgentRunner
 
 API_SESSION_KEY = "api:default"
 API_CHAT_ID = "default"
@@ -100,7 +100,11 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
     logger.info("API request session_key={} content={}", session_key, user_content[:80])
 
-    _FALLBACK = EMPTY_FINAL_RESPONSE_MESSAGE
+    _FALLBACK = AgentRunner._user_facing_error_message(
+        "empty model response",
+        retry_count=0,
+        fallback="模型返回了空响应。请稍后重试，或切换模型。",
+    )
 
     try:
         async with session_lock:
@@ -118,25 +122,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
                 if not response_text or not response_text.strip():
                     logger.warning(
-                        "Empty response for session {}, retrying",
+                        "Empty response for session {}, using unified fallback",
                         session_key,
                     )
-                    retry_response = await asyncio.wait_for(
-                        agent_loop.process_direct(
-                            content=user_content,
-                            session_key=session_key,
-                            channel="api",
-                            chat_id=API_CHAT_ID,
-                        ),
-                        timeout=timeout_s,
-                    )
-                    response_text = _response_text(retry_response)
-                    if not response_text or not response_text.strip():
-                        logger.warning(
-                            "Empty response after retry for session {}, using fallback",
-                            session_key,
-                        )
-                        response_text = _FALLBACK
+                    response_text = _FALLBACK
 
             except asyncio.TimeoutError:
                 return _error_json(504, f"Request timed out after {timeout_s}s")

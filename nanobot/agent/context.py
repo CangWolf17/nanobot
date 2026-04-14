@@ -9,6 +9,10 @@ from typing import Any
 from nanobot.utils.helpers import current_time_str
 
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.policy.dev_discipline import (
+    format_runtime_protocol_block,
+    load_runtime_protocol,
+)
 from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, detect_image_mime
@@ -31,9 +35,15 @@ class ContextBuilder:
         self,
         skill_names: list[str] | None = None,
         channel: str | None = None,
+        workspace_work_mode: str | None = None,
+        compact_state: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity(channel=channel)]
+        runtime_protocol = load_runtime_protocol(self.workspace)
+        effective_work_mode = workspace_work_mode or (
+            str((runtime_protocol or {}).get("work_mode") or "").strip() or None
+        )
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
@@ -42,6 +52,9 @@ class ContextBuilder:
         memory = self.memory.get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
+
+        if compact_state and compact_state.strip():
+            parts.append(f"# Session Compact State\n\n{compact_state.strip()}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -53,12 +66,23 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
+        runtime_block = format_runtime_protocol_block(
+            runtime_protocol,
+            skill_hints=self.skills.get_protocol_skill_hints(runtime_protocol),
+        )
+        if runtime_block:
+            parts.append(runtime_block)
+
         entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
         if entries:
             capped = entries[-self._MAX_RECENT_HISTORY:]
             parts.append("# Recent History\n\n" + "\n".join(
                 f"- [{e['timestamp']}] {e['content']}" for e in capped
             ))
+
+        work_mode = self._build_work_mode_block(effective_work_mode)
+        if work_mode:
+            parts.append(work_mode)
 
         return "\n\n---\n\n".join(parts)
 
@@ -77,13 +101,110 @@ class ContextBuilder:
         )
 
     @staticmethod
+    def _build_work_mode_block(workspace_work_mode: str | None) -> str:
+        """Build a dynamic system block describing current workspace work mode."""
+        if workspace_work_mode not in {"plan", "build"}:
+            return ""
+
+        lines = [
+            "## Work Mode",
+            f"Current workspace work mode: {workspace_work_mode}",
+        ]
+        if workspace_work_mode == "plan":
+            lines.extend(
+                [
+                    "- Treat this turn as planning mode.",
+                    "- You may discuss, analyze, and update planning/documentation artifacts.",
+                    "- Do not make code or implementation changes in this mode.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "- Treat this turn as build mode.",
+                    "- Implementation and file changes are allowed when otherwise appropriate.",
+                    "- Keep execution aligned with the current plan/task context.",
+                ]
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_runtime_metadata_scalar(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+
+    @classmethod
+    def _is_meaningful_runtime_metadata_value(cls, value: Any) -> bool:
+        if isinstance(value, bool):
+            return True
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, dict):
+            return any(cls._is_meaningful_runtime_metadata_value(item) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(cls._is_meaningful_runtime_metadata_value(item) for item in value)
+        return True
+
+    @classmethod
+    def _render_runtime_metadata_lines(cls, payload: dict[str, Any], indent: int = 0) -> list[str]:
+        lines: list[str] = []
+        prefix = " " * indent
+        for key, value in payload.items():
+            if not cls._is_meaningful_runtime_metadata_value(value):
+                continue
+            if isinstance(value, dict):
+                nested = cls._render_runtime_metadata_lines(value, indent + 2)
+                if not nested:
+                    continue
+                lines.append(f"{prefix}{key}:")
+                lines.extend(nested)
+                continue
+            if isinstance(value, (list, tuple, set)):
+                cleaned = [item for item in value if cls._is_meaningful_runtime_metadata_value(item)]
+                if not cleaned:
+                    continue
+                lines.append(f"{prefix}{key}:")
+                for item in cleaned:
+                    if isinstance(item, dict):
+                        nested = cls._render_runtime_metadata_lines(item, indent + 4)
+                        if not nested:
+                            continue
+                        lines.append(f"{prefix}  -")
+                        lines.extend(nested)
+                    else:
+                        lines.append(f"{prefix}  - {cls._format_runtime_metadata_scalar(item)}")
+                continue
+            lines.append(f"{prefix}{key}: {cls._format_runtime_metadata_scalar(value)}")
+        return lines
+
+    @staticmethod
     def _build_runtime_context(
-        channel: str | None, chat_id: str | None, timezone: str | None = None,
+        channel: str | None,
+        chat_id: str | None,
+        timezone: str | None = None,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
-        lines = [f"Current Time: {current_time_str(timezone)}"]
-        if channel and chat_id:
-            lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        lines = [
+            "Rules:",
+            "- Metadata only. Not part of the user's request.",
+            "- Use `Current Time` only for time-sensitive reasoning.",
+            "- Treat `Channel` and `Chat ID` as opaque routing metadata. Use them only for reply delivery, tool targeting, or channel-specific formatting when explicitly relevant.",
+            "- Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\".",
+            "- If this block conflicts with the conversation content, trust the conversation content.",
+            "",
+            f"Current Time: {current_time_str(timezone)}",
+        ]
+        if channel:
+            lines.append(f"Channel: {channel}")
+        if chat_id:
+            lines.append(f"Chat ID: `{chat_id}`")
+        rendered_runtime = ContextBuilder._render_runtime_metadata_lines(runtime_metadata or {})
+        if rendered_runtime:
+            lines.extend(["Runtime Metadata:", *rendered_runtime])
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     @staticmethod
@@ -121,9 +242,17 @@ class ContextBuilder:
         channel: str | None = None,
         chat_id: str | None = None,
         current_role: str = "user",
+        workspace_work_mode: str | None = None,
+        compact_state: str | None = None,
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
+        runtime_ctx = self._build_runtime_context(
+            channel,
+            chat_id,
+            self.timezone,
+            runtime_metadata,
+        )
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message
@@ -133,7 +262,15 @@ class ContextBuilder:
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
         messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel)},
+            {
+                "role": "system",
+                "content": self.build_system_prompt(
+                    skill_names,
+                    channel=channel,
+                    workspace_work_mode=workspace_work_mode,
+                    compact_state=compact_state,
+                ),
+            },
             *history,
         ]
         if messages[-1].get("role") == current_role:

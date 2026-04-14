@@ -457,8 +457,8 @@ async def test_runner_uses_raw_messages_when_context_governance_fails():
 
 
 @pytest.mark.asyncio
-async def test_runner_retries_empty_final_response_with_summary_prompt():
-    """Empty responses get 2 silent retries before finalization kicks in."""
+async def test_runner_uses_unified_message_for_direct_blank_response():
+    """A direct blank reply should surface the shared empty-response fallback."""
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
@@ -491,26 +491,26 @@ async def test_runner_retries_empty_final_response_with_summary_prompt():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.final_content == "final answer"
-    # 2 silent retries (iterations 0,1) + finalization on iteration 1
-    assert len(calls) == 3
+    assert result.final_content == "模型返回了空响应。请稍后重试，或切换模型。"
+    assert result.stop_reason == "error"
+    assert len(calls) == 1
     assert calls[0]["tools"] is not None
-    assert calls[1]["tools"] is not None
-    assert calls[2]["tools"] is None
-    assert result.usage["prompt_tokens"] == 13
-    assert result.usage["completion_tokens"] == 9
 
 
 @pytest.mark.asyncio
-async def test_runner_uses_specific_message_after_empty_finalization_retry():
-    """After silent retries + finalization all return empty, stop_reason is empty_final_response."""
+async def test_runner_uses_unified_message_for_empty_model_error():
+    """Provider-classified empty-model errors should keep the shared fallback wording."""
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
-    from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
     provider = MagicMock()
 
     async def chat_with_retry(*, messages, **kwargs):
-        return LLMResponse(content=None, tool_calls=[], usage={})
+        return LLMResponse(
+            content="empty model response",
+            tool_calls=[],
+            finish_reason="error",
+            usage={},
+        )
 
     provider.chat_with_retry = chat_with_retry
     tools = MagicMock()
@@ -525,8 +525,8 @@ async def test_runner_uses_specific_message_after_empty_finalization_retry():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.final_content == EMPTY_FINAL_RESPONSE_MESSAGE
-    assert result.stop_reason == "empty_final_response"
+    assert result.final_content == "模型返回了空响应。请稍后重试，或切换模型。"
+    assert result.stop_reason == "error"
 
 
 @pytest.mark.asyncio

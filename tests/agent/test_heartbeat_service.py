@@ -23,6 +23,27 @@ class DummyProvider(LLMProvider):
 
 
 @pytest.mark.asyncio
+async def test_tick_runs_maintenance_even_without_heartbeat_file(tmp_path) -> None:
+    provider = DummyProvider([])
+    calls: list[str] = []
+
+    async def _maintenance() -> None:
+        calls.append("ran")
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+        on_maintenance=_maintenance,
+    )
+
+    await service._tick()
+
+    assert calls == ["ran"]
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_start_is_idempotent(tmp_path) -> None:
     provider = DummyProvider([])
 
@@ -286,4 +307,3 @@ async def test_decide_prompt_includes_current_time(tmp_path) -> None:
     user_msg = captured_messages[1]
     assert user_msg["role"] == "user"
     assert "Current Time:" in user_msg["content"]
-
