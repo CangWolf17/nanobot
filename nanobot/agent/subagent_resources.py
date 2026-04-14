@@ -20,6 +20,8 @@ _GITHUB_COPILOT_DEFAULT_API_BASE = "https://api.githubcopilot.com"
 _ANTHROPIC_VERSION = "2023-06-01"
 _AZURE_OPENAI_API_VERSION = "2024-10-21"
 _WORKSPACE_FALLBACK_BACKENDS = {"openai_codex"}
+_DEFAULT_NANOBOT_ROOT = Path.home() / ".nanobot"
+_DEFAULT_WORKSPACE_ROOT = _DEFAULT_NANOBOT_ROOT / "workspace"
 
 
 @dataclass(frozen=True)
@@ -537,6 +539,14 @@ def _infer_manager_tier_from_ref(ref: str) -> str:
     text = str(ref or "").strip().lower()
     if text.startswith("lite-"):
         return "lite"
+    if text.startswith("pro-"):
+        return "pro"
+    if text.startswith("standard-"):
+        return "standard"
+    if "gpt-5.4-mini" in text:
+        return "standard"
+    if "gpt-5.4" in text:
+        return "pro"
     return "standard"
 
 
@@ -707,8 +717,28 @@ def _apply_route_status(
     return True
 
 
+def _registry_path_for_workspace(workspace: Path) -> Path:
+    env_path = str(os.environ.get("NANOBOT_MODEL_REGISTRY_PATH") or "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    workspace_path = Path(workspace).expanduser()
+    if workspace_path == _DEFAULT_WORKSPACE_ROOT:
+        return _DEFAULT_NANOBOT_ROOT / "model_registry.json"
+    return workspace_path / "model_registry.json"
+
+
+def _config_path_for_workspace(workspace: Path) -> Path:
+    env_path = str(os.environ.get("NANOBOT_CONFIG_PATH") or "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    workspace_path = Path(workspace).expanduser()
+    if workspace_path == _DEFAULT_WORKSPACE_ROOT:
+        return _DEFAULT_NANOBOT_ROOT / "config.json"
+    return workspace_path / "config.json"
+
+
 def _load_registry_for_status_update(workspace: Path) -> tuple[Path, dict[str, Any]]:
-    registry_path = workspace / "model_registry.json"
+    registry_path = _registry_path_for_workspace(workspace)
     data = _load_json(registry_path)
     if not isinstance(data, dict):
         data = {}
@@ -798,7 +828,7 @@ def refresh_provider_status(
 
 
 def _known_provider_routes(workspace: Path) -> set[str]:
-    registry = _load_json(workspace / "model_registry.json")
+    registry = _load_json(_registry_path_for_workspace(workspace))
     routes = {"aizhiwen-top", "tokenx", "weclawai", "minimax"}
 
     models = registry.get("models") if isinstance(registry, dict) else None
@@ -1202,7 +1232,7 @@ def _resolve_runtime_probe_target(
     *,
     ref: str,
 ) -> tuple[str, dict[str, Any]] | None:
-    registry = _load_json(workspace / "model_registry.json")
+    registry = _load_json(_registry_path_for_workspace(workspace))
     resolved = _resolve_registry_model_ref(registry, ref)
     if resolved:
         models = registry.get("models") if isinstance(registry, dict) else None
@@ -1384,8 +1414,8 @@ def run_legacy_workspace_provider_probe(workspace: Path, *, ref: str) -> dict[st
             return None
         result = health_fn(
             ref=ref,
-            config_path=workspace / "config.json",
-            registry_path=workspace / "model_registry.json",
+            config_path=_config_path_for_workspace(workspace),
+            registry_path=_registry_path_for_workspace(workspace),
             state_path=workspace / "model_state.json",
             profile="chat",
         )
@@ -1417,7 +1447,7 @@ def probe_due_provider_routes(
     now: str | None = None,
     probe_runner: Any | None = None,
 ) -> list[dict[str, Any]]:
-    registry = _load_json(workspace / "model_registry.json")
+    registry = _load_json(_registry_path_for_workspace(workspace))
     selected_routes: list[str] = []
     if isinstance(routes, (list, tuple)):
         for item in routes:
@@ -1480,7 +1510,7 @@ def probe_provider_route_status(
     now: str | None = None,
     probe_runner: Any | None = None,
 ) -> dict[str, Any]:
-    registry = _load_json(workspace / "model_registry.json")
+    registry = _load_json(_registry_path_for_workspace(workspace))
     probe_interval_seconds = _provider_status_probe_interval_seconds(registry)
     route_clean = str(route or "").strip()
     last_updated_at = _provider_status_last_updated_at(registry, route_clean)
@@ -1576,11 +1606,11 @@ def build_manager_from_workspace_snapshot(
     fallback_model: str | None = None,
     now: str | None = None,
 ) -> SubagentResourceManager:
-    registry = _load_json(workspace / "model_registry.json")
+    registry = _load_json(_registry_path_for_workspace(workspace))
     if not isinstance(registry, dict):
         registry = {}
     registry.setdefault("models", {})
-    _config = _load_json(workspace / "config.json")
+    _config = _load_json(_config_path_for_workspace(workspace))
     transient_ttl_seconds = _provider_status_transient_ttl_seconds(registry)
 
     route_policies = {

@@ -10,7 +10,7 @@ def _registry() -> dict:
     return {
         "version": 1,
         "subagent_defaults": {
-            "model": "gpt-5.4",
+            "model": "standard-gpt-5.4-mini-xhigh-tokenx",
             "task_budget": 3,
             "level_limit": 2,
         },
@@ -18,8 +18,8 @@ def _registry() -> dict:
             "archive": {"ref": "lite-minimax-m2.7-high-minimax"},
         },
         "models": {
-            "standard-gpt-5.4-high-aizhiwen-top": {
-                "tier": "standard",
+            "pro-gpt-5.4-high-aizhiwen-top": {
+                "tier": "pro",
                 "family": "gpt-5.4",
                 "effort": "high",
                 "route": "aizhiwen-top",
@@ -34,8 +34,8 @@ def _registry() -> dict:
                 "enabled": True,
                 "template": False,
             },
-            "standard-gpt-5.4-xhigh-aizhiwen-top": {
-                "tier": "standard",
+            "pro-gpt-5.4-xhigh-aizhiwen-top": {
+                "tier": "pro",
                 "family": "gpt-5.4",
                 "effort": "xhigh",
                 "route": "aizhiwen-top",
@@ -50,8 +50,8 @@ def _registry() -> dict:
                 "enabled": True,
                 "template": False,
             },
-            "standard-gpt-5.4-high-tokenx": {
-                "tier": "standard",
+            "pro-gpt-5.4-high-tokenx": {
+                "tier": "pro",
                 "family": "gpt-5.4",
                 "effort": "high",
                 "route": "tokenx",
@@ -66,8 +66,8 @@ def _registry() -> dict:
                 "enabled": True,
                 "template": False,
             },
-            "standard-gpt-5.4-xhigh-tokenx": {
-                "tier": "standard",
+            "pro-gpt-5.4-xhigh-tokenx": {
+                "tier": "pro",
                 "family": "gpt-5.4",
                 "effort": "xhigh",
                 "route": "tokenx",
@@ -283,15 +283,15 @@ def test_acquire_candidates_skips_manual_outage_routes():
     manager = _manager()
     decision = manager.acquire(
         SubagentRequest(
-            model="standard-gpt-5.4-xhigh-aizhiwen-top",
+            model="pro-gpt-5.4-xhigh-aizhiwen-top",
             harness_tier="standard",
-            manager_model="standard-gpt-5.4-high-aizhiwen-top",
+            manager_model="pro-gpt-5.4-high-aizhiwen-top",
         )
     )
 
     assert decision.status == "granted"
     assert decision.lease is not None
-    assert decision.lease.model_id == "standard-gpt-5.4-xhigh-aizhiwen-top"
+    assert decision.lease.model_id == "pro-gpt-5.4-xhigh-aizhiwen-top"
 
 
 
@@ -302,15 +302,15 @@ def test_standard_tier_defaults_to_high_and_skips_exhausted_tokenx():
     decision = manager.acquire(
         SubagentRequest(
             tier="standard",
-            harness_model="standard-gpt-5.4-xhigh-tokenx",
-            manager_model="standard-gpt-5.4-xhigh-tokenx",
+            harness_model="pro-gpt-5.4-xhigh-tokenx",
+            manager_model="pro-gpt-5.4-xhigh-tokenx",
         )
     )
 
     assert decision.status == "granted"
     assert decision.lease is not None
-    assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
-    assert decision.lease.effort == "high"
+    assert decision.lease.model_id == "standard-gpt-5.4-mini-medium-aizhiwen-top"
+    assert decision.lease.effort == "medium"
     assert decision.lease.route == "aizhiwen-top"
 
 
@@ -452,14 +452,48 @@ def test_build_manager_from_workspace_snapshot_uses_workspace_truth(tmp_path):
     )
 
     request = manager.default_request()
-    assert request.manager_model == "gpt-5.4"
+    assert request.manager_model == "standard-gpt-5.4-mini-xhigh-tokenx"
     assert request.manager_tier == "standard"
 
     decision = manager.acquire(request)
     assert decision.status == "granted"
     assert decision.lease is not None
-    assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
-    assert decision.lease.effort == "high"
+    assert decision.lease.model_id == "standard-gpt-5.4-mini-medium-aizhiwen-top"
+    assert decision.lease.effort == "medium"
+
+
+
+def test_build_manager_from_default_workspace_prefers_root_registry_truth(tmp_path, monkeypatch):
+    from nanobot.agent.subagent_resources import build_manager_from_workspace_snapshot
+
+    nanobot_root = tmp_path / ".nanobot"
+    workspace = nanobot_root / "workspace"
+    workspace.mkdir(parents=True)
+
+    root_registry = _registry()
+    root_registry["provider_policies"] = {"tokenx": {"max_concurrency": 9}}
+    workspace_registry = _registry()
+    workspace_registry["provider_policies"] = {"tokenx": {"max_concurrency": 1}}
+
+    (nanobot_root / "config.json").write_text(
+        json.dumps({"agents": {"defaults": {"model": "gpt-5.4"}}, "providers": {}}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (nanobot_root / "model_registry.json").write_text(
+        json.dumps(root_registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (workspace / "model_registry.json").write_text(
+        json.dumps(workspace_registry, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("nanobot.agent.subagent_resources._DEFAULT_NANOBOT_ROOT", nanobot_root)
+    monkeypatch.setattr("nanobot.agent.subagent_resources._DEFAULT_WORKSPACE_ROOT", workspace)
+
+    manager = build_manager_from_workspace_snapshot(workspace=workspace)
+
+    assert manager.route_policies["tokenx"].max_concurrency == 9
 
 
 
@@ -507,7 +541,7 @@ def test_build_manager_snapshot_uses_persisted_provider_status_for_candidate_sel
 
     assert decision.status == "granted"
     assert decision.lease is not None
-    assert decision.lease.model_id == "standard-gpt-5.4-high-tokenx"
+    assert decision.lease.model_id == "standard-gpt-5.4-mini-medium-tokenx"
 
 
 
@@ -585,7 +619,7 @@ def test_record_provider_failure_persists_hard_status_and_future_snapshot_skips_
 
     assert decision.status == "granted"
     assert decision.lease is not None
-    assert decision.lease.model_id == "standard-gpt-5.4-high-tokenx"
+    assert decision.lease.model_id == "standard-gpt-5.4-mini-medium-tokenx"
 
 
 
@@ -620,7 +654,7 @@ def test_record_provider_failure_persists_transient_status_without_shrinking_can
 
     assert decision.status == "granted"
     assert decision.lease is not None
-    assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
+    assert decision.lease.model_id == "standard-gpt-5.4-mini-medium-aizhiwen-top"
 
 
 
@@ -654,7 +688,7 @@ def test_build_manager_snapshot_ignores_stale_transient_provider_status(tmp_path
 
     assert decision.status == "granted"
     assert decision.lease is not None
-    assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
+    assert decision.lease.model_id == "standard-gpt-5.4-mini-medium-aizhiwen-top"
 
 
 
@@ -699,7 +733,7 @@ def test_refresh_provider_status_restores_route_for_future_snapshot(tmp_path):
 
     assert decision.status == "granted"
     assert decision.lease is not None
-    assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
+    assert decision.lease.model_id == "standard-gpt-5.4-mini-medium-aizhiwen-top"
 
 
 
@@ -734,7 +768,7 @@ def test_build_manager_snapshot_uses_registry_configured_transient_ttl_seconds(t
 
     assert decision.status == "granted"
     assert decision.lease is not None
-    assert decision.lease.model_id == "standard-gpt-5.4-high-aizhiwen-top"
+    assert decision.lease.model_id == "standard-gpt-5.4-mini-medium-aizhiwen-top"
 
 
 
@@ -926,7 +960,7 @@ def test_run_runtime_quick_provider_probe_uses_registry_model_record_without_wor
 
     probe = run_runtime_quick_provider_probe(
         tmp_path,
-        ref="standard-gpt-5.4-high-aizhiwen-top",
+        ref="pro-gpt-5.4-high-aizhiwen-top",
         request_runner=_request,
     )
 
@@ -1083,7 +1117,7 @@ def test_run_default_provider_probe_returns_workspace_fallback_when_no_runtime_t
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("workspace fallback should not run")),
     )
 
-    probe = sr.run_default_provider_probe(tmp_path, ref="standard-gpt-5.4-high-aizhiwen-top")
+    probe = sr.run_default_provider_probe(tmp_path, ref="pro-gpt-5.4-high-aizhiwen-top")
 
     assert probe is not None
     assert probe["ok"] is False
@@ -1223,7 +1257,7 @@ def test_probe_provider_route_status_prefers_runtime_native_probe_by_default(tmp
     )
 
     assert result["status"] == "updated"
-    assert called == ["standard-gpt-5.4-high-aizhiwen-top"]
+    assert called == ["pro-gpt-5.4-high-aizhiwen-top"]
 
 
 
@@ -1407,7 +1441,7 @@ def test_probe_provider_route_status_runs_probe_when_due_and_refreshes_status(tm
 
     assert result["status"] == "updated"
     assert result["route"] == "aizhiwen-top"
-    assert called == ["standard-gpt-5.4-high-aizhiwen-top"]
+    assert called == ["pro-gpt-5.4-high-aizhiwen-top"]
     updated = json.loads((tmp_path / "model_registry.json").read_text(encoding="utf-8"))
     assert updated["provider_status"]["aizhiwen-top"]["availability"] == "available"
     assert updated["provider_status"]["aizhiwen-top"]["source"] == "monitor_refresh"
@@ -1504,7 +1538,7 @@ def test_probe_due_provider_routes_only_runs_due_routes(tmp_path):
     assert results[0]["status"] == "updated"
     assert results[1]["status"] == "skipped"
     assert results[1]["reason"] == "not_due"
-    assert called == ["standard-gpt-5.4-high-aizhiwen-top"]
+    assert called == ["pro-gpt-5.4-high-aizhiwen-top"]
 
 
 
