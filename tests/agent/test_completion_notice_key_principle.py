@@ -30,6 +30,15 @@ def test_extract_terminal_key_principle_bold_with_fullwidth_colon() -> None:
     assert kp == "**Key Principle：** 先保证主链路正确，再做体验优化。"
 
 
+def test_extract_terminal_key_principle_bold_label_then_colon_variant() -> None:
+    body, kp = AgentLoop._extract_terminal_key_principle(
+        "方案如下。\n\n**Key Principle**：先保证主链路正确，再做体验优化。"
+    )
+
+    assert body == "方案如下。"
+    assert kp == "**Key Principle**：先保证主链路正确，再做体验优化。"
+
+
 def test_extract_terminal_key_principle_single_newline_prefix() -> None:
     body, kp = AgentLoop._extract_terminal_key_principle(
         "方案如下。\nKey Principle：先保证主链路正确，再做体验优化。"
@@ -46,6 +55,15 @@ def test_extract_terminal_key_principle_multiline_body_after_label() -> None:
 
     assert body == "方案如下。"
     assert kp == "Key Principle：\n先保证主链路正确，再做体验优化。"
+
+
+def test_extract_terminal_key_principle_case_insensitive_and_trailing_blank_lines() -> None:
+    body, kp = AgentLoop._extract_terminal_key_principle(
+        "方案如下。\n\nkey principle: keep the boundary clean.\n\n"
+    )
+
+    assert body == "方案如下。"
+    assert kp == "key principle: keep the boundary clean."
 
 
 def test_extract_terminal_key_principle_ignores_mid_body_occurrence() -> None:

@@ -37,6 +37,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.harness.service import HarnessService
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
+from nanobot.utils.key_principle import extract_terminal_key_principle
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -782,21 +783,7 @@ class AgentLoop:
 
     @staticmethod
     def _extract_terminal_key_principle(text: str) -> tuple[str, str | None]:
-        stripped = str(text or "")
-        patterns = [
-            r"\n+(\*\*Key Principle[:：]\*\*\s*.+?)\s*$",
-            r"\n+(Key Principle[:：]\s*.+?)\s*$",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, stripped, flags=re.DOTALL)
-            if not match:
-                continue
-            principle_text = (match.group(1) or "").strip()
-            if not principle_text:
-                continue
-            main_text = stripped[:match.start()].rstrip()
-            return main_text, principle_text
-        return stripped, None
+        return extract_terminal_key_principle(text)
 
     async def _run_agent_loop(
         self,

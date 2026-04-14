@@ -36,3 +36,12 @@ def test_trim_terminal_key_principle_removes_exact_suffix_only():
 
     untouched = ch._trim_terminal_key_principle('正文里提到 Key Principle：例子', 'Key Principle：先收口，再扩展。')
     assert untouched == '正文里提到 Key Principle：例子'
+
+
+def test_trim_terminal_key_principle_removes_tail_block_even_when_metadata_format_differs():
+    ch = _make_channel()
+    text = '方案如下。\n\n**Key Principle**：先收口，再扩展。\n\n'
+
+    trimmed = ch._trim_terminal_key_principle(text, 'Key Principle：先收口，再扩展。')
+
+    assert trimmed == '方案如下。'

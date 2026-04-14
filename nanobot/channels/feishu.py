@@ -19,6 +19,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
+from nanobot.utils.key_principle import trim_terminal_key_principle
 from pydantic import Field
 
 import importlib.util
@@ -1045,14 +1046,7 @@ class FeishuChannel(BaseChannel):
 
     @staticmethod
     def _trim_terminal_key_principle(text: str, terminal_key_principle: str | None) -> str:
-        source = str(text or "")
-        kp = str(terminal_key_principle or "").strip()
-        if not kp:
-            return source
-        stripped = source.rstrip()
-        if stripped.endswith(kp):
-            return stripped[: -len(kp)].rstrip()
-        return source
+        return trim_terminal_key_principle(text, terminal_key_principle)
 
     async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
         """Progressive streaming via CardKit: create card on first delta, stream-update on subsequent."""
