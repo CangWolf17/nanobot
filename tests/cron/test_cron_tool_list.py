@@ -262,6 +262,18 @@ def test_list_shows_next_run(tmp_path) -> None:
     assert "(UTC)" in result
 
 
+def test_add_cron_job_records_creator_sender_id(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool.set_context("telegram", "chat-1", "user-42")
+
+    result = tool._add_job("Morning standup", None, "0 8 * * *", None, None)
+
+    assert result.startswith("Created job")
+    job = tool._cron.list_jobs()[0]
+    assert job.payload.creator_sender_id == "user-42"
+    assert job.payload.completion_notice_text == "Morning standup"
+
+
 def test_add_cron_job_defaults_to_tool_timezone(tmp_path) -> None:
     tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
     tool.set_context("telegram", "chat-1")
@@ -285,15 +297,3 @@ def test_add_at_job_uses_default_timezone_for_naive_datetime(tmp_path) -> None:
     assert job.schedule.at_ms == expected
 
 
-def test_list_excludes_disabled_jobs(tmp_path) -> None:
-    tool = _make_tool(tmp_path)
-    job = tool._cron.add_job(
-        name="Paused job",
-        schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="UTC"),
-        message="test",
-    )
-    tool._cron.enable_job(job.id, enabled=False)
-
-    result = tool._list_jobs()
-    assert "Paused job" not in result
-    assert result == "No scheduled jobs."

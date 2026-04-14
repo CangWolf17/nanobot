@@ -585,8 +585,10 @@ def _build_weather_brief_prompt(task_message: str) -> str:
         "3. 必须包含 `### 📍 重庆南岸区天气`、`### 📅 今日日程`、`### 📌 提醒` 三段。\n"
         "4. 今日日程段先不要调用飞书日历；直接写 `📭 **飞书日历暂未接入**`。\n"
         "5. 不要调用飞书日历、不要搜索 workspace 里的日历脚本、不要解释限制来源。\n"
-        "6. 天气数据优先使用 Open-Meteo（重庆南岸区固定坐标可用 29.5,106.5），需要今天 current + daily forecast，并尽量补未来几天趋势。\n"
-        "7. 最终只输出发给用户的成品 Markdown，不要输出思考过程、说明、工具解释。\n\n"
+        "6. 天气数据必须优先使用本地脚本 `/home/admin/.nanobot/workspace/scripts/weather.py`，不要自己写 curl，也不要搜索别的天气工具。\n"
+        "7. 先执行 `/home/admin/.nanobot/workspace/venv/bin/python /home/admin/.nanobot/workspace/scripts/weather.py 重庆南岸区 forecast`。如果 `重庆南岸区` 获取失败，立即改用固定坐标 29.5,106.5 对应的南岸区天气结果，不要把失败过程写给用户。\n"
+        "8. 必须保留 `###` 标题、Markdown 表格和 `---` 分隔线，不要把表格改写成自然语言段落。\n"
+        "9. 最终只输出发给用户的成品 Markdown，不要输出思考过程、说明、工具解释、命令回显。\n\n"
         f"触发任务: {normalized}\n\n"
         "输出模板（按这个骨架来，内容按当天真实天气填）：\n"
         "🌤️ **早上好！X月X日 周X**\n\n"
@@ -691,10 +693,15 @@ def gateway(
             f"Task '{job.name}' has been triggered.\n"
             f"Scheduled instruction: {job.payload.message}"
         )
-        metadata: dict[str, Any] | None = None
+        metadata: dict[str, Any] | None = {
+            "_origin_sender_id": str(job.payload.creator_sender_id or "").strip(),
+        }
+        if str(job.payload.completion_notice_text or "").strip():
+            metadata["_completion_notice_text"] = str(job.payload.completion_notice_text).strip()
         weather_task = "重庆南岸区" in (job.payload.message or "") and "天气预报" in (job.payload.message or "")
         if weather_task:
             metadata = {
+                **(metadata or {}),
                 "workspace_agent_cmd": "weather_brief",
                 "workspace_agent_input": _build_weather_brief_prompt(job.payload.message),
             }
@@ -716,6 +723,18 @@ def gateway(
                 cron_tool.reset_cron_context(cron_token)
 
         response = resp.content if resp else ""
+        response_metadata = dict(resp.metadata or {}) if resp else {}
+        completion_notice_text = str(
+            response_metadata.get("_completion_notice_text")
+            or job.payload.completion_notice_text
+            or ""
+        ).strip()
+        completion_notice_user_id = str(
+            response_metadata.get("_completion_notice_mention_user_id")
+            or response_metadata.get("_origin_sender_id")
+            or job.payload.creator_sender_id
+            or ""
+        ).strip()
 
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
@@ -731,7 +750,21 @@ def gateway(
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to,
                     content=response,
+                    metadata=response_metadata,
                 ))
+                if completion_notice_text:
+                    notice_metadata = {
+                        "_completion_notice": True,
+                        "_completion_notice_text": completion_notice_text,
+                    }
+                    if completion_notice_user_id:
+                        notice_metadata["_completion_notice_mention_user_id"] = completion_notice_user_id
+                    await bus.publish_outbound(OutboundMessage(
+                        channel=job.payload.channel or "cli",
+                        chat_id=job.payload.to,
+                        content="",
+                        metadata=notice_metadata,
+                    ))
         return response
     cron.on_job = on_cron_job
 

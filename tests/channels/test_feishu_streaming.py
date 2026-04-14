@@ -49,6 +49,7 @@ def _mock_content_response(success: bool = True):
 class TestFeishuStreamingConfig:
     def test_streaming_default_true(self):
         assert FeishuConfig().streaming is True
+        assert FeishuConfig().streaming_placeholder_text == "正在生成…"
 
     def test_supports_streaming_when_enabled(self):
         ch = _make_channel(streaming=True)
@@ -70,6 +71,7 @@ def test_feishu_streaming_completion_notice_can_be_enabled() -> None:
     assert config.streaming_completion_notice_enabled is True
     assert config.streaming_completion_notice_text == "✅ 回复完成"
     assert config.streaming_completion_notice_mention_user is False
+    assert config.streaming_completion_notice_mention_fallback_user_id == ""
     assert config.streaming_completion_notice_mention_fallback_name == ""
 
 
@@ -82,6 +84,8 @@ class TestCreateStreamingCard:
         assert result == "card_123"
         ch._client.cardkit.v1.card.create.assert_called_once()
         ch._client.im.v1.message.create.assert_called_once()
+        request = ch._client.cardkit.v1.card.create.call_args[0][0]
+        assert "正在生成…" in request.request_body.data
 
     def test_returns_none_on_failure(self):
         ch = _make_channel()
@@ -269,8 +273,10 @@ class TestSendDelta:
         mock_send.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_send_emits_completion_notice_when_explicitly_requested(self):
+    async def test_send_skips_completion_notice_when_mention_flag_disabled(self):
         ch = _make_channel()
+        ch.config.streaming_completion_notice_enabled = True
+        ch.config.streaming_completion_notice_mention_user = False
 
         from unittest.mock import patch
         from nanobot.bus.events import OutboundMessage
@@ -283,15 +289,11 @@ class TestSendDelta:
                     "_streamed": True,
                     "_completion_notice": True,
                     "_completion_notice_text": "✅ 回复完成",
+                    "_completion_notice_mention_user_id": "ou_runtime_user",
                 },
             ))
 
-        mock_send.assert_called_once_with(
-            "chat_id",
-            "oc_chat1",
-            "text",
-            '{"text": "✅ 回复完成"}',
-        )
+        mock_send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_emits_completion_notice_with_group_mention_when_enabled(self):
@@ -379,6 +381,53 @@ class TestSendDelta:
         assert args[2] == "post"
         assert '"user_name": "Tim"' in args[3]
         assert '"user_name": "你"' not in args[3]
+
+    @pytest.mark.asyncio
+    async def test_send_completion_notice_uses_fallback_user_id_when_runtime_id_missing(self):
+        ch = _make_channel()
+        ch.config.streaming_completion_notice_enabled = True
+        ch.config.streaming_completion_notice_mention_user = True
+        ch.config.streaming_completion_notice_mention_fallback_user_id = "ou_fallback_user"
+
+        from unittest.mock import patch
+        from nanobot.bus.events import OutboundMessage
+        with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
+            await ch.send(OutboundMessage(
+                channel="feishu",
+                chat_id="oc_chat1",
+                content="Final content that was already streamed",
+                metadata={
+                    "_streamed": True,
+                    "_completion_notice": True,
+                    "_completion_notice_text": "✅ 回复完成",
+                },
+            ))
+
+        args = mock_send.call_args[0]
+        assert args[2] == "post"
+        assert '"user_id": "ou_fallback_user"' in args[3]
+
+    @pytest.mark.asyncio
+    async def test_send_completion_notice_skips_when_no_runtime_or_fallback_user_id(self):
+        ch = _make_channel()
+        ch.config.streaming_completion_notice_enabled = True
+        ch.config.streaming_completion_notice_mention_user = True
+
+        from unittest.mock import patch
+        from nanobot.bus.events import OutboundMessage
+        with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
+            await ch.send(OutboundMessage(
+                channel="feishu",
+                chat_id="oc_chat1",
+                content="Final content that was already streamed",
+                metadata={
+                    "_streamed": True,
+                    "_completion_notice": True,
+                    "_completion_notice_text": "✅ 回复完成",
+                },
+            ))
+
+        mock_send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stream_end_skips_completion_notice_when_resuming(self):
@@ -501,7 +550,26 @@ class TestSendDelta:
         assert buf.sequence == 7
 
 
-class TestToolHintInlineStreaming:
+    @pytest.mark.asyncio
+    async def test_send_weather_brief_forces_interactive_card(self):
+        ch = _make_channel()
+
+        from unittest.mock import patch
+        from nanobot.bus.events import OutboundMessage
+        with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
+            await ch.send(OutboundMessage(
+                channel="feishu",
+                chat_id="oc_chat1",
+                content="天气成品",
+                metadata={"workspace_agent_cmd": "weather_brief"},
+            ))
+
+        args = mock_send.call_args[0]
+        assert args[0] == "chat_id"
+        assert args[1] == "oc_chat1"
+        assert args[2] == "interactive"
+        assert '"elements"' in args[3]
+
     """Tool hint messages should be inlined into active streaming cards."""
 
     @pytest.mark.asyncio

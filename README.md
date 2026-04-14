@@ -564,6 +564,11 @@ Uses **WebSocket** long connection — no public IP required.
       "doneEmoji": "DONE",
       "toolHintPrefix": "🔧",
       "streaming": true,
+      "streamingCompletionNoticeEnabled": true,
+      "streamingCompletionNoticeText": "✅ 回复完成",
+      "streamingCompletionNoticeMentionUser": true,
+      "streamingCompletionNoticeMentionFallbackUserId": "ou_YOUR_OPEN_ID",
+      "streamingCompletionNoticeMentionFallbackName": "",
       "domain": "feishu"
     }
   }
@@ -577,6 +582,11 @@ Uses **WebSocket** long connection — no public IP required.
 > `reactEmoji`: Emoji for "processing" status (default: `OnIt`). See [available emojis](https://open.larkoffice.com/document/server-docs/im-v1/message-reaction/emojis-introduce).
 > `doneEmoji`: Optional emoji for "completed" status (e.g., `DONE`, `OK`, `HEART`). When set, bot adds this reaction after removing `reactEmoji`.
 > `toolHintPrefix`: Prefix for inline tool hints in streaming cards (default: `🔧`).
+> `streamingCompletionNoticeEnabled`: Sends a separate completion notice after a streamed reply finishes.
+> `streamingCompletionNoticeText`: Default completion notice text. If the final turn carries a Key Principle completion text, nanobot uses that instead.
+> `streamingCompletionNoticeMentionUser`: When `true`, the completion notice is sent as an `@user` message. When `false`, no separate completion notice is sent.
+> `streamingCompletionNoticeMentionFallbackUserId`: Optional fallback open_id/user_id used when runtime metadata does not carry the mention target.
+> `streamingCompletionNoticeMentionFallbackName`: Optional display name used in the Feishu `@` rich-text block when a fallback mention is sent.
 > `domain`: `"feishu"` (default) for China (open.feishu.cn), `"lark"` for international Lark (open.larksuite.com).
 
 **3. Run**

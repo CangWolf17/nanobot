@@ -252,9 +252,11 @@ class FeishuConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"
     reply_to_message: bool = False  # If True, bot replies quote the user's original message
     streaming: bool = True
+    streaming_placeholder_text: str = "正在生成…"
     streaming_completion_notice_enabled: bool = False
     streaming_completion_notice_text: str = "✅ 回复完成"
     streaming_completion_notice_mention_user: bool = False
+    streaming_completion_notice_mention_fallback_user_id: str = ""
     streaming_completion_notice_mention_fallback_name: str = ""
 
 
@@ -285,7 +287,7 @@ class FeishuChannel(BaseChannel):
     name = "feishu"
     display_name = "Feishu"
 
-    _STREAM_EDIT_INTERVAL = 0.5  # throttle between CardKit streaming updates
+    _STREAM_EDIT_INTERVAL = 0.2  # throttle between CardKit streaming updates
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
@@ -959,10 +961,11 @@ class FeishuChannel(BaseChannel):
     def _create_streaming_card_sync(self, receive_id_type: str, chat_id: str) -> str | None:
         """Create a CardKit streaming card, send it to chat, return card_id."""
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
+        placeholder = str(getattr(self.config, "streaming_placeholder_text", "") or "").strip()
         card_json = {
             "schema": "2.0",
             "config": {"wide_screen_mode": True, "update_multi": True, "streaming_mode": True},
-            "body": {"elements": [{"tag": "markdown", "content": "", "element_id": _STREAM_ELEMENT_ID}]},
+            "body": {"elements": [{"tag": "markdown", "content": placeholder, "element_id": _STREAM_ELEMENT_ID}]},
         }
         try:
             request = CreateCardRequest.builder().request_body(
@@ -1040,6 +1043,17 @@ class FeishuChannel(BaseChannel):
             logger.warning("Error closing streaming on card {}: {}", card_id, e)
             return False
 
+    @staticmethod
+    def _trim_terminal_key_principle(text: str, terminal_key_principle: str | None) -> str:
+        source = str(text or "")
+        kp = str(terminal_key_principle or "").strip()
+        if not kp:
+            return source
+        stripped = source.rstrip()
+        if stripped.endswith(kp):
+            return stripped[: -len(kp)].rstrip()
+        return source
+
     async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
         """Progressive streaming via CardKit: create card on first delta, stream-update on subsequent."""
         if not self._client:
@@ -1063,16 +1077,33 @@ class FeishuChannel(BaseChannel):
 
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):
-            buf = self._stream_bufs.pop(chat_id, None)
+            resuming = bool(meta.get("_resuming"))
+            buf = self._stream_bufs.get(chat_id)
             if not buf:
                 return
+            terminal_key_principle = str(meta.get("_terminal_key_principle_text") or "").strip()
+            if terminal_key_principle:
+                buf.text = self._trim_terminal_key_principle(buf.text, terminal_key_principle)
             if not buf.text:
-                if buf.card_id:
+                if buf.card_id and not resuming:
                     buf.sequence += 1
                     await loop.run_in_executor(
                         None, self._close_streaming_mode_sync, buf.card_id, buf.sequence,
                     )
+                    self._stream_bufs.pop(chat_id, None)
+                elif not resuming:
+                    self._stream_bufs.pop(chat_id, None)
                 return
+            if resuming:
+                if not buf.card_id:
+                    return
+                buf.sequence += 1
+                await loop.run_in_executor(
+                    None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence,
+                )
+                buf.last_edit = time.monotonic()
+                return
+            self._stream_bufs.pop(chat_id, None)
             if buf.card_id:
                 buf.sequence += 1
                 await loop.run_in_executor(
@@ -1112,15 +1143,25 @@ class FeishuChannel(BaseChannel):
             buf.last_edit = now
 
     async def _send_stream_completion_notice(self, receive_id_type: str, msg: OutboundMessage) -> None:
+        if not getattr(self.config, "streaming_completion_notice_enabled", False):
+            return
+        if not getattr(self.config, "streaming_completion_notice_mention_user", False):
+            return
+
         notice_text = str(
             msg.metadata.get("_completion_notice_text")
             or self.config.streaming_completion_notice_text
             or ""
         ).strip()
-        mention_user_id = str(
-            msg.metadata.get("_completion_notice_mention_user_id") or ""
-        ).strip()
         if not notice_text:
+            return
+
+        mention_user_id = str(
+            msg.metadata.get("_completion_notice_mention_user_id")
+            or getattr(self.config, "streaming_completion_notice_mention_fallback_user_id", "")
+            or ""
+        ).strip()
+        if not mention_user_id:
             return
 
         at_tag = {"tag": "at", "user_id": mention_user_id}
@@ -1131,24 +1172,19 @@ class FeishuChannel(BaseChannel):
         if fallback_name:
             at_tag["user_name"] = fallback_name
 
+        post_body = json.dumps(
+            {
+                "zh_cn": {
+                    "content": [[
+                        at_tag,
+                        {"tag": "text", "text": f" {notice_text}"},
+                    ]]
+                }
+            },
+            ensure_ascii=False,
+        )
         loop = asyncio.get_running_loop()
-        if mention_user_id:
-            post_body = json.dumps(
-                {
-                    "zh_cn": {
-                        "content": [[
-                            at_tag,
-                            {"tag": "text", "text": f" {notice_text}"},
-                        ]]
-                    }
-                },
-                ensure_ascii=False,
-            )
-            await loop.run_in_executor(None, self._send_message_sync, receive_id_type, msg.chat_id, "post", post_body)
-            return
-
-        text_body = json.dumps({"text": notice_text}, ensure_ascii=False)
-        await loop.run_in_executor(None, self._send_message_sync, receive_id_type, msg.chat_id, "text", text_body)
+        await loop.run_in_executor(None, self._send_message_sync, receive_id_type, msg.chat_id, "post", post_body)
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
@@ -1161,12 +1197,26 @@ class FeishuChannel(BaseChannel):
             loop = asyncio.get_running_loop()
 
             # Handle tool hint messages as code blocks in interactive cards.
-            # These are progress-only messages and should bypass normal reply routing.
+            # When a streaming card is active for this chat, inline the hint into the card instead.
             if msg.metadata.get("_tool_hint"):
                 if msg.content and msg.content.strip():
-                    await self._send_tool_hint_card(
-                        receive_id_type, msg.chat_id, msg.content.strip()
-                    )
+                    active_buf = self._stream_bufs.get(msg.chat_id)
+                    if active_buf and active_buf.card_id:
+                        hint_text = f"\n\n🔧 {msg.content.strip()}\n\n"
+                        active_buf.text += hint_text
+                        active_buf.sequence += 1
+                        await loop.run_in_executor(
+                            None,
+                            self._stream_update_text_sync,
+                            active_buf.card_id,
+                            active_buf.text,
+                            active_buf.sequence,
+                        )
+                        active_buf.last_edit = time.monotonic()
+                    else:
+                        await self._send_tool_hint_card(
+                            receive_id_type, msg.chat_id, msg.content.strip()
+                        )
                 return
 
             # Determine whether the first message should quote the user's message.
@@ -1229,7 +1279,8 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
-                fmt = self._detect_msg_format(msg.content)
+                forced_interactive = (msg.metadata or {}).get("workspace_agent_cmd") == "weather_brief"
+                fmt = "interactive" if forced_interactive else self._detect_msg_format(msg.content)
 
                 if fmt == "text":
                     # Short plain text – send as simple text message

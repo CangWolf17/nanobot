@@ -123,24 +123,34 @@ def test_workspace_agent_notes_emits_progress_before_agent_run(tmp_path: Path) -
     asyncio.run(run())
 
 
-def test_workspace_agent_diagnose_emits_progress_before_agent_run(tmp_path: Path) -> None:
+def test_workspace_agent_weather_brief_hides_tool_hints_from_user(tmp_path: Path) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)
+
+        async def fake_run_agent_loop(*_args, **kwargs):
+            on_progress = kwargs.get("on_progress")
+            assert on_progress is not None
+            await on_progress('python /home/admin/.nanobot/workspace/scripts/weather.py 重庆南岸区 forecast', tool_hint=True)
+            return "天气成品", [], []
+
+        loop._run_agent_loop = AsyncMock(side_effect=fake_run_agent_loop)
         msg = InboundMessage(
-            channel="telegram",
+            channel="feishu",
             sender_id="user1",
             chat_id="chat1",
-            content="/诊断 登录失败",
-            metadata={"workspace_agent_cmd": "诊断"},
+            content="天气",
+            metadata={"workspace_agent_cmd": "weather_brief"},
         )
 
         result = await loop._process_message(msg)
-        progress = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        first = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
 
-        assert progress.content == "正在诊断问题…"
-        assert progress.metadata["_progress"] is True
+        assert first.content == "正在生成天气早报…"
+        assert first.metadata["_progress"] is True
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(bus.consume_outbound(), timeout=0.05)
         assert result is not None
-        assert result.content == "done"
+        assert result.content == "天气成品"
 
     asyncio.run(run())
 
@@ -329,6 +339,54 @@ def test_separate_completion_notice_when_earlier_streamed_but_final_segment_sile
         assert final_reply.content == "final done"
         assert "_streamed" not in (final_reply.metadata or {})
         assert completion_notice.metadata["_completion_notice"] is True
+        assert completion_notice.metadata["_completion_notice_mention_user_id"] == "user1"
+
+    asyncio.run(run())
+
+
+def test_separate_completion_notice_prefers_key_principle_text_when_final_segment_silent(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        loop.channels_config = ChannelsConfig.model_validate(
+            {
+                "feishu": {
+                    "enabled": True,
+                    "streaming": True,
+                    "streamingCompletionNoticeEnabled": True,
+                    "streamingCompletionNoticeText": "✅ 回复完成",
+                    "streamingCompletionNoticeMentionUser": True,
+                }
+            }
+        )
+
+        async def fake_process_message(_msg, **_kwargs):
+            return OutboundMessage(
+                channel="feishu",
+                chat_id="chat1",
+                content="final done",
+                metadata={
+                    "_streamed": True,
+                    "_completion_notice_text": "Key Principle：先收口，再扩展。",
+                    "_terminal_key_principle_text": "Key Principle：先收口，再扩展。",
+                },
+            )
+
+        loop._process_message = fake_process_message
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={"_wants_stream": True},
+        )
+
+        await loop._dispatch(msg)
+        outputs = [await asyncio.wait_for(bus.consume_outbound(), timeout=1.0) for _ in range(bus.outbound_size)]
+
+        completion_notice = next(
+            item for item in outputs if (item.metadata or {}).get("_completion_notice") is True
+        )
+        assert completion_notice.metadata["_completion_notice_text"] == "Key Principle：先收口，再扩展。"
         assert completion_notice.metadata["_completion_notice_mention_user_id"] == "user1"
 
     asyncio.run(run())

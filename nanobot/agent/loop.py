@@ -343,9 +343,11 @@ class AgentLoop:
             return
 
         meta["_completion_notice"] = True
-        meta["_completion_notice_text"] = notice_text
-        mention_user_id = ""
-        if mention_user:
+        meta["_completion_notice_text"] = str(
+            meta.get("_completion_notice_text") or notice_text
+        ).strip()
+        mention_user_id = str(meta.get("_completion_notice_mention_user_id") or "").strip()
+        if not mention_user_id and mention_user:
             mention_user_id = str(
                 (auto_decision or {}).get("origin_sender_id")
                 or (msg.metadata or {}).get("_origin_sender_id")
@@ -531,6 +533,7 @@ class AgentLoop:
         chat_id: str,
         message_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        sender_id: str = "",
     ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
@@ -541,7 +544,7 @@ class AgentLoop:
                     elif name == "spawn":
                         tool.set_context(channel, chat_id, metadata)
                     else:
-                        tool.set_context(channel, chat_id)
+                        tool.set_context(channel, chat_id, sender_id)
 
     @staticmethod
     def _read_complete_line(text: str, start: int) -> tuple[str | None, int]:
@@ -763,6 +766,7 @@ class AgentLoop:
             return f"模型响应超时，正在自动重试（{attempt}/{max_retries}）…"
         return f"模型服务临时异常，正在自动重试（{attempt}/{max_retries}）…"
 
+
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
@@ -776,6 +780,24 @@ class AgentLoop:
 
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _extract_terminal_key_principle(text: str) -> tuple[str, str | None]:
+        stripped = str(text or "")
+        patterns = [
+            r"\n+(\*\*Key Principle[:：]\*\*\s*.+?)\s*$",
+            r"\n+(Key Principle[:：]\s*.+?)\s*$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, stripped, flags=re.DOTALL)
+            if not match:
+                continue
+            principle_text = (match.group(1) or "").strip()
+            if not principle_text:
+                continue
+            main_text = stripped[:match.start()].rstrip()
+            return main_text, principle_text
+        return stripped, None
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -786,6 +808,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        sender_id: str = "user",
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -845,7 +868,7 @@ class AgentLoop:
                 for tc in context.tool_calls:
                     args_str = json.dumps(tc.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
-                loop_self._set_tool_context(channel, chat_id, message_id)
+                loop_self._set_tool_context(channel, chat_id, message_id, sender_id=sender_id)
 
             def finalize_content(
                 self, context: AgentHookContext, content: str | None
@@ -933,6 +956,7 @@ class AgentLoop:
                 stream_char_count = 0
                 segment_stream_chunk_count = 0
                 segment_stream_char_count = 0
+                terminal_key_principle_text = ""
 
                 async def _emit_pending_stream_end() -> None:
                     nonlocal stream_end_sent, stream_finished_at
@@ -940,16 +964,19 @@ class AgentLoop:
                         return
                     if stream_started_at is not None:
                         stream_finished_at = time.monotonic()
+                    metadata = {
+                        "_stream_end": True,
+                        "_resuming": False,
+                        "_stream_id": f"{stream_base_id}:{stream_segment}",
+                    }
+                    if terminal_key_principle_text:
+                        metadata["_terminal_key_principle_text"] = terminal_key_principle_text
                     await self.bus.publish_outbound(
                         OutboundMessage(
                             channel=msg.channel,
                             chat_id=msg.chat_id,
                             content="",
-                            metadata={
-                                "_stream_end": True,
-                                "_resuming": False,
-                                "_stream_id": f"{stream_base_id}:{stream_segment}",
-                            },
+                            metadata=metadata,
                         )
                     )
                     stream_end_sent = True
@@ -1011,16 +1038,19 @@ class AgentLoop:
                             segment_stream_char_count
                         if stream_started_at is not None:
                             stream_finished_at = time.monotonic()
+                        metadata = {
+                            "_stream_end": True,
+                            "_resuming": resuming,
+                            "_stream_id": _current_stream_id(),
+                        }
+                        if terminal_key_principle_text:
+                            metadata["_terminal_key_principle_text"] = terminal_key_principle_text
                         await self.bus.publish_outbound(
                             OutboundMessage(
                                 channel=msg.channel,
                                 chat_id=msg.chat_id,
                                 content="",
-                                metadata={
-                                    "_stream_end": True,
-                                    "_resuming": resuming,
-                                    "_stream_id": _current_stream_id(),
-                                },
+                                metadata=metadata,
                             )
                         )
                         stream_end_sent = True
@@ -1036,7 +1066,11 @@ class AgentLoop:
                     on_stream_end=on_stream_end,
                 )
                 if response is not None:
+                    terminal_key_principle_text = str(
+                        (response.metadata or {}).get("_terminal_key_principle_text") or ""
+                    ).strip()
                     await _emit_pending_stream_end()
+
                     separate_completion_notice: OutboundMessage | None = None
                     final_segment_silent = on_stream is not None and (
                         segment_stream_chunk_count <= 0 or segment_stream_char_count <= 0
@@ -1297,7 +1331,7 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             await self._maybe_run_pre_reply_consolidation(session, msg=msg)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), msg.metadata)
+            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), msg.metadata, msg.sender_id)
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
@@ -1315,6 +1349,7 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
+                sender_id=msg.sender_id,
             )
             final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
             self._save_turn(session, all_msgs, 1 + len(history))
@@ -1351,6 +1386,9 @@ class AgentLoop:
         preflight_ok = await self._maybe_run_pre_reply_consolidation(session, msg=msg)
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            workspace_cmd = (msg.metadata or {}).get("workspace_agent_cmd")
+            if workspace_cmd == "weather_brief" and tool_hint:
+                return
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
@@ -1387,7 +1425,7 @@ class AgentLoop:
         if computed_runtime:
             tool_metadata["workspace_runtime"] = computed_runtime
         self._set_tool_context(
-            msg.channel, msg.chat_id, msg.metadata.get("message_id"), tool_metadata
+            msg.channel, msg.chat_id, msg.metadata.get("message_id"), tool_metadata, msg.sender_id
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -1446,9 +1484,11 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
+            sender_id=msg.sender_id,
         )
 
         final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
+        final_content, key_principle_notice = self._extract_terminal_key_principle(final_content)
 
         if final_content is None:
             final_content = AgentRunner._user_facing_error_message(
@@ -1484,6 +1524,9 @@ class AgentLoop:
             await self._schedule_harness_auto_continue(msg)
 
         meta = dict(msg.metadata or {})
+        if key_principle_notice:
+            meta["_completion_notice_text"] = key_principle_notice
+            meta["_terminal_key_principle_text"] = key_principle_notice
         if on_stream is not None:
             meta["_streamed"] = True
         return OutboundMessage(
@@ -1623,7 +1666,7 @@ class AgentLoop:
         await self._connect_mcp()
         msg = InboundMessage(
             channel=channel,
-            sender_id="user",
+            sender_id=str((metadata or {}).get("_origin_sender_id") or (metadata or {}).get("sender_id") or "user"),
             chat_id=chat_id,
             content=content,
             metadata=dict(metadata or {}),

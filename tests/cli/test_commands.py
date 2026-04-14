@@ -1464,6 +1464,11 @@ def test_build_weather_brief_prompt_locks_fixed_morning_template_without_calenda
     assert "### 📅 今日日程" in prompt
     assert "📭 **飞书日历暂未接入**" in prompt
     assert "不要调用飞书日历" in prompt
+    assert "/home/admin/.nanobot/workspace/scripts/weather.py" in prompt
+    assert "如果 `重庆南岸区` 获取失败，立即改用固定坐标 29.5,106.5" in prompt
+    assert "不要搜索别的天气工具" in prompt
+    assert "必须保留 `###` 标题、Markdown 表格和 `---` 分隔线" in prompt
+    assert "不要把表格改写成自然语言段落" in prompt
 
 
 def test_gateway_cron_weather_job_uses_fixed_prepared_prompt(monkeypatch, tmp_path: Path) -> None:
@@ -1500,7 +1505,7 @@ def test_gateway_cron_weather_job_uses_fixed_prepared_prompt(monkeypatch, tmp_pa
 
     class _FakeBus:
         async def publish_outbound(self, msg):
-            captured.setdefault("published", []).append((msg.channel, msg.chat_id, msg.content))
+            captured.setdefault("published", []).append((msg.channel, msg.chat_id, msg.content, dict(msg.metadata or {})))
 
         async def consume_outbound(self):
             raise AssertionError("consume_outbound should not be called in this test")
@@ -1526,6 +1531,8 @@ def test_gateway_cron_weather_job_uses_fixed_prepared_prompt(monkeypatch, tmp_pa
                 payload=CronPayload(
                     kind="agent_turn",
                     message="🌤️ 早上好！今日天气预报：重庆南岸区 + 你的飞书日程",
+                    completion_notice_text="🌤️ 天气早报",
+                    creator_sender_id="ou_creator",
                     deliver=True,
                     channel="feishu",
                     to="ou_test",
@@ -1621,8 +1628,18 @@ def test_gateway_cron_weather_job_uses_fixed_prepared_prompt(monkeypatch, tmp_pa
     assert captured["session_key"] == "cron:weather001"
     metadata = captured["kwargs"]["metadata"]
     assert metadata["workspace_agent_cmd"] == "weather_brief"
+    assert metadata["_origin_sender_id"] == "ou_creator"
+    assert metadata["_completion_notice_text"] == "🌤️ 天气早报"
     assert "3月29日那套固定版式" in metadata["workspace_agent_input"]
     assert "📭 **飞书日历暂未接入**" in metadata["workspace_agent_input"]
+    assert captured["published"] == [
+        ("feishu", "ou_test", "weather ok", {}),
+        ("feishu", "ou_test", "", {
+            "_completion_notice": True,
+            "_completion_notice_text": "🌤️ 天气早报",
+            "_completion_notice_mention_user_id": "ou_creator",
+        }),
+    ]
 def test_gateway_sends_startup_online_notice_to_configured_target(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
