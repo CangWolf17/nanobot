@@ -1,8 +1,8 @@
 """Tests for the Dream class — two-phase memory consolidation via AgentRunner."""
 
-import pytest
-
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from nanobot.agent.memory import Dream, MemoryStore
 from nanobot.agent.runner import AgentRunResult
@@ -123,3 +123,23 @@ class TestDreamRun:
         assert "Successfully wrote" in result
         assert (store.workspace / "skills" / "test-skill" / "SKILL.md").exists()
 
+    async def test_auto_commits_when_durable_memory_files_change(self, dream, mock_provider, mock_runner, store):
+        """Dream should create a git-backed memory commit after durable-file edits."""
+        store.append_history("Project X phase changed")
+        dream.git = MagicMock()
+        dream.git.is_initialized.return_value = True
+        mock_provider.chat_with_retry.return_value = MagicMock(content="Update MEMORY")
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[
+                {
+                    "name": "edit_file",
+                    "status": "ok",
+                    "detail": "Successfully edited /tmp/workspace/memory/MEMORY.md",
+                }
+            ],
+        ))
+
+        result = await dream.run()
+
+        assert result is True
+        dream.git.auto_commit.assert_called_once()

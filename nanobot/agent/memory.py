@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import weakref
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from loguru import logger
 from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain
 
 if TYPE_CHECKING:
+    from nanobot.agent.runner import AgentRunSpec
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import Session, SessionManager
 
@@ -74,27 +76,97 @@ def _is_tool_choice_unsupported(content: str | None) -> bool:
 
 
 class MemoryStore:
-    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
+    """Two-layer memory with a JSONL archive plus Dream-managed durable files."""
 
     _MAX_FAILURES_BEFORE_RAW_ARCHIVE = 3
+    _LEGACY_ENTRY_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]\s*(.*)$")
+    _RAW_CONTINUATION_PREFIXES = ("USER:", "ASSISTANT:", "TOOL:", "SYSTEM:")
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, max_history_entries: int = 200):
+        self.workspace = workspace
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
-        self.history_file = self.memory_dir / "HISTORY.md"
+        self.soul_file = workspace / "SOUL.md"
+        self.user_file = workspace / "USER.md"
+        self.history_file = self.memory_dir / "history.jsonl"
+        self.legacy_history_file = self.memory_dir / "HISTORY.md"
+        self._cursor_file = self.memory_dir / ".cursor"
+        self._dream_cursor_file = self.memory_dir / ".dream_cursor"
+        self.max_history_entries = max_history_entries
         self._consecutive_failures = 0
+        self._maybe_migrate_legacy_history()
+
+    @staticmethod
+    def read_file(path: Path) -> str:
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+
+    @staticmethod
+    def write_file(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def read_memory(self) -> str:
+        return self.read_file(self.memory_file)
+
+    def write_memory(self, content: str) -> None:
+        self.write_file(self.memory_file, content)
+
+    def read_soul(self) -> str:
+        return self.read_file(self.soul_file)
+
+    def write_soul(self, content: str) -> None:
+        self.write_file(self.soul_file, content)
+
+    def read_user(self) -> str:
+        return self.read_file(self.user_file)
+
+    def write_user(self, content: str) -> None:
+        self.write_file(self.user_file, content)
 
     def read_long_term(self) -> str:
-        if self.memory_file.exists():
-            return self.memory_file.read_text(encoding="utf-8")
-        return ""
+        return self.read_memory()
 
     def write_long_term(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+        self.write_memory(content)
 
-    def append_history(self, entry: str) -> None:
+    def append_history(self, entry: Any) -> int:
+        cursor = self._next_cursor()
+        record = self._normalize_history_record(entry, cursor=cursor)
         with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(entry.rstrip() + "\n\n")
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.write_file(self._cursor_file, str(cursor))
+        return cursor
+
+    def read_unprocessed_history(self, since_cursor: int = 0) -> list[dict[str, Any]]:
+        entries = self._load_history_entries()
+        return [entry for entry in entries if int(entry.get("cursor", 0) or 0) > since_cursor]
+
+    def compact_history(self) -> None:
+        if self.max_history_entries <= 0:
+            return
+        entries = self._load_history_entries()
+        if len(entries) <= self.max_history_entries:
+            return
+        kept = entries[-self.max_history_entries :]
+        with open(self.history_file, "w", encoding="utf-8") as f:
+            for entry in kept:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        if kept:
+            self.write_file(self._cursor_file, str(int(kept[-1].get("cursor", 0) or 0)))
+
+    def get_last_dream_cursor(self) -> int:
+        raw = self.read_file(self._dream_cursor_file).strip()
+        if not raw:
+            return 0
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+
+    def set_last_dream_cursor(self, cursor: int) -> None:
+        self.write_file(self._dream_cursor_file, str(max(0, int(cursor))))
 
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
@@ -120,7 +192,7 @@ class MemoryStore:
         provider: LLMProvider,
         model: str,
     ) -> bool:
-        """Consolidate the provided message chunk into MEMORY.md + HISTORY.md."""
+        """Consolidate the provided message chunk into MEMORY.md + history.jsonl."""
         if not messages:
             return True
 
@@ -191,12 +263,16 @@ At the end of both `history_entry` and `memory_update`, include the note: `Runti
                 )
                 return self._fail_or_raw_archive(messages)
 
-            entry = _ensure_text(entry).strip()
-            if not entry:
+            normalized_entry = (
+                _ensure_text(entry).strip()
+                if not isinstance(entry, dict)
+                else entry
+            )
+            if (isinstance(normalized_entry, str) and not normalized_entry) or normalized_entry == {}:
                 logger.warning("Memory consolidation: history_entry is empty after normalization")
                 return self._fail_or_raw_archive(messages)
 
-            self.append_history(entry)
+            self.append_history(normalized_entry)
             update = _ensure_text(update)
             if update != current_memory:
                 self.write_long_term(update)
@@ -218,12 +294,305 @@ At the end of both `history_entry` and `memory_update`, include the note: `Runti
         return True
 
     def _raw_archive(self, messages: list[dict]) -> None:
-        """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
+        """Fallback: dump raw messages to the canonical archive without summarization."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.append_history(
             f"[{ts}] [RAW] {len(messages)} messages\n{self._format_messages(messages)}"
         )
         logger.warning("Memory consolidation degraded: raw-archived {} messages", len(messages))
+
+    def _load_history_entries(self) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        if not self.history_file.exists():
+            return entries
+
+        for idx, line in enumerate(self.read_file(self.history_file).splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("Skipping malformed history entry in {}", self.history_file)
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            cursor = parsed.get("cursor")
+            try:
+                parsed["cursor"] = int(cursor) if cursor is not None else idx
+            except (TypeError, ValueError):
+                parsed["cursor"] = idx
+            entries.append(parsed)
+        return entries
+
+    def _next_cursor(self) -> int:
+        raw = self.read_file(self._cursor_file).strip()
+        if raw:
+            try:
+                return int(raw) + 1
+            except ValueError:
+                pass
+        entries = self._load_history_entries()
+        if not entries:
+            return 1
+        return max(int(entry.get("cursor", 0) or 0) for entry in entries) + 1
+
+    def _history_exists_and_nonempty(self) -> bool:
+        return self.history_file.exists() and bool(self.read_file(self.history_file).strip())
+
+    def _maybe_migrate_legacy_history(self) -> None:
+        if not self.legacy_history_file.exists():
+            return
+        if self._history_exists_and_nonempty():
+            return
+
+        legacy_bytes = self.legacy_history_file.read_bytes()
+        legacy_text = legacy_bytes.decode("utf-8", errors="replace")
+        backup = self.memory_dir / "HISTORY.md.bak"
+        backup.write_text(legacy_text, encoding="utf-8")
+        fallback_timestamp = datetime.fromtimestamp(backup.stat().st_mtime).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+
+        entries = self._parse_legacy_history(legacy_text, fallback_timestamp)
+        if entries:
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                for cursor, entry in enumerate(entries, start=1):
+                    record = self._normalize_history_record(entry, cursor=cursor)
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self.write_file(self._cursor_file, str(len(entries)))
+            self.write_file(self._dream_cursor_file, str(len(entries)))
+
+        self.legacy_history_file.unlink()
+
+    @classmethod
+    def _parse_legacy_history(
+        cls,
+        text: str,
+        fallback_timestamp: str,
+    ) -> list[dict[str, str]]:
+        entries: list[dict[str, str]] = []
+        current: dict[str, Any] | None = None
+
+        def flush() -> None:
+            nonlocal current
+            if current is None:
+                return
+            content = "\n".join(current["lines"]).strip()
+            if content:
+                entries.append(
+                    {
+                        "timestamp": current["timestamp"],
+                        "content": content,
+                    }
+                )
+            current = None
+
+        def start(timestamp: str, content: str, *, raw: bool) -> None:
+            nonlocal current
+            current = {"timestamp": timestamp, "lines": [content] if content else [], "raw": raw}
+
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip("\n")
+            stripped = line.strip()
+            if not stripped:
+                flush()
+                continue
+
+            match = cls._LEGACY_ENTRY_RE.match(stripped)
+            if match:
+                timestamp, remainder = match.groups()
+                remainder = remainder.strip()
+                if current is not None and current["raw"] and remainder.startswith(
+                    cls._RAW_CONTINUATION_PREFIXES
+                ):
+                    current["lines"].append(stripped)
+                    continue
+                flush()
+                start(timestamp, remainder, raw=remainder.startswith("[RAW]"))
+                continue
+
+            if stripped.startswith("[") and current is not None and not current["raw"]:
+                flush()
+                start(fallback_timestamp, stripped, raw=False)
+                continue
+
+            if current is None:
+                start(fallback_timestamp, stripped, raw=False)
+                continue
+
+            current["lines"].append(stripped)
+
+        flush()
+        return entries
+
+    @staticmethod
+    def _normalize_history_record(entry: Any, *, cursor: int) -> dict[str, Any]:
+        record: dict[str, Any] = {"cursor": cursor}
+        if isinstance(entry, dict):
+            record.update(entry)
+            record.setdefault("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M"))
+            if "content" not in record and isinstance(record.get("summary"), str):
+                record["content"] = record["summary"]
+            return record
+
+        record["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        record["content"] = _ensure_text(entry).strip()
+        return record
+
+
+class Dream:
+    """Second-stage durable memory governor."""
+
+    _TRACKED_FILES = ["SOUL.md", "USER.md", "memory/MEMORY.md"]
+
+    def __init__(
+        self,
+        store: MemoryStore,
+        provider: LLMProvider,
+        model: str,
+        *,
+        max_batch_size: int = 20,
+        max_iterations: int = 10,
+    ) -> None:
+        from nanobot.agent.runner import AgentRunner
+        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+        from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
+        from nanobot.agent.tools.registry import ToolRegistry
+        from nanobot.utils.gitstore import GitStore
+
+        self.store = store
+        self.provider = provider
+        self.model = model
+        self.max_batch_size = max_batch_size
+        self.max_iterations = max_iterations
+        self._skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
+        self._runner = AgentRunner(provider)
+        self._tools = ToolRegistry()
+        self._tools.register(
+            ReadFileTool(
+                workspace=self.store.workspace,
+                allowed_dir=self.store.workspace,
+                extra_allowed_dirs=[BUILTIN_SKILLS_DIR],
+            )
+        )
+        self._tools.register(
+            EditFileTool(
+                workspace=self.store.workspace,
+                allowed_dir=self.store.workspace,
+            )
+        )
+        self._tools.register(
+            WriteFileTool(
+                workspace=self.store.workspace,
+                allowed_dir=self.store.workspace,
+            )
+        )
+        self.git = getattr(store, "git", None) or GitStore(self.store.workspace, self._TRACKED_FILES)
+        self.store.git = self.git
+
+    async def run(self) -> bool:
+        """Process unread archive entries into governed durable memory updates."""
+        pending = self.store.read_unprocessed_history(
+            since_cursor=self.store.get_last_dream_cursor()
+        )[: self.max_batch_size]
+        if not pending:
+            return False
+
+        analysis = await self._analyze_pending_entries(pending)
+        spec = self._build_run_spec(pending, analysis)
+        result = await self._runner.run(spec)
+        last_cursor = max(int(entry.get("cursor", 0) or 0) for entry in pending)
+        self.store.set_last_dream_cursor(last_cursor)
+        self.store.compact_history()
+        self._maybe_commit_memory_changes(result.tool_events)
+        return True
+
+    async def _analyze_pending_entries(self, pending: list[dict[str, Any]]) -> str:
+        prompt = "\n".join(
+            f"- [{entry.get('cursor', '?')}] {entry.get('timestamp', '?')}: {entry.get('content', '')}"
+            for entry in pending
+        )
+        response = await self.provider.chat_with_retry(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You triage archive entries for durable memory updates. "
+                        "Return concise analysis only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Review these archive entries and identify durable facts, preference changes, "
+                        "conflicts, stale items to remove, and repeated workflows worth turning into skills.\n\n"
+                        f"{prompt}"
+                    ),
+                },
+            ],
+            model=self.model,
+        )
+        return str(response.content or "").strip()
+
+    def _build_run_spec(
+        self,
+        pending: list[dict[str, Any]],
+        analysis: str,
+    ) -> AgentRunSpec:
+        from nanobot.agent.runner import AgentRunSpec
+
+        template_path = Path(__file__).resolve().parent.parent / "templates" / "agent" / "dream_phase2.md"
+        system_prompt = template_path.read_text(encoding="utf-8").replace(
+            "{{ skill_creator_path }}",
+            str(self._skill_creator_path),
+        )
+        archive_lines = "\n".join(
+            f"- [{entry.get('cursor', '?')}] {entry.get('timestamp', '?')}: {entry.get('content', '')}"
+            for entry in pending
+        )
+        user_prompt = f"""## Analysis
+{analysis or "(no additional analysis)"}
+
+## Pending Archive Entries
+{archive_lines}
+
+## Current Files
+### SOUL.md
+{self.store.read_soul() or "(empty)"}
+
+### USER.md
+{self.store.read_user() or "(empty)"}
+
+### memory/MEMORY.md
+{self.store.read_memory() or "(empty)"}
+"""
+        return AgentRunSpec(
+            initial_messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            tools=self._tools,
+            model=self.model,
+            max_iterations=self.max_iterations,
+            fail_on_tool_error=False,
+        )
+
+    def _maybe_commit_memory_changes(self, tool_events: list[dict[str, str]]) -> None:
+        details = [
+            str(event.get("detail") or "").strip()
+            for event in tool_events
+            if str(event.get("status") or "") == "ok"
+        ]
+        if not any(path in detail for detail in details for path in self._TRACKED_FILES):
+            return
+        if not self.git.is_initialized():
+            self.git.init()
+        change_count = sum(
+            1 for path in self._TRACKED_FILES if any(path in detail for detail in details)
+        )
+        message = f"dream: {datetime.now().strftime('%Y-%m-%d')}, {change_count} change(s)"
+        self.git.auto_commit(message)
 
 
 class MemoryConsolidator:

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import datetime as datetime_module
 from datetime import datetime as real_datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
-import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
 
@@ -56,6 +56,16 @@ def test_system_prompt_includes_dynamic_work_mode_block_when_requested(tmp_path)
     assert "## Work Mode" in prompt
     assert "Current workspace work mode: plan" in prompt
     assert "Do not make code or implementation changes" in prompt
+
+
+def test_system_prompt_references_history_jsonl(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt()
+
+    assert "memory/history.jsonl" in prompt
+    assert "memory/HISTORY.md" not in prompt
 
 
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
@@ -139,6 +149,24 @@ def test_runtime_context_includes_sparse_harness_metadata_when_present(tmp_path)
     assert "id: har_0038" in user_content
     assert "phase: executing" in user_content
     assert "auto: true" in user_content
+
+
+def test_runtime_context_can_include_auxiliary_retrieval_block(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="继续推进",
+        retrieval_context="Project memory says Phase 2 owns the retrieval seam.",
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert ContextBuilder._RETRIEVAL_CONTEXT_TAG in user_content
+    assert "Auxiliary background only. Not part of the user's request." in user_content
+    assert "Project memory says Phase 2 owns the retrieval seam." in user_content
+    assert user_content.rstrip().endswith("继续推进")
 
 
 def test_runtime_context_echo_strip_handles_runtime_metadata_block() -> None:

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import os
+import re
 import subprocess
 import time
 from contextlib import AsyncExitStack, nullcontext
@@ -20,10 +20,17 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.policy.dev_discipline import should_disable_concurrent_tools
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.retrieval import (
+    MetadataRetrievalProvider,
+    NullRetrievalProvider,
+    RetrievalProvider,
+    RetrievalRequest,
+    normalize_retrieval_context,
+)
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
+from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -31,9 +38,9 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.command.fastlane import try_workspace_fastlane
-from nanobot.bus.queue import MessageBus
 from nanobot.harness.service import HarnessService
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
@@ -379,6 +386,7 @@ class AgentLoop:
         memory_config: MemoryConsolidationConfig | None = None,
         archive_provider: LLMProvider | None = None,
         archive_model: str | None = None,
+        retrieval_provider: RetrievalProvider | None = None,
         hooks: list[AgentHook] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, MemoryConsolidationConfig, WebSearchConfig
@@ -404,6 +412,8 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._inflight_turns: dict[str, dict[str, Any]] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        self.retrieval_provider = retrieval_provider or NullRetrievalProvider()
+        self._metadata_retrieval_provider = MetadataRetrievalProvider()
 
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
@@ -475,6 +485,50 @@ class AgentLoop:
             return None
         compact_state = self.compact_state.get_state(session)
         return compact_state.strip() or None
+
+    async def _build_retrieval_context(
+        self,
+        *,
+        history: list[dict[str, Any]],
+        current_message: str,
+        channel: str | None,
+        chat_id: str | None,
+        metadata: dict[str, Any] | None,
+        runtime_metadata: dict[str, Any] | None,
+    ) -> str | None:
+        """Resolve optional auxiliary retrieval context through the core seam."""
+        if not self.memory_config.retrieval_enabled:
+            return None
+
+        request = RetrievalRequest(
+            workspace=self.workspace,
+            current_message=current_message,
+            history=history,
+            metadata=dict(metadata or {}),
+            runtime_metadata=dict(runtime_metadata or {}),
+            channel=channel,
+            chat_id=chat_id,
+        )
+
+        metadata_context = await self._metadata_retrieval_provider.build_context(request)
+        if metadata_context:
+            return normalize_retrieval_context(
+                metadata_context,
+                max_chars=self.memory_config.retrieval_max_chars,
+            )
+
+        try:
+            provider_context = await self.retrieval_provider.build_context(request)
+        except Exception as exc:
+            logger.warning("Retrieval provider failed safely: {}", exc)
+            return None
+
+        if not provider_context:
+            return None
+        return normalize_retrieval_context(
+            provider_context,
+            max_chars=self.memory_config.retrieval_max_chars,
+        )
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -1321,6 +1375,15 @@ class AgentLoop:
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), msg.metadata, msg.sender_id)
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
+            runtime_metadata = self._extract_runtime_metadata(msg)
+            retrieval_context = await self._build_retrieval_context(
+                history=history,
+                current_message=msg.content,
+                channel=channel,
+                chat_id=chat_id,
+                metadata=msg.metadata,
+                runtime_metadata=runtime_metadata,
+            )
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content,
@@ -1329,7 +1392,8 @@ class AgentLoop:
                 current_role=current_role,
                 workspace_work_mode=(msg.metadata or {}).get("workspace_work_mode"),
                 compact_state=self._get_session_compact_state(session),
-                runtime_metadata=self._extract_runtime_metadata(msg),
+                runtime_metadata=runtime_metadata,
+                retrieval_context=retrieval_context,
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages,
@@ -1425,6 +1489,15 @@ class AgentLoop:
             if isinstance(prepared_agent_input, str) and prepared_agent_input.strip()
             else msg.content
         )
+        runtime_metadata = self._extract_runtime_metadata(msg)
+        retrieval_context = await self._build_retrieval_context(
+            history=history,
+            current_message=current_message,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            metadata=msg.metadata,
+            runtime_metadata=runtime_metadata,
+        )
         persisted_role = "assistant" if msg.sender_id == "subagent" else "user"
         persisted_turn_content = msg.content
         self._register_inflight_turn(
@@ -1446,7 +1519,8 @@ class AgentLoop:
             chat_id=msg.chat_id,
             workspace_work_mode=(msg.metadata or {}).get("workspace_work_mode"),
             compact_state=self._get_session_compact_state(session),
-            runtime_metadata=self._extract_runtime_metadata(msg),
+            runtime_metadata=runtime_metadata,
+            retrieval_context=retrieval_context,
         )
         persisted_current_content = None
         if current_message != msg.content:
@@ -1458,7 +1532,8 @@ class AgentLoop:
                 chat_id=msg.chat_id,
                 workspace_work_mode=(msg.metadata or {}).get("workspace_work_mode"),
                 compact_state=self._get_session_compact_state(session),
-                runtime_metadata=self._extract_runtime_metadata(msg),
+                runtime_metadata=runtime_metadata,
+                retrieval_context=retrieval_context,
             )
             if persisted_messages:
                 persisted_current_content = persisted_messages[-1].get("content")
@@ -1567,7 +1642,7 @@ class AgentLoop:
         content: list[dict[str, Any]],
         *,
         truncate_text: bool = False,
-        drop_runtime: bool = False,
+        drop_auxiliary: bool = False,
     ) -> list[dict[str, Any]]:
         """Strip volatile multimodal payloads before writing session history."""
         filtered: list[dict[str, Any]] = []
@@ -1577,10 +1652,13 @@ class AgentLoop:
                 continue
 
             if (
-                drop_runtime
+                drop_auxiliary
                 and block.get("type") == "text"
                 and isinstance(block.get("text"), str)
-                and block["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                and (
+                    block["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                    or block["text"].startswith(ContextBuilder._RETRIEVAL_CONTEXT_TAG)
+                )
             ):
                 continue
 
@@ -1619,18 +1697,15 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             elif role == "user":
-                if isinstance(content, str) and content.startswith(
-                    ContextBuilder._RUNTIME_CONTEXT_TAG
-                ):
-                    # Strip the full runtime-context block and keep only the raw user text.
-                    stripped = content[len(ContextBuilder._RUNTIME_CONTEXT_TAG) :].lstrip("\n")
-                    parts = stripped.split("\n\n", 2)
-                    if len(parts) > 2 and parts[2].strip():
-                        entry["content"] = parts[2]
-                    else:
-                        continue
+                if isinstance(content, str):
+                    stripped_content = ContextBuilder.strip_auxiliary_prefixes(content)
+                    if stripped_content != content:
+                        if stripped_content.strip():
+                            entry["content"] = stripped_content
+                        else:
+                            continue
                 if isinstance(content, list):
-                    filtered = self._sanitize_persisted_blocks(content, drop_runtime=True)
+                    filtered = self._sanitize_persisted_blocks(content, drop_auxiliary=True)
                     if not filtered:
                         continue
                     entry["content"] = filtered

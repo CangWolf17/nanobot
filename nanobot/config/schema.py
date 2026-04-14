@@ -211,6 +211,8 @@ class MemoryConsolidationConfig(Base):
     background_timeout_seconds: float = 20.0
     recent_history_fallback_messages: int = 80
     model: str = ""  # Optional dedicated consolidation model. Current special route only supports minimax/...
+    retrieval_enabled: bool = False
+    retrieval_max_chars: int = Field(default=1600, ge=0)
 
 
 class ToolsConfig(Base):

@@ -76,6 +76,25 @@ def test_save_turn_strips_full_runtime_string_context_and_keeps_raw_user_text() 
     assert session.messages[0]["content"] == "/merge"
 
 
+def test_save_turn_strips_runtime_and_retrieval_prefixes() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:retrieval-string")
+    content = (
+        ContextBuilder._build_runtime_context("telegram", "chat1")
+        + "\n\n"
+        + ContextBuilder._build_retrieval_context("Archived note: retrieval is auxiliary.")
+        + "\n\n请继续"
+    )
+
+    loop._save_turn(
+        session,
+        [{"role": "user", "content": content}],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == "请继续"
+
+
     loop = _mk_loop()
     session = Session(key="test:tool-result")
     content = "x" * 12_000
