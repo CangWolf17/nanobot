@@ -95,6 +95,12 @@ def test_feishu_config_reply_to_message_can_be_enabled() -> None:
     assert config.reply_to_message is True
 
 
+def test_detect_msg_format_promotes_multiline_readable_content_to_interactive() -> None:
+    content = "第一段说明\n\n第二段细节\n第三段补充\n第四段结论"
+
+    assert FeishuChannel._detect_msg_format(content) == "interactive"
+
+
 # ---------------------------------------------------------------------------
 # _get_message_content_sync tests
 # ---------------------------------------------------------------------------
@@ -344,6 +350,39 @@ async def test_send_fallback_to_create_when_reply_fails() -> None:
     # reply attempted first, then falls back to create
     channel._client.im.v1.message.reply.assert_called_once()
     channel._client.im.v1.message.create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_send_respects_render_as_text_for_multiline_output() -> None:
+    channel = _make_feishu_channel()
+
+    await channel.send(OutboundMessage(
+        channel="feishu",
+        chat_id="oc_abc",
+        content="line 1\n\nline 2\nline 3\nline 4",
+        metadata={"render_as": "text"},
+    ))
+
+    channel._client.im.v1.message.create.assert_called_once()
+    request = channel._client.im.v1.message.create.call_args.args[0]
+    assert request.body.msg_type == "text"
+    assert json.loads(request.body.content) == {"text": "line 1\n\nline 2\nline 3\nline 4"}
+
+
+@pytest.mark.asyncio
+async def test_send_respects_render_as_card_alias() -> None:
+    channel = _make_feishu_channel()
+
+    await channel.send(OutboundMessage(
+        channel="feishu",
+        chat_id="oc_abc",
+        content="简短但应走卡片",
+        metadata={"render_as": "card"},
+    ))
+
+    channel._client.im.v1.message.create.assert_called_once()
+    request = channel._client.im.v1.message.create.call_args.args[0]
+    assert request.body.msg_type == "interactive"
 
 
 # ---------------------------------------------------------------------------

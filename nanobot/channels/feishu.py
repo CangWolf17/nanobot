@@ -646,6 +646,10 @@ class FeishuChannel(BaseChannel):
         if cls._LIST_RE.search(stripped) or cls._OLIST_RE.search(stripped):
             return "interactive"
 
+        # Multi-paragraph readable content → card (avoid lossy post downgrade)
+        if "\n\n" in stripped or stripped.count("\n") >= 3:
+            return "interactive"
+
         # Has links → post format (supports <a> tags)
         if cls._MD_LINK_RE.search(stripped):
             return "post"
@@ -1273,8 +1277,15 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
-                forced_interactive = (msg.metadata or {}).get("workspace_agent_cmd") == "weather_brief"
-                fmt = "interactive" if forced_interactive else self._detect_msg_format(msg.content)
+                metadata = msg.metadata or {}
+                forced_interactive = metadata.get("workspace_agent_cmd") == "weather_brief"
+                render_as = str(metadata.get("render_as") or "").strip().lower()
+                if forced_interactive or render_as in {"interactive", "card"}:
+                    fmt = "interactive"
+                elif render_as in {"text", "post"}:
+                    fmt = render_as
+                else:
+                    fmt = self._detect_msg_format(msg.content)
 
                 if fmt == "text":
                     # Short plain text – send as simple text message

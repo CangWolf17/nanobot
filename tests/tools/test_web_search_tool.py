@@ -5,6 +5,7 @@ import asyncio
 import httpx
 import pytest
 
+import nanobot.agent.tools.web as web_mod
 from nanobot.agent.tools.web import WebSearchTool
 from nanobot.config.schema import WebSearchConfig
 
@@ -68,19 +69,11 @@ async def test_searxng_search(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_duckduckgo_search(monkeypatch):
-    class MockDDGS:
-        def __init__(self, **kw):
-            pass
-
-        def text(self, query, max_results=5):
-            return [{"title": "DDG Result", "href": "https://ddg.example", "body": "From DuckDuckGo"}]
-
-    monkeypatch.setattr("nanobot.agent.tools.web.DDGS", MockDDGS, raising=False)
-    import nanobot.agent.tools.web as web_mod
-    monkeypatch.setattr(web_mod, "DDGS", MockDDGS, raising=False)
-
-    from ddgs import DDGS
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    monkeypatch.setattr(
+        web_mod,
+        "_run_ddgs_search_in_subprocess",
+        lambda query, n, timeout: [{"title": "DDG Result", "href": "https://ddg.example", "body": "From DuckDuckGo"}],
+    )
 
     tool = _tool(provider="duckduckgo")
     result = await tool.execute(query="hello")
@@ -89,14 +82,11 @@ async def test_duckduckgo_search(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_brave_fallback_to_duckduckgo_when_no_key(monkeypatch):
-    class MockDDGS:
-        def __init__(self, **kw):
-            pass
-
-        def text(self, query, max_results=5):
-            return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
-
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    monkeypatch.setattr(
+        web_mod,
+        "_run_ddgs_search_in_subprocess",
+        lambda query, n, timeout: [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}],
+    )
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
 
     tool = _tool(provider="brave", api_key="")
@@ -163,14 +153,11 @@ async def test_default_provider_is_brave(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_searxng_no_base_url_falls_back(monkeypatch):
-    class MockDDGS:
-        def __init__(self, **kw):
-            pass
-
-        def text(self, query, max_results=5):
-            return [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}]
-
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    monkeypatch.setattr(
+        web_mod,
+        "_run_ddgs_search_in_subprocess",
+        lambda query, n, timeout: [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}],
+    )
     monkeypatch.delenv("SEARXNG_BASE_URL", raising=False)
 
     tool = _tool(provider="searxng", base_url="")
@@ -187,13 +174,6 @@ async def test_searxng_invalid_url():
 
 @pytest.mark.asyncio
 async def test_jina_422_falls_back_to_duckduckgo(monkeypatch):
-    class MockDDGS:
-        def __init__(self, **kw):
-            pass
-
-        def text(self, query, max_results=5):
-            return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
-
     async def mock_get(self, url, **kw):
         assert "s.jina.ai" in str(url)
         raise httpx.HTTPStatusError(
@@ -203,7 +183,11 @@ async def test_jina_422_falls_back_to_duckduckgo(monkeypatch):
         )
 
     monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    monkeypatch.setattr(
+        web_mod,
+        "_run_ddgs_search_in_subprocess",
+        lambda query, n, timeout: [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}],
+    )
 
     tool = _tool(provider="jina", api_key="jina-key")
     result = await tool.execute(query="test")
@@ -212,14 +196,11 @@ async def test_jina_422_falls_back_to_duckduckgo(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_kagi_fallback_to_duckduckgo_when_no_key(monkeypatch):
-    class MockDDGS:
-        def __init__(self, **kw):
-            pass
-
-        def text(self, query, max_results=5):
-            return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
-
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    monkeypatch.setattr(
+        web_mod,
+        "_run_ddgs_search_in_subprocess",
+        lambda query, n, timeout: [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}],
+    )
     monkeypatch.delenv("KAGI_API_KEY", raising=False)
 
     tool = _tool(provider="kagi", api_key="")
@@ -247,23 +228,13 @@ async def test_jina_search_uses_path_encoded_query(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_duckduckgo_timeout_returns_error(monkeypatch):
-    """asyncio.wait_for guard should fire when DDG search hangs."""
-    import threading
-    gate = threading.Event()
+    def _timeout(*args, **kwargs):
+        raise TimeoutError("timed out after 0.2s")
 
-    class HangingDDGS:
-        def __init__(self, **kw):
-            pass
-
-        def text(self, query, max_results=5):
-            gate.wait(timeout=10)
-            return []
-
-    monkeypatch.setattr("ddgs.DDGS", HangingDDGS)
+    monkeypatch.setattr(web_mod, "_run_ddgs_search_in_subprocess", _timeout)
     tool = _tool(provider="duckduckgo")
     tool.config.timeout = 0.2
     result = await tool.execute(query="test")
-    gate.set()
     assert "Error" in result
-
+    assert "timed out" in result
 
