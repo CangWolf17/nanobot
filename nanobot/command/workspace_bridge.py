@@ -18,7 +18,7 @@ from nanobot.config.paths import get_workspace_path
 
 WORKSPACE_ROUTER = Path.home() / ".nanobot" / "workspace" / "scripts" / "router.py"
 BRIDGE_TIMEOUT_SECONDS = 25
-PREPARED_INPUT_CMDS = {"小结", "simplify", "笔记", "merge"}
+PREPARED_INPUT_CMDS = {"plan", "小结", "simplify", "笔记", "merge"}
 POSTPROCESSABLE_AGENT_CMDS = {
     "plan",
     "plan-exec",
