@@ -545,7 +545,7 @@ def test_final_visible_stream_segment_preserves_streamed_marker(tmp_path: Path) 
 
 def test_workspace_harness_runtime_metadata_prefers_durable_auto_from_store(tmp_path: Path) -> None:
     loop, _bus = _make_loop(tmp_path)
-    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses").mkdir(parents=True, exist_ok=True)
     (tmp_path / "harnesses" / "control.json").write_text(
         '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
     )
@@ -571,7 +571,7 @@ def test_workspace_harness_runtime_metadata_falls_back_to_durable_auto_false_whe
     tmp_path: Path,
 ) -> None:
     loop, _bus = _make_loop(tmp_path)
-    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses").mkdir(parents=True, exist_ok=True)
     (tmp_path / "harnesses" / "control.json").write_text(
         '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
     )
@@ -597,7 +597,7 @@ def test_workspace_harness_runtime_metadata_exposes_main_harness_and_next_runnab
     tmp_path: Path,
 ) -> None:
     loop, _bus = _make_loop(tmp_path)
-    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses").mkdir(parents=True, exist_ok=True)
     (tmp_path / "harnesses" / "control.json").write_text(
         '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
     )
@@ -629,7 +629,7 @@ def test_workspace_harness_runtime_metadata_exposes_main_harness_and_next_runnab
 
 def test_workspace_harness_runtime_metadata_includes_subagent_policy_fields(tmp_path: Path) -> None:
     loop, _bus = _make_loop(tmp_path)
-    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses").mkdir(parents=True, exist_ok=True)
     (tmp_path / "harnesses" / "control.json").write_text(
         '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
     )
@@ -661,7 +661,7 @@ def test_workspace_harness_turn_sets_spawn_context_with_computed_runtime_policy(
 ) -> None:
     async def run() -> None:
         loop, _bus = _make_loop(tmp_path)
-        (tmp_path / "harnesses").mkdir(parents=True)
+        (tmp_path / "harnesses").mkdir(parents=True, exist_ok=True)
         (tmp_path / "harnesses" / "control.json").write_text(
             '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
         )
@@ -709,11 +709,51 @@ def test_workspace_harness_turn_sets_spawn_context_with_computed_runtime_policy(
     asyncio.run(run())
 
 
-def test_workspace_harness_auto_reentry_continues_when_project_completed_but_next_child_exists(
+
+
+def test_workspace_harness_auto_uses_active_goal_not_literal_auto_in_prepared_input(
     tmp_path: Path,
 ) -> None:
+    async def run() -> None:
+        loop, _bus = _make_loop(tmp_path)
+        service = HarnessService.for_workspace(tmp_path)
+        service.handle_command(
+            "/harness 修复 interrupt 的真实接线",
+            session_key="feishu:chat1",
+            sender_id="user1",
+        )
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="/harness auto",
+            metadata={"workspace_agent_cmd": "harness", "workspace_harness_auto": True},
+        )
+
+        loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
+        loop._select_history_for_reply = MagicMock(return_value=[])
+        loop._save_turn = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._schedule_background = lambda coro: coro.close()
+        loop.tools.get = MagicMock(return_value=None)
+        captured_messages = []
+
+        async def _run_agent_loop(messages, **kwargs):
+            captured_messages[:] = messages
+            return ("done", [], list(messages) + [{"role": "assistant", "content": "done"}])
+
+        loop._run_agent_loop = _run_agent_loop  # type: ignore[method-assign]
+
+        await loop._process_message(msg)
+
+        assert captured_messages
+        user_content = captured_messages[-1]["content"]
+        assert "requested_goal: auto" not in user_content
+        assert "requested_goal: 修复 interrupt 的真实接线" in user_content
+
+    asyncio.run(run())
     loop, _bus = _make_loop(tmp_path)
-    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses").mkdir(parents=True, exist_ok=True)
     (tmp_path / "harnesses" / "control.json").write_text(
         '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
     )
@@ -742,7 +782,7 @@ def test_workspace_harness_auto_reentry_stops_on_stop_gate_child_even_if_project
     tmp_path: Path,
 ) -> None:
     loop, _bus = _make_loop(tmp_path)
-    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses").mkdir(parents=True, exist_ok=True)
     (tmp_path / "harnesses" / "control.json").write_text(
         '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
     )
@@ -765,6 +805,35 @@ def test_workspace_harness_auto_reentry_stops_on_stop_gate_child_even_if_project
 
     assert decision["should_fire"] is False
     assert decision["reason"] == "blocked"
+
+
+def test_workspace_harness_auto_reentry_stops_for_active_project_without_runnable_child(
+    tmp_path: Path,
+) -> None:
+    loop, _bus = _make_loop(tmp_path)
+    (tmp_path / "harnesses").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "harnesses" / "control.json").write_text(
+        '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
+    )
+    (tmp_path / "harnesses" / "index.json").write_text(
+        '{"harnesses":{'
+        '"har_0001":{"id":"har_0001","type":"project","status":"active","phase":"planning","awaiting_user":false,"blocked":false,"auto":true,"queue_order":1}'
+        "}}",
+        encoding="utf-8",
+    )
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="user1",
+        chat_id="chat1",
+        content="/harness auto",
+        metadata={"workspace_agent_cmd": "harness", "workspace_harness_auto": True},
+    )
+
+    decision = loop._decide_harness_auto_reentry(msg)
+
+    assert decision["should_fire"] is False
+    assert decision["reason"] == "no_open_child"
+
 
 
 def test_workspace_harness_auto_continue_decision_comes_from_service_not_workspace_projection(
@@ -831,7 +900,7 @@ def test_workspace_harness_runtime_metadata_prefers_queue_order_over_updated_at_
     tmp_path: Path,
 ) -> None:
     loop, _bus = _make_loop(tmp_path)
-    (tmp_path / "harnesses").mkdir(parents=True)
+    (tmp_path / "harnesses").mkdir(parents=True, exist_ok=True)
     (tmp_path / "harnesses" / "control.json").write_text(
         '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
     )
@@ -878,6 +947,59 @@ def test_workspace_harness_postprocess_uses_service_apply_closeout(tmp_path: Pat
     processed = loop._postprocess_workspace_agent_output(msg, update)
 
     assert "focused tests passed" in processed
+
+
+
+
+@pytest.mark.asyncio
+async def test_workspace_harness_auto_process_message_does_not_publish_follow_up_without_runnable_child(
+    tmp_path: Path,
+) -> None:
+    loop, bus = _make_loop(tmp_path)
+    (tmp_path / "harnesses").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "harnesses" / "control.json").write_text(
+        '{"active_harness_id":"har_0001","updated_at":""}', encoding="utf-8"
+    )
+    (tmp_path / "harnesses" / "index.json").write_text(
+        '{"harnesses":{'
+        '"har_0001":{"id":"har_0001","type":"project","status":"active","phase":"planning","awaiting_user":false,"blocked":false,"auto":true,"queue_order":1}'
+        "}}",
+        encoding="utf-8",
+    )
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="user1",
+        chat_id="chat1",
+        content="/harness auto",
+        metadata={
+            "workspace_agent_cmd": "harness",
+            "workspace_harness_auto": True,
+            "workspace_agent_input": "prepared harness auto input",
+            "workspace_harness_id": "har_0001",
+        },
+    )
+
+    loop._run_pre_reply_consolidation = AsyncMock(return_value=True)
+    loop._select_history_for_reply = MagicMock(return_value=[])
+    loop._save_turn = MagicMock()
+    loop.sessions.save = MagicMock()
+    loop._schedule_background = lambda coro: coro.close()
+    loop.tools.get = MagicMock(return_value=None)
+    loop._run_agent_loop = AsyncMock(
+        return_value=(
+            "raw-summary",
+            [],
+            [{"role": "assistant", "content": "raw-summary"}],
+        )
+    )
+
+    result = await loop._process_message(msg)
+
+    assert result is not None
+    assert result.content == "raw-summary"
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(bus.consume_inbound(), timeout=0.05)
+
 
 
 def test_workspace_harness_auto_continue_follow_up_uses_service_origin_sender(

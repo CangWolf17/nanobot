@@ -19,6 +19,7 @@ from nanobot.agent.compact_state import CompactStateManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.om_brain import build_agent_brain_context
 from nanobot.agent.policy.dev_discipline import should_disable_concurrent_tools
 from nanobot.agent.retrieval import (
     MetadataRetrievalProvider,
@@ -354,6 +355,8 @@ class AgentLoop:
         meta["_completion_notice_text"] = str(
             meta.get("_completion_notice_text") or notice_text
         ).strip()
+        if is_harness_auto:
+            meta["_harness_closeout"] = True
         mention_user_id = str(meta.get("_completion_notice_mention_user_id") or "").strip()
         if not mention_user_id and mention_user:
             mention_user_id = str(
@@ -510,25 +513,37 @@ class AgentLoop:
             chat_id=chat_id,
         )
 
+        parts: list[str] = []
+
         metadata_context = await self._metadata_retrieval_provider.build_context(request)
         if metadata_context:
-            return normalize_retrieval_context(
+            normalized_metadata = normalize_retrieval_context(
                 metadata_context,
                 max_chars=self.memory_config.retrieval_max_chars,
             )
+            if normalized_metadata:
+                parts.append(normalized_metadata)
+        else:
+            try:
+                provider_context = await self.retrieval_provider.build_context(request)
+            except Exception as exc:
+                logger.warning("Retrieval provider failed safely: {}", exc)
+            else:
+                if provider_context:
+                    normalized_provider = normalize_retrieval_context(
+                        provider_context,
+                        max_chars=self.memory_config.retrieval_max_chars,
+                    )
+                    if normalized_provider:
+                        parts.append(normalized_provider)
 
-        try:
-            provider_context = await self.retrieval_provider.build_context(request)
-        except Exception as exc:
-            logger.warning("Retrieval provider failed safely: {}", exc)
-            return None
+        brain_context = build_agent_brain_context()
+        if brain_context:
+            parts.append(brain_context)
 
-        if not provider_context:
+        if not parts:
             return None
-        return normalize_retrieval_context(
-            provider_context,
-            max_chars=self.memory_config.retrieval_max_chars,
-        )
+        return "\n\n".join(parts)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -1484,6 +1499,23 @@ class AgentLoop:
 
         history = self._select_history_for_reply(session, preflight_ok=preflight_ok)
         prepared_agent_input = (msg.metadata or {}).get("workspace_agent_input")
+        if not (isinstance(prepared_agent_input, str) and prepared_agent_input.strip()):
+            meta = msg.metadata or {}
+            if meta.get("workspace_agent_cmd") == "harness" and bool(
+                meta.get("workspace_harness_auto")
+            ):
+                try:
+                    harness_result = HarnessService.for_workspace(self.workspace).handle_command(
+                        msg.content,
+                        session_key=msg.session_key,
+                        sender_id=msg.sender_id,
+                    )
+                except ValueError:
+                    harness_result = None
+                if harness_result is not None:
+                    rebuilt_input = str(getattr(harness_result, "prepared_input", "") or "").strip()
+                    if rebuilt_input:
+                        prepared_agent_input = rebuilt_input
         current_message = (
             prepared_agent_input
             if isinstance(prepared_agent_input, str) and prepared_agent_input.strip()
