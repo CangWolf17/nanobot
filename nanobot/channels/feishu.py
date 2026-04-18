@@ -1,12 +1,14 @@
 """Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
 
 import asyncio
+import importlib
 import json
 import os
 import re
 import threading
 import time
 import uuid
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +35,32 @@ MSG_TYPE_MAP = {
     "file": "[file]",
     "sticker": "[sticker]",
 }
+
+_LARK_OAPI_UPSTREAM_WARNING = (
+    r"datetime\.datetime\.utcfromtimestamp\(\) is deprecated and scheduled for removal.*"
+)
+_LARK_OAPI_UPSTREAM_WARNING_MODULE = (
+    r"lark_oapi\.ws\.pb\.google\.protobuf\.internal\.well_known_types"
+)
+
+
+def _import_lark_oapi_module(module_name: str) -> Any:
+    """Import lark-oapi modules while silencing a known upstream deprecation warning."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_LARK_OAPI_UPSTREAM_WARNING,
+            category=DeprecationWarning,
+            module=_LARK_OAPI_UPSTREAM_WARNING_MODULE,
+        )
+        return importlib.import_module(module_name)
+
+
+def _import_lark_im_v1(*names: str) -> Any:
+    module = _import_lark_oapi_module("lark_oapi.api.im.v1")
+    if len(names) == 1:
+        return getattr(module, names[0])
+    return tuple(getattr(module, name) for name in names)
 
 
 def _extract_share_card_content(content_json: dict, msg_type: str) -> str:
@@ -322,7 +350,7 @@ class FeishuChannel(BaseChannel):
             logger.error("Feishu app_id and app_secret not configured")
             return
 
-        import lark_oapi as lark
+        lark = _import_lark_oapi_module("lark_oapi")
         self._running = True
         self._loop = asyncio.get_running_loop()
 
@@ -366,7 +394,7 @@ class FeishuChannel(BaseChannel):
         # "This event loop is already running" errors.
         def run_ws():
             import time
-            import lark_oapi.ws.client as _lark_ws_client
+            _lark_ws_client = _import_lark_oapi_module("lark_oapi.ws.client")
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
             # Patch the module-level loop used by lark's ws Client.start()
@@ -426,7 +454,11 @@ class FeishuChannel(BaseChannel):
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
         """Sync helper for adding reaction (runs in thread pool)."""
-        from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji
+        CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji = _import_lark_im_v1(
+            "CreateMessageReactionRequest",
+            "CreateMessageReactionRequestBody",
+            "Emoji",
+        )
         try:
             request = CreateMessageReactionRequest.builder() \
                 .message_id(message_id) \
@@ -715,7 +747,10 @@ class FeishuChannel(BaseChannel):
 
     def _upload_image_sync(self, file_path: str) -> str | None:
         """Upload an image to Feishu and return the image_key."""
-        from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
+        CreateImageRequest, CreateImageRequestBody = _import_lark_im_v1(
+            "CreateImageRequest",
+            "CreateImageRequestBody",
+        )
         try:
             with open(file_path, "rb") as f:
                 request = CreateImageRequest.builder() \
@@ -739,7 +774,10 @@ class FeishuChannel(BaseChannel):
 
     def _upload_file_sync(self, file_path: str) -> str | None:
         """Upload a file to Feishu and return the file_key."""
-        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
+        CreateFileRequest, CreateFileRequestBody = _import_lark_im_v1(
+            "CreateFileRequest",
+            "CreateFileRequestBody",
+        )
         ext = os.path.splitext(file_path)[1].lower()
         file_type = self._FILE_TYPE_MAP.get(ext, "stream")
         file_name = os.path.basename(file_path)
@@ -767,7 +805,7 @@ class FeishuChannel(BaseChannel):
 
     def _download_image_sync(self, message_id: str, image_key: str) -> tuple[bytes | None, str | None]:
         """Download an image from Feishu message by message_id and image_key."""
-        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        GetMessageResourceRequest = _import_lark_im_v1("GetMessageResourceRequest")
         try:
             request = GetMessageResourceRequest.builder() \
                 .message_id(message_id) \
@@ -792,7 +830,7 @@ class FeishuChannel(BaseChannel):
         self, message_id: str, file_key: str, resource_type: str = "file"
     ) -> tuple[bytes | None, str | None]:
         """Download a file/audio/media from a Feishu message by message_id and file_key."""
-        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        GetMessageResourceRequest = _import_lark_im_v1("GetMessageResourceRequest")
 
         # Feishu API only accepts 'image' or 'file' as type parameter
         # Convert 'audio' to 'file' for API compatibility
@@ -872,7 +910,7 @@ class FeishuChannel(BaseChannel):
 
         Returns a "[Reply to: ...]" context string, or None on failure.
         """
-        from lark_oapi.api.im.v1 import GetMessageRequest
+        GetMessageRequest = _import_lark_im_v1("GetMessageRequest")
         try:
             request = GetMessageRequest.builder().message_id(message_id).build()
             response = self._client.im.v1.message.get(request)
@@ -913,7 +951,10 @@ class FeishuChannel(BaseChannel):
 
     def _reply_message_sync(self, parent_message_id: str, msg_type: str, content: str) -> bool:
         """Reply to an existing Feishu message using the Reply API (synchronous)."""
-        from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+        ReplyMessageRequest, ReplyMessageRequestBody = _import_lark_im_v1(
+            "ReplyMessageRequest",
+            "ReplyMessageRequestBody",
+        )
         try:
             request = ReplyMessageRequest.builder() \
                 .message_id(parent_message_id) \
@@ -938,7 +979,10 @@ class FeishuChannel(BaseChannel):
 
     def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str | None:
         """Send a single message and return the message_id on success."""
-        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        CreateMessageRequest, CreateMessageRequestBody = _import_lark_im_v1(
+            "CreateMessageRequest",
+            "CreateMessageRequestBody",
+        )
         try:
             request = CreateMessageRequest.builder() \
                 .receive_id_type(receive_id_type) \

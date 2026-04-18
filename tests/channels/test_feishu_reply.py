@@ -101,6 +101,26 @@ def test_detect_msg_format_promotes_multiline_readable_content_to_interactive() 
     assert FeishuChannel._detect_msg_format(content) == "interactive"
 
 
+def test_import_lark_oapi_module_installs_targeted_warning_filter() -> None:
+    from nanobot.channels import feishu as feishu_module
+
+    sentinel = object()
+    with (
+        patch.object(feishu_module.warnings, "filterwarnings") as mock_filter,
+        patch.object(feishu_module.importlib, "import_module", return_value=sentinel) as mock_import,
+    ):
+        result = feishu_module._import_lark_oapi_module("lark_oapi.api.im.v1")
+
+    assert result is sentinel
+    mock_import.assert_called_once_with("lark_oapi.api.im.v1")
+    mock_filter.assert_called_once()
+    args, kwargs = mock_filter.call_args
+    assert args == ("ignore",)
+    assert kwargs["category"] is DeprecationWarning
+    assert "utcfromtimestamp" in kwargs["message"]
+    assert "well_known_types" in kwargs["module"]
+
+
 # ---------------------------------------------------------------------------
 # _get_message_content_sync tests
 # ---------------------------------------------------------------------------
