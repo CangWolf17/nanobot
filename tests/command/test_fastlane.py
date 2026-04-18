@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from nanobot.bus.events import InboundMessage
-from nanobot.command.fastlane import try_workspace_fastlane
+from nanobot.command.fastlane import build_workspace_env, try_workspace_fastlane
 
 
 def _msg(content: str) -> InboundMessage:
@@ -73,5 +73,39 @@ def test_fastlane_ignores_non_whitelisted_command(tmp_path: Path) -> None:
     ):
         (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
         result = asyncio.run(try_workspace_fastlane(_msg("/merge"), "/merge"))
+
+    assert result is None
+
+
+def test_build_workspace_env_includes_runtime_config_path_when_present(tmp_path: Path) -> None:
+    runtime_home = tmp_path / "home"
+    runtime_config = runtime_home / ".nanobot" / "config.json"
+    runtime_config.parent.mkdir(parents=True, exist_ok=True)
+    runtime_config.write_text("{}", encoding="utf-8")
+
+    with patch("nanobot.command.fastlane.Path.home", return_value=runtime_home):
+        env = build_workspace_env(_msg("/help model"))
+
+    assert env["NANOBOT_CHANNEL"] == "feishu"
+    assert env["NANOBOT_CHAT_ID"] == "ou_test"
+    assert env["NANOBOT_MESSAGE_ID"] == "om_test"
+    assert env["NANOBOT_CONFIG_PATH"] == str(runtime_config)
+
+
+def test_fastlane_ignores_backend_specific_decision_kind(tmp_path: Path) -> None:
+    decision = MagicMock(
+        stdout='{"kind":"oapi_exec","operation":"message.send","backend":"oapi"}\n',
+        stderr="",
+        returncode=0,
+    )
+
+    with (
+        patch("nanobot.command.fastlane.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.fastlane.subprocess.run", return_value=decision),
+    ):
+        (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
+        result = asyncio.run(
+            try_workspace_fastlane(_msg("/lark message.send --text hi"), "/lark message.send --text hi")
+        )
 
     assert result is None

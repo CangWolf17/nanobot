@@ -1,5 +1,7 @@
 import asyncio
+import importlib
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -649,3 +651,50 @@ def test_workspace_bridge_non_slash_continuation_prepares_input_with_loop_worksp
     ]
     env = mock_run.call_args.kwargs["env"]
     assert env["NANOBOT_MESSAGE_ID"] == "om_test"
+
+
+def test_workspace_bridge_cross_repo_lark_surface_still_uses_cli_backend() -> None:
+    workspace_root = Path.home() / ".nanobot" / "workspace"
+    inserted = False
+    if str(workspace_root) not in sys.path:
+        sys.path.insert(0, str(workspace_root))
+        inserted = True
+    try:
+        lark_cmd = importlib.import_module("scripts.lark_cmd")
+        cli_calls: list[tuple[str, dict[str, object], dict[str, object] | None, Path | None]] = []
+
+        def _fake_cli_backend(
+            operation: str,
+            values: dict[str, object],
+            *,
+            body: dict[str, object] | None = None,
+            runner=None,
+            cwd: Path | None = None,
+        ) -> dict[str, object]:
+            cli_calls.append((operation, values, body, cwd))
+            return {"ok": True, "backend": "cli"}
+
+        client_factory = MagicMock(side_effect=AssertionError("OAPI client should stay unused"))
+        args = lark_cmd._parse_args(
+            ["message.send", "--receive-id", "oc_bridge", "--text", "transport proof"]
+        )
+
+        with patch.object(lark_cmd, "run_phase1_lark_cli_operation", side_effect=_fake_cli_backend):
+            result = lark_cmd.run_operation(args, client_factory=client_factory, root=workspace_root)
+
+        assert result == {"ok": True, "backend": "cli"}
+        client_factory.assert_not_called()
+        assert len(cli_calls) == 1
+        operation, values, body, cwd = cli_calls[0]
+        assert operation == "message.send"
+        assert values["receive_id"] == "oc_bridge"
+        assert values["receive_id_type"] == "chat_id"
+        assert body == {
+            "receive_id": "oc_bridge",
+            "msg_type": "text",
+            "content": "{\"text\": \"transport proof\"}",
+        }
+        assert cwd == workspace_root
+    finally:
+        if inserted:
+            sys.path.remove(str(workspace_root))

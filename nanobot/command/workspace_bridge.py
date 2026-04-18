@@ -1,7 +1,7 @@
-"""Workspace slash-command bridge.
+"""Workspace slash-command transport bridge.
 
-Forward unknown slash commands to the workspace router script before they fall
-through to the LLM.
+Forward unknown slash commands to the workspace router before they fall
+through to the LLM, while keeping capability/backend truth in the workspace.
 """
 
 from __future__ import annotations

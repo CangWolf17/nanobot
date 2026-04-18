@@ -1,4 +1,8 @@
-"""Workspace fastlane helpers for read-only slash commands."""
+"""Workspace fastlane transport helpers for read-only slash commands.
+
+This module only carries runtime -> workspace transport decisions. The
+workspace router still owns capability truth and backend selection.
+"""
 
 from __future__ import annotations
 
@@ -17,12 +21,17 @@ FASTLANE_ROUTE_TIMEOUT_SECONDS = 5
 
 
 def build_workspace_env(msg: InboundMessage) -> dict[str, str]:
-    return {
+    """Build transport metadata for workspace-owned command execution."""
+    env = {
         **os.environ.copy(),
         "NANOBOT_CHANNEL": msg.channel,
         "NANOBOT_CHAT_ID": msg.chat_id,
         "NANOBOT_MESSAGE_ID": msg.metadata.get("message_id", ""),
     }
+    runtime_config = Path.home() / ".nanobot" / "config.json"
+    if runtime_config.exists() and not env.get("NANOBOT_CONFIG_PATH"):
+        env["NANOBOT_CONFIG_PATH"] = str(runtime_config)
+    return env
 
 
 def _load_fastlane_decision(raw: str, env: dict[str, str] | None) -> dict[str, Any] | None:
