@@ -447,6 +447,41 @@ def test_workspace_bridge_prepares_notes_agent_input(tmp_path: Path) -> None:
     assert mock_run.call_args_list[1].args[0][-2:] == ["--prepare-agent-input", "笔记"]
 
 
+def test_workspace_bridge_prepares_sync_agent_input(tmp_path: Path) -> None:
+    completed = MagicMock(stdout="[AGENT]sync\n", stderr="", returncode=0)
+    prepared = MagicMock(stdout="prepared sync input\n", stderr="", returncode=0)
+    ctx = CommandContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="ou_test",
+            content="/sync 整理今天的 follow-ups",
+            metadata={"message_id": "om_test"},
+        ),
+        session=None,
+        key="feishu:ou_test",
+        raw="/sync 整理今天的 follow-ups",
+        args="整理今天的 follow-ups",
+        loop=None,
+    )
+
+    with (
+        patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.workspace_bridge.try_workspace_fastlane", return_value=None),
+        patch(
+            "nanobot.command.workspace_bridge.subprocess.run",
+            side_effect=[completed, prepared],
+        ) as mock_run,
+    ):
+        (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
+        result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is None
+    assert ctx.msg.metadata["workspace_agent_cmd"] == "sync"
+    assert ctx.msg.metadata["workspace_agent_input"] == "prepared sync input"
+    assert mock_run.call_args_list[1].args[0][-2:] == ["--prepare-agent-input", "sync"]
+
+
 def test_workspace_bridge_prepares_merge_agent_input(tmp_path: Path) -> None:
     completed = MagicMock(stdout="[AGENT]merge\n", stderr="", returncode=0)
     prepared = MagicMock(stdout="prepared merge input\n", stderr="", returncode=0)
