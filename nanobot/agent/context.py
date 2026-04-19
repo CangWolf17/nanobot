@@ -14,7 +14,7 @@ from nanobot.agent.policy.dev_discipline import (
 )
 from nanobot.agent.skills import SkillsLoader
 from nanobot.config.paths import get_workspace_bootstrap_files
-from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
+from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime, safe_filename
 
 
 class ContextBuilder:
@@ -33,6 +33,7 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         workspace_work_mode: str | None = None,
         compact_state: str | None = None,
+        session_key: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
@@ -78,6 +79,11 @@ Skills with available="false" need dependencies installed first - you can try in
         work_mode = self._build_work_mode_block(workspace_work_mode)
         if work_mode:
             parts.append(work_mode)
+
+        # Workflow context injection
+        workflow_ctx = self._build_workflow_contexts(session_key)
+        if workflow_ctx:
+            parts.append(workflow_ctx)
 
         return "\n\n---\n\n".join(parts)
 
@@ -258,6 +264,51 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             + "\n".join(cleaned_lines)
         )
 
+    def _build_workflow_contexts(self, session_key: str | None) -> str:
+        """Build [Workflow Context] blocks for all active workflows.
+
+        Reads sessions/{session_key}/workflow_state.json and injects rules
+        from each active workflow's skill_ref file into the system prompt.
+        """
+        if not session_key:
+            return ""
+        import json
+
+        safe_key = safe_filename(session_key)
+        state_path = self.workspace / "sessions" / safe_key / "workflow_state.json"
+        if not state_path.exists():
+            return ""
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return ""
+
+        workflows = state.get("workflows", []) if isinstance(state, dict) else []
+        active = [w for w in workflows if w.get("active")]
+        if not active:
+            return ""
+
+        blocks = []
+        for w in active:
+            skill_name = w.get("skill_name", "")
+            skill_ref = w.get("skill_ref", "")
+            if not skill_name or not skill_ref:
+                continue
+            file_path = self.workspace / skill_ref
+            if not file_path.exists():
+                continue
+            try:
+                content = file_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            blocks.append(
+                f"[Workflow Context — {skill_name}]\n"
+                f"来源：{skill_ref}\n\n"
+                f"{content}"
+            )
+
+        return "\n\n---\n\n".join(blocks)
+
     @classmethod
     def strip_auxiliary_prefixes(cls, text: str) -> str:
         """Strip synthetic runtime/retrieval blocks from a persisted user string."""
@@ -297,6 +348,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         compact_state: str | None = None,
         runtime_metadata: dict[str, Any] | None = None,
         retrieval_context: str | None = None,
+        session_key: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, runtime_metadata)
@@ -324,6 +376,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
                     skill_names,
                     workspace_work_mode=workspace_work_mode,
                     compact_state=compact_state,
+                    session_key=session_key,
                 ),
             },
             *history,

@@ -38,6 +38,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.workflow_state import WorkflowStateTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -569,6 +570,7 @@ class AgentLoop:
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(WorkflowStateTool())
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
@@ -606,7 +608,7 @@ class AgentLoop:
         sender_id: str = "",
     ) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "manage_workflow_state"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     if name == "message":
@@ -1409,6 +1411,7 @@ class AgentLoop:
                 compact_state=self._get_session_compact_state(session),
                 runtime_metadata=runtime_metadata,
                 retrieval_context=retrieval_context,
+                session_key=msg.session_key,
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages,
@@ -1553,6 +1556,7 @@ class AgentLoop:
             compact_state=self._get_session_compact_state(session),
             runtime_metadata=runtime_metadata,
             retrieval_context=retrieval_context,
+            session_key=msg.session_key,
         )
         persisted_current_content = None
         if current_message != msg.content:
@@ -1566,6 +1570,7 @@ class AgentLoop:
                 compact_state=self._get_session_compact_state(session),
                 runtime_metadata=runtime_metadata,
                 retrieval_context=retrieval_context,
+                session_key=msg.session_key,
             )
             if persisted_messages:
                 persisted_current_content = persisted_messages[-1].get("content")
