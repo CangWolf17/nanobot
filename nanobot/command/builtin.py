@@ -53,6 +53,19 @@ def _resolve_workspace_root(loop: object | None = None) -> Path:
     return get_workspace_path(getattr(loop, "workspace", None) if loop is not None else None)
 
 
+def _clear_workflow_state(loop: object, session_key: str) -> None:
+    """Clear session-scoped workflow state on /new."""
+    try:
+        from nanobot.utils.helpers import safe_filename
+        safe_key = safe_filename(session_key)
+        workspace = _resolve_workspace_root(loop)
+        state_path = workspace / "sessions" / safe_key / "workflow_state.json"
+        if state_path.exists():
+            state_path.unlink()
+    except Exception:
+        pass
+
+
 async def _cancel_session_work(ctx: CommandContext) -> tuple[int, int, int]:
     """Cancel active loop tasks and subagents for the current session."""
     loop = ctx.loop
@@ -242,6 +255,9 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     )
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
+
+    # Clear session-scoped workflow states on /new
+    _clear_workflow_state(loop, msg.session_key)
     if snapshot:
         archive = getattr(getattr(loop, "consolidator", None), "archive", None)
         if archive is None:
