@@ -47,6 +47,20 @@ def is_default_workspace(workspace: str | Path | None) -> bool:
     return current.resolve(strict=False) == default.resolve(strict=False)
 
 
+def get_workspace_bootstrap_files(workspace: str | Path | None) -> tuple[str, ...]:
+    """Return the allowed root bootstrap/template files for a workspace profile."""
+    if is_default_workspace(workspace):
+        return ("AGENTS.md", "SOUL.md")
+    return ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md")
+
+
+def get_workspace_memory_tracked_files(workspace: str | Path | None) -> tuple[str, ...]:
+    """Return the durable memory-managed files for a workspace profile."""
+    if is_default_workspace(workspace):
+        return ("SOUL.md", "memory/MEMORY.md")
+    return ("SOUL.md", "USER.md", "memory/MEMORY.md")
+
+
 def get_cli_history_path() -> Path:
     """Return the shared CLI history file path."""
     return Path.home() / ".nanobot" / "history" / "cli_history"

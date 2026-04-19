@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
+from nanobot.config.paths import get_workspace_memory_tracked_files
 from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain
 
 if TYPE_CHECKING:
@@ -87,6 +88,8 @@ class MemoryStore:
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.soul_file = workspace / "SOUL.md"
+        self._tracked_files = tuple(get_workspace_memory_tracked_files(workspace))
+        self._user_enabled = "USER.md" in self._tracked_files
         self.user_file = workspace / "USER.md"
         self.history_file = self.memory_dir / "history.jsonl"
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
@@ -120,9 +123,13 @@ class MemoryStore:
         self.write_file(self.soul_file, content)
 
     def read_user(self) -> str:
+        if not self._user_enabled:
+            return ""
         return self.read_file(self.user_file)
 
     def write_user(self, content: str) -> None:
+        if not self._user_enabled:
+            return
         self.write_file(self.user_file, content)
 
     def read_long_term(self) -> str:
@@ -444,8 +451,6 @@ At the end of both `history_entry` and `memory_update`, include the note: `Runti
 class Dream:
     """Second-stage durable memory governor."""
 
-    _TRACKED_FILES = ["SOUL.md", "USER.md", "memory/MEMORY.md"]
-
     def __init__(
         self,
         store: MemoryStore,
@@ -466,6 +471,7 @@ class Dream:
         self.model = model
         self.max_batch_size = max_batch_size
         self.max_iterations = max_iterations
+        self._tracked_files = tuple(get_workspace_memory_tracked_files(self.store.workspace))
         self._skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
         self._runner = AgentRunner(provider)
         self._tools = ToolRegistry()
@@ -488,7 +494,7 @@ class Dream:
                 allowed_dir=self.store.workspace,
             )
         )
-        self.git = getattr(store, "git", None) or GitStore(self.store.workspace, self._TRACKED_FILES)
+        self.git = getattr(store, "git", None) or GitStore(self.store.workspace, self._tracked_files)
         self.store.git = self.git
 
     async def run(self) -> bool:
@@ -551,6 +557,14 @@ class Dream:
             f"- [{entry.get('cursor', '?')}] {entry.get('timestamp', '?')}: {entry.get('content', '')}"
             for entry in pending
         )
+        current_files_sections = [
+            "### SOUL.md",
+            self.store.read_soul() or "(empty)",
+        ]
+        user_text = self.store.read_user()
+        if user_text:
+            current_files_sections.extend(["", "### USER.md", user_text])
+        current_files_sections.extend(["", "### memory/MEMORY.md", self.store.read_memory() or "(empty)"])
         user_prompt = f"""## Analysis
 {analysis or "(no additional analysis)"}
 
@@ -558,14 +572,7 @@ class Dream:
 {archive_lines}
 
 ## Current Files
-### SOUL.md
-{self.store.read_soul() or "(empty)"}
-
-### USER.md
-{self.store.read_user() or "(empty)"}
-
-### memory/MEMORY.md
-{self.store.read_memory() or "(empty)"}
+{chr(10).join(current_files_sections)}
 """
         return AgentRunSpec(
             initial_messages=[
@@ -584,12 +591,12 @@ class Dream:
             for event in tool_events
             if str(event.get("status") or "") == "ok"
         ]
-        if not any(path in detail for detail in details for path in self._TRACKED_FILES):
+        if not any(path in detail for detail in details for path in self._tracked_files):
             return
         if not self.git.is_initialized():
             self.git.init()
         change_count = sum(
-            1 for path in self._TRACKED_FILES if any(path in detail for detail in details)
+            1 for path in self._tracked_files if any(path in detail for detail in details)
         )
         message = f"dream: {datetime.now().strftime('%Y-%m-%d')}, {change_count} change(s)"
         self.git.auto_commit(message)

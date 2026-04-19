@@ -13,13 +13,12 @@ from nanobot.agent.policy.dev_discipline import (
     load_runtime_protocol,
 )
 from nanobot.agent.skills import SkillsLoader
+from nanobot.config.paths import get_workspace_bootstrap_files
 from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
 
 
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
-
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _RETRIEVAL_CONTEXT_TAG = "[Retrieved Context — auxiliary memory, not user-authored]"
 
@@ -229,6 +228,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             "- Treat `Channel` and `Chat ID` as opaque routing metadata. Use them only for reply delivery, tool targeting, or channel-specific formatting when explicitly relevant.",
             "- Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\".",
             "- If this block conflicts with the conversation content, trust the conversation content.",
+            "- Do not treat this block as evidence of user-visible output, leakage, or a product bug unless the user explicitly reports seeing it or outbound/send logs confirm it.",
             "",
             f"Current Time: {current_time_str(timezone)}",
         ]
@@ -276,7 +276,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         """Load all bootstrap files from workspace."""
         parts = []
 
-        for filename in self.BOOTSTRAP_FILES:
+        for filename in get_workspace_bootstrap_files(self.workspace):
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")

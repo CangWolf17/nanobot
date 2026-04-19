@@ -449,6 +449,10 @@ def build_status_content(
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
     """Sync bundled templates to workspace. Only creates missing files."""
     from importlib.resources import files as pkg_files
+    from nanobot.config.paths import (
+        get_workspace_bootstrap_files,
+        get_workspace_memory_tracked_files,
+    )
     try:
         tpl = pkg_files("nanobot") / "templates"
     except Exception:
@@ -457,6 +461,8 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         return []
 
     added: list[str] = []
+    allowed_root_files = set(get_workspace_bootstrap_files(workspace))
+    tracked_files = list(get_workspace_memory_tracked_files(workspace))
 
     def _write(src, dest: Path):
         if dest.exists():
@@ -466,7 +472,11 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         added.append(str(dest.relative_to(workspace)))
 
     for item in tpl.iterdir():
-        if item.name.endswith(".md") and not item.name.startswith("."):
+        if (
+            item.name.endswith(".md")
+            and not item.name.startswith(".")
+            and item.name in allowed_root_files
+        ):
             _write(item, workspace / item.name)
     _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
     _write(None, workspace / "memory" / "history.jsonl")
@@ -480,9 +490,7 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     # Initialize git for memory version control
     try:
         from nanobot.utils.gitstore import GitStore
-        gs = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md",
-        ])
+        gs = GitStore(workspace, tracked_files=tracked_files)
         gs.init()
     except Exception:
         logger.warning("Failed to initialize git store for {}", workspace)
