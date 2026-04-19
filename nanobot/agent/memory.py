@@ -886,3 +886,97 @@ class MemoryConsolidator:
                         )
                     return False
                 raise
+
+
+# =============================================================================
+# BudgetInfo — immutable budget check result carrier
+# =============================================================================
+
+import time as _time_module
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class BudgetInfo:
+    """Immutable result of a budget check. Single source of truth for budget decisions."""
+
+    is_over_budget: bool
+    estimated_tokens: int
+    source: str  # "compact" | "full" | "budget_disabled"
+
+
+# =============================================================================
+# MemoryConsolidator: add cached check_budget() + pre-reply gate
+# =============================================================================
+
+
+class _BudgetCache:
+    """Per-session budget check cache with 5s TTL."""
+
+    __slots__ = ("result", "timestamp")
+
+    def __init__(self, result: BudgetInfo, timestamp: float) -> None:
+        self.result: BudgetInfo = result
+        self.timestamp: float = timestamp
+
+
+def _check_budget(self, session: "Session") -> BudgetInfo:
+    """Cached budget check — uses 5s TTL cache per session.
+
+    This is the SINGLE budget check entry point for both the pre-reply
+    consolidation path and the history-fallback path, ensuring consistent
+    budget logic everywhere.
+    """
+    session_key = getattr(session, "key", None)
+    if session_key is None:
+        over, estimated, source = self.is_over_budget(session)
+        return BudgetInfo(
+            is_over_budget=over,
+            estimated_tokens=estimated,
+            source=source,
+        )
+
+    now = _time_module.monotonic()
+    cache: _BudgetCache | None = getattr(self, "_budget_cache", {}).get(session_key)
+
+    if cache is not None and (now - cache.timestamp) < 5.0:
+        return cache.result
+
+    over, estimated, source = self.is_over_budget(session)
+    result = BudgetInfo(
+        is_over_budget=over,
+        estimated_tokens=estimated,
+        source=source if not over else "full",
+    )
+
+    if not hasattr(self, "_budget_cache"):
+        self._budget_cache: dict[str, _BudgetCache] = {}
+    self._budget_cache[session_key] = _BudgetCache(result, now)
+
+    return result
+
+
+def _should_run_pre_reply_consolidation(
+    self, session: "Session", *, msg: Any | None = None
+) -> tuple[bool, str]:
+    """Pre-reply consolidation gate. Returns (should_run, reason).
+
+    Combines the disabled-check, harness_auto-check, and budget-check
+    into a single gate — used by AgentLoop._should_run_pre_reply_consolidation().
+    """
+    if not getattr(self, "store", None):
+        return False, "memory_disabled"
+
+    harness_auto = bool((msg.metadata or {}).get("workspace_harness_auto")) if msg else False
+    if harness_auto:
+        return False, "harness_auto_skip"
+
+    budget = _check_budget(self, session)
+    if not budget.is_over_budget:
+        return False, "under_budget_skip"
+    return True, "over_budget"
+
+
+# Patch the methods onto MemoryConsolidator at runtime
+MemoryConsolidator.check_budget = _check_budget
+MemoryConsolidator.should_run_pre_reply_consolidation = _should_run_pre_reply_consolidation
