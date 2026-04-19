@@ -334,6 +334,9 @@ class HarnessRecord:
                     "auto_state": legacy_state.get("auto_state") or legacy_index.get("auto_state"),
                     "continuation_token": legacy_state.get("continuation_token")
                     or legacy_index.get("continuation_token"),
+                    # session_key lives in runtime_state for harness-auto continuation tracking
+                    "session_key": legacy_state.get("session_key")
+                    or legacy_index.get("session_key"),
                 },
             }
         )
