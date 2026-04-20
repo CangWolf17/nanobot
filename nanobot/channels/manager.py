@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from loguru import logger
 
@@ -13,19 +12,6 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
 from nanobot.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
-
-if TYPE_CHECKING:
-    from nanobot.session.manager import SessionManager
-
-
-def _default_webui_dist() -> Path | None:
-    """Return the absolute path to the bundled webui dist directory if it exists."""
-    try:
-        import nanobot.web as web_pkg  # type: ignore[import-not-found]
-    except ImportError:
-        return None
-    candidate = Path(web_pkg.__file__).resolve().parent / "dist"
-    return candidate if candidate.is_dir() else None
 
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
 _SEND_RETRY_DELAYS = (1, 2, 4)
@@ -41,16 +27,9 @@ class ChannelManager:
     - Route outbound messages
     """
 
-    def __init__(
-        self,
-        config: Config,
-        bus: MessageBus,
-        *,
-        session_manager: "SessionManager | None" = None,
-    ):
+    def __init__(self, config: Config, bus: MessageBus):
         self.config = config
         self.bus = bus
-        self._session_manager = session_manager
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -62,7 +41,6 @@ class ChannelManager:
 
         transcription_provider = self.config.channels.transcription_provider
         transcription_key = self._resolve_transcription_key(transcription_provider)
-        transcription_base = self._resolve_transcription_base(transcription_provider)
 
         for name, cls in discover_all().items():
             section = getattr(self.config.channels, name, None)
@@ -76,18 +54,9 @@ class ChannelManager:
             if not enabled:
                 continue
             try:
-                kwargs: dict[str, Any] = {}
-                # Only the WebSocket channel currently hosts the embedded webui
-                # surface; other channels stay oblivious to these knobs.
-                if cls.name == "websocket" and self._session_manager is not None:
-                    kwargs["session_manager"] = self._session_manager
-                    static_path = _default_webui_dist()
-                    if static_path is not None:
-                        kwargs["static_dist_path"] = static_path
-                channel = cls(section, self.bus, **kwargs)
+                channel = cls(section, self.bus)
                 channel.transcription_provider = transcription_provider
                 channel.transcription_api_key = transcription_key
-                channel.transcription_api_base = transcription_base
                 self.channels[name] = channel
                 logger.info("{} channel enabled", cls.display_name)
             except Exception as e:
@@ -104,26 +73,9 @@ class ChannelManager:
         except AttributeError:
             return ""
 
-    def _resolve_transcription_base(self, provider: str) -> str:
-        """Pick the API base URL for the configured transcription provider."""
-        try:
-            if provider == "openai":
-                return self.config.providers.openai.api_base or ""
-            return self.config.providers.groq.api_base or ""
-        except AttributeError:
-            return ""
-
     def _validate_allow_from(self) -> None:
         for name, ch in self.channels.items():
-            cfg = ch.config
-            if isinstance(cfg, dict):
-                if "allow_from" in cfg:
-                    allow = cfg.get("allow_from")
-                else:
-                    allow = cfg.get("allowFrom")
-            else:
-                allow = getattr(cfg, "allow_from", None)
-            if allow == []:
+            if getattr(ch.config, "allow_from", None) == []:
                 raise SystemExit(
                     f'Error: "{name}" has empty allowFrom (denies all). '
                     f'Set ["*"] to allow everyone, or add specific user IDs.'
@@ -218,9 +170,6 @@ class ChannelManager:
                     if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
                         continue
 
-                if msg.metadata.get("_retry_wait"):
-                    continue
-
                 # Coalesce consecutive _stream_delta messages for the same (channel, chat_id)
                 # to reduce API calls and improve streaming latency
                 if msg.metadata.get("_stream_delta") and not msg.metadata.get("_stream_end"):
@@ -241,9 +190,13 @@ class ChannelManager:
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send one outbound message without retry policy."""
-        if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
+        if (
+            msg.metadata.get("_stream_start")
+            or msg.metadata.get("_stream_delta")
+            or msg.metadata.get("_stream_end")
+        ):
             await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
-        elif not msg.metadata.get("_streamed"):
+        elif (not msg.metadata.get("_streamed")) or msg.metadata.get("_completion_notice"):
             await channel.send(msg)
 
     def _coalesce_stream_deltas(
