@@ -35,3 +35,11 @@ Do NOT guess paths.
 - Concise bullets under clear headers
 - When reducing (not deleting): keep essential facts, drop verbose details
 - If uncertain whether to delete, keep but add "(verify currency)"
+
+## Governance
+- `SOUL.md`: stable assistant voice, communication stance, and durable operating style only
+- `USER.md`: stable user preferences, identity facts, and recurring habits only
+- `memory/MEMORY.md`: project facts, decisions, active constraints, and durable workflow knowledge
+- If new evidence conflicts with an old fact, update or remove the stale fact instead of duplicating both versions
+- Prefer the smallest honest edit that preserves coherence across files
+- Do not manage vector indexes, retrieval caches, sync pipelines, or other adapter-owned infrastructure here
