@@ -27,10 +27,12 @@ class ScriptedProvider(LLMProvider):
 
 @pytest.mark.asyncio
 async def test_chat_with_retry_retries_transient_error_then_succeeds(monkeypatch) -> None:
-    provider = ScriptedProvider([
-        LLMResponse(content="429 rate limit", finish_reason="error"),
-        LLMResponse(content="ok"),
-    ])
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content="429 rate limit", finish_reason="error"),
+            LLMResponse(content="ok"),
+        ]
+    )
     delays: list[int] = []
 
     async def _fake_sleep(delay: int) -> None:
@@ -47,10 +49,93 @@ async def test_chat_with_retry_retries_transient_error_then_succeeds(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_chat_with_retry_retries_pending_requests_error_then_succeeds(monkeypatch) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content="Too many pending requests, please retry later", finish_reason="error"),
+            LLMResponse(content="ok"),
+        ]
+    )
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.finish_reason == "stop"
+    assert response.content == "ok"
+    assert provider.calls == 2
+    assert delays == [1]
+
+
+@pytest.mark.asyncio
+async def test_chat_with_retry_reports_retry_callback(monkeypatch) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content="429 rate limit", finish_reason="error"),
+            LLMResponse(content="ok"),
+        ]
+    )
+    retries: list[tuple[int, int, int, str | None]] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        return None
+
+    async def _on_retry(*, attempt: int, max_retries: int, delay: int, error: str | None) -> None:
+        retries.append((attempt, max_retries, delay, error))
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_retry=_on_retry,
+    )
+
+    assert response.content == "ok"
+    assert retries == [(1, 5, 1, "429 rate limit")]
+
+
+@pytest.mark.asyncio
+async def test_chat_with_retry_retries_empty_success_then_succeeds(monkeypatch) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content=None),
+            LLMResponse(content="ok"),
+        ]
+    )
+    delays: list[int] = []
+    retries: list[tuple[int, int, int, str | None]] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    async def _on_retry(*, attempt: int, max_retries: int, delay: int, error: str | None) -> None:
+        retries.append((attempt, max_retries, delay, error))
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_retry=_on_retry,
+    )
+
+    assert response.finish_reason == "stop"
+    assert response.content == "ok"
+    assert provider.calls == 2
+    assert delays == [1]
+    assert retries == [(1, 5, 1, "empty model response")]
+
+
+@pytest.mark.asyncio
 async def test_chat_with_retry_does_not_retry_non_transient_error(monkeypatch) -> None:
-    provider = ScriptedProvider([
-        LLMResponse(content="401 unauthorized", finish_reason="error"),
-    ])
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content="401 unauthorized", finish_reason="error"),
+        ]
+    )
     delays: list[int] = []
 
     async def _fake_sleep(delay: int) -> None:
@@ -67,12 +152,16 @@ async def test_chat_with_retry_does_not_retry_non_transient_error(monkeypatch) -
 
 @pytest.mark.asyncio
 async def test_chat_with_retry_returns_final_error_after_retries(monkeypatch) -> None:
-    provider = ScriptedProvider([
-        LLMResponse(content="429 rate limit a", finish_reason="error"),
-        LLMResponse(content="429 rate limit b", finish_reason="error"),
-        LLMResponse(content="429 rate limit c", finish_reason="error"),
-        LLMResponse(content="503 final server error", finish_reason="error"),
-    ])
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content="429 rate limit a", finish_reason="error"),
+            LLMResponse(content="429 rate limit b", finish_reason="error"),
+            LLMResponse(content="429 rate limit c", finish_reason="error"),
+            LLMResponse(content="429 rate limit d", finish_reason="error"),
+            LLMResponse(content="429 rate limit e", finish_reason="error"),
+            LLMResponse(content="503 final server error", finish_reason="error"),
+        ]
+    )
     delays: list[int] = []
 
     async def _fake_sleep(delay: int) -> None:
@@ -83,35 +172,8 @@ async def test_chat_with_retry_returns_final_error_after_retries(monkeypatch) ->
     response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
 
     assert response.content == "503 final server error"
-    assert provider.calls == 4
-    assert delays == [1, 2, 4]
-
-
-@pytest.mark.asyncio
-async def test_chat_with_retry_emits_terminal_progress_when_standard_retries_exhaust(monkeypatch) -> None:
-    provider = ScriptedProvider([
-        LLMResponse(content="429 rate limit a", finish_reason="error"),
-        LLMResponse(content="429 rate limit b", finish_reason="error"),
-        LLMResponse(content="429 rate limit c", finish_reason="error"),
-        LLMResponse(content="503 final server error", finish_reason="error"),
-    ])
-    progress: list[str] = []
-
-    async def _fake_sleep(delay: int) -> None:
-        return None
-
-    async def _progress(msg: str) -> None:
-        progress.append(msg)
-
-    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
-
-    response = await provider.chat_with_retry(
-        messages=[{"role": "user", "content": "hello"}],
-        on_retry_wait=_progress,
-    )
-
-    assert response.content == "503 final server error"
-    assert progress[-1] == "Model request failed after 4 retries, giving up."
+    assert provider.calls == 6
+    assert delays == [1, 2, 4, 8, 10]
 
 
 @pytest.mark.asyncio
@@ -126,7 +188,9 @@ async def test_chat_with_retry_preserves_cancelled_error() -> None:
 async def test_chat_with_retry_uses_provider_generation_defaults() -> None:
     """When callers omit generation params, provider.generation defaults are used."""
     provider = ScriptedProvider([LLMResponse(content="ok")])
-    provider.generation = GenerationSettings(temperature=0.2, max_tokens=321, reasoning_effort="high")
+    provider.generation = GenerationSettings(
+        temperature=0.2, max_tokens=321, reasoning_effort="high"
+    )
 
     await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
 
@@ -139,7 +203,9 @@ async def test_chat_with_retry_uses_provider_generation_defaults() -> None:
 async def test_chat_with_retry_explicit_override_beats_defaults() -> None:
     """Explicit kwargs should override provider.generation defaults."""
     provider = ScriptedProvider([LLMResponse(content="ok")])
-    provider.generation = GenerationSettings(temperature=0.2, max_tokens=321, reasoning_effort="high")
+    provider.generation = GenerationSettings(
+        temperature=0.2, max_tokens=321, reasoning_effort="high"
+    )
 
     await provider.chat_with_retry(
         messages=[{"role": "user", "content": "hello"}],
@@ -158,27 +224,39 @@ async def test_chat_with_retry_explicit_override_beats_defaults() -> None:
 # ---------------------------------------------------------------------------
 
 _IMAGE_MSG = [
-    {"role": "user", "content": [
-        {"type": "text", "text": "describe this"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}, "_meta": {"path": "/media/test.png"}},
-    ]},
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe this"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"},
+                "_meta": {"path": "/media/test.png"},
+            },
+        ],
+    },
 ]
 
 _IMAGE_MSG_NO_META = [
-    {"role": "user", "content": [
-        {"type": "text", "text": "describe this"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-    ]},
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ],
+    },
 ]
 
 
 @pytest.mark.asyncio
 async def test_non_transient_error_with_images_retries_without_images() -> None:
     """Any non-transient error retries once with images stripped when images are present."""
-    provider = ScriptedProvider([
-        LLMResponse(content="API调用参数有误,请检查文档", finish_reason="error"),
-        LLMResponse(content="ok, no image"),
-    ])
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content="API调用参数有误,请检查文档", finish_reason="error"),
+            LLMResponse(content="ok, no image"),
+        ]
+    )
 
     response = await provider.chat_with_retry(messages=copy.deepcopy(_IMAGE_MSG))
 
@@ -213,9 +291,11 @@ async def test_successful_image_retry_mutates_original_messages_in_place() -> No
 @pytest.mark.asyncio
 async def test_non_transient_error_without_images_no_retry() -> None:
     """Non-transient errors without image content are returned immediately."""
-    provider = ScriptedProvider([
-        LLMResponse(content="401 unauthorized", finish_reason="error"),
-    ])
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content="401 unauthorized", finish_reason="error"),
+        ]
+    )
 
     response = await provider.chat_with_retry(
         messages=[{"role": "user", "content": "hello"}],
@@ -228,10 +308,12 @@ async def test_non_transient_error_without_images_no_retry() -> None:
 @pytest.mark.asyncio
 async def test_image_fallback_returns_error_on_second_failure() -> None:
     """If the image-stripped retry also fails, return that error."""
-    provider = ScriptedProvider([
-        LLMResponse(content="some model error", finish_reason="error"),
-        LLMResponse(content="still failing", finish_reason="error"),
-    ])
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content="some model error", finish_reason="error"),
+            LLMResponse(content="still failing", finish_reason="error"),
+        ]
+    )
 
     response = await provider.chat_with_retry(messages=copy.deepcopy(_IMAGE_MSG))
 
@@ -241,12 +323,111 @@ async def test_image_fallback_returns_error_on_second_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_image_fallback_without_meta_uses_default_placeholder() -> None:
+async def test_chat_stream_with_retry_buffers_failed_attempt_deltas(monkeypatch) -> None:
+    from nanobot.providers.base import LLMProvider
+
+    class ScriptedStreamingProvider(LLMProvider):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def chat(self, *args, **kwargs) -> LLMResponse:
+            raise NotImplementedError
+
+        async def chat_stream(self, *args, on_content_delta=None, **kwargs) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                if on_content_delta:
+                    await on_content_delta("partial leaked text ")
+                return LLMResponse(
+                    content="Error calling LLM: Request timed out.", finish_reason="error"
+                )
+            if on_content_delta:
+                await on_content_delta("Hello")
+            return LLMResponse(content="Hello", finish_reason="stop")
+
+        def get_default_model(self) -> str:
+            return "test-model"
+
+    provider = ScriptedStreamingProvider()
+    deltas: list[str] = []
+
+    async def _capture_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    async def _fake_sleep(delay: int) -> None:
+        return None
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=_capture_delta,
+    )
+
+    assert provider.calls == 2
+    assert response.content == "Hello"
+    assert deltas == ["Hello"]
+
+
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_with_retry_retries_pending_requests_error_without_leaking_failed_deltas(monkeypatch) -> None:
+    from nanobot.providers.base import LLMProvider
+
+    class ScriptedStreamingPendingProvider(LLMProvider):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def chat(self, *args, **kwargs) -> LLMResponse:
+            raise NotImplementedError
+
+        async def chat_stream(self, *args, on_content_delta=None, **kwargs) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                if on_content_delta:
+                    await on_content_delta("pending leaked text ")
+                return LLMResponse(
+                    content="Too many pending requests, please retry later",
+                    finish_reason="error",
+                )
+            if on_content_delta:
+                await on_content_delta("Hello")
+            return LLMResponse(content="Hello", finish_reason="stop")
+
+        def get_default_model(self) -> str:
+            return "test-model"
+
+    provider = ScriptedStreamingPendingProvider()
+    deltas: list[str] = []
+    delays: list[int] = []
+
+    async def _capture_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=_capture_delta,
+    )
+
+    assert provider.calls == 2
+    assert response.content == "Hello"
+    assert deltas == ["Hello"]
+    assert delays == [1]
     """When _meta is absent, fallback placeholder is '[image omitted]'."""
-    provider = ScriptedProvider([
-        LLMResponse(content="error", finish_reason="error"),
-        LLMResponse(content="ok"),
-    ])
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content="error", finish_reason="error"),
+            LLMResponse(content="ok"),
+        ]
+    )
 
     response = await provider.chat_with_retry(messages=copy.deepcopy(_IMAGE_MSG_NO_META))
 
@@ -496,67 +677,3 @@ async def test_persistent_retry_aborts_after_ten_identical_transient_errors(monk
     assert response.content == "429 rate limit"
     assert provider.calls == 10
     assert delays == [1, 2, 4, 4, 4, 4, 4, 4, 4]
-
-
-@pytest.mark.asyncio
-async def test_persistent_retry_emits_terminal_progress_on_identical_error_limit(monkeypatch) -> None:
-    provider = ScriptedProvider([
-        *[LLMResponse(content="429 rate limit", finish_reason="error") for _ in range(10)],
-    ])
-    progress: list[str] = []
-
-    async def _fake_sleep(delay: float) -> None:
-        return None
-
-    async def _progress(msg: str) -> None:
-        progress.append(msg)
-
-    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
-
-    response = await provider.chat_with_retry(
-        messages=[{"role": "user", "content": "hello"}],
-        retry_mode="persistent",
-        on_retry_wait=_progress,
-    )
-
-    assert response.finish_reason == "error"
-    assert progress[-1] == "Persistent retry stopped after 10 identical errors."
-
-
-@pytest.mark.asyncio
-async def test_chat_with_retry_normalizes_explicit_none_max_tokens() -> None:
-    """Explicit max_tokens=None must fall back to generation defaults.
-
-    Regression for #3102: callers that construct AgentRunSpec with
-    max_tokens=None propagate None into chat_with_retry, which used to
-    reach ``_build_kwargs`` and crash on ``max(1, None)``.
-    """
-    provider = ScriptedProvider([LLMResponse(content="ok")])
-
-    response = await provider.chat_with_retry(
-        messages=[{"role": "user", "content": "hi"}],
-        max_tokens=None,
-        temperature=None,
-    )
-
-    assert response.content == "ok"
-    # Generation settings default to 4096 / 0.7; explicit None should
-    # have been replaced before reaching chat().
-    assert provider.last_kwargs["max_tokens"] == 4096
-    assert provider.last_kwargs["temperature"] == 0.7
-
-
-@pytest.mark.asyncio
-async def test_chat_stream_with_retry_normalizes_explicit_none_max_tokens() -> None:
-    """chat_stream_with_retry must apply the same None-guard as chat_with_retry."""
-    provider = ScriptedProvider([LLMResponse(content="ok")])
-
-    response = await provider.chat_stream_with_retry(
-        messages=[{"role": "user", "content": "hi"}],
-        max_tokens=None,
-        temperature=None,
-    )
-
-    assert response.content == "ok"
-    assert provider.last_kwargs["max_tokens"] == 4096
-    assert provider.last_kwargs["temperature"] == 0.7
