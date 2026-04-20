@@ -57,6 +57,7 @@ class HeartbeatService:
         model: str,
         on_execute: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        on_maintenance: Callable[[], Coroutine[Any, Any, None]] | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
         timezone: str | None = None,
@@ -66,6 +67,7 @@ class HeartbeatService:
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
+        self.on_maintenance = on_maintenance
         self.interval_s = interval_s
         self.enabled = enabled
         self.timezone = timezone
@@ -104,12 +106,7 @@ class HeartbeatService:
             model=self.model,
         )
 
-        if not response.should_execute_tools:
-            if response.has_tool_calls:
-                logger.warning(
-                    "Ignoring heartbeat tool calls under finish_reason='{}'",
-                    response.finish_reason,
-                )
+        if not response.has_tool_calls:
             return "skip", ""
 
         args = response.tool_calls[0].arguments
@@ -150,6 +147,12 @@ class HeartbeatService:
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
         from nanobot.utils.evaluator import evaluate_response
+
+        if self.on_maintenance is not None:
+            try:
+                await self.on_maintenance()
+            except Exception:
+                logger.exception("Heartbeat maintenance failed")
 
         content = self._read_heartbeat_file()
         if not content:
