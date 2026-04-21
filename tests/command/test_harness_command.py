@@ -115,9 +115,9 @@ def test_runtime_help_includes_harness_even_when_workspace_help_exists(tmp_path:
     router_path.write_text("#!/bin/sh\n", encoding="utf-8")
 
     with (
-        patch("nanobot.command.builtin.Path.home", return_value=home),
+        patch("nanobot.command.runtime_builtin.Path.home", return_value=home),
         patch(
-            "nanobot.command.builtin.subprocess.run",
+            "nanobot.command.runtime_builtin.subprocess.run",
             return_value=SimpleNamespace(
                 stdout="/plan -- Workspace planner help\n/help -- Workspace help\n",
                 stderr="",
@@ -142,7 +142,7 @@ def test_runtime_help_uses_loop_workspace_root_and_still_includes_harness(tmp_pa
     ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/help", loop=loop)
 
     with patch(
-        "nanobot.command.builtin.subprocess.run",
+        "nanobot.command.runtime_builtin.subprocess.run",
         return_value=SimpleNamespace(
             stdout="/plan -- Workspace planner help\n/help -- Workspace help\n",
             stderr="",

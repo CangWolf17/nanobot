@@ -287,14 +287,9 @@ class TestHandleStop:
             msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop
         )
 
-        with (
-            patch("nanobot.command.builtin.Path.home", return_value=tmp_path),
-            patch("nanobot.command.builtin.subprocess.run") as mock_run,
-        ):
-            out = await cmd_interrupt(ctx)
+        out = await cmd_interrupt(ctx)
 
         assert "No active task" in out.content
-        mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stop_does_not_set_interrupt_metadata(self):
@@ -351,12 +346,10 @@ class TestHandleStop:
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/new")
         ctx = CommandContext(msg=msg, session=session, key=msg.session_key, raw="/new", loop=loop)
 
-        with patch("nanobot.command.builtin.subprocess.run") as mock_run:
-            out = await cmd_new(ctx)
+        out = await cmd_new(ctx)
 
         assert "interrupt_state" not in session.metadata
         assert "new session started" in out.content.lower()
-        mock_run.assert_not_called()
         snapshot = service.store.load()
         record = next(iter(snapshot.records.values()))
         assert record.status == "interrupted"
