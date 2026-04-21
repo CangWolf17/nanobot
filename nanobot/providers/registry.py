@@ -215,6 +215,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="github_copilot",
         default_api_base="https://api.githubcopilot.com",
         is_oauth=True,
+        strip_model_prefix=True,
     ),
     # DeepSeek: OpenAI-compatible at api.deepseek.com
     ProviderSpec(
@@ -320,6 +321,17 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_local=True,
         detect_by_base_keyword="11434",
         default_api_base="http://localhost:11434/v1",
+    ),
+    # LM Studio local OpenAI-compatible server
+    ProviderSpec(
+        name="lm_studio",
+        keywords=("lm-studio", "lm_studio"),
+        env_key="LM_STUDIO_API_KEY",
+        display_name="LM Studio",
+        backend="openai_compat",
+        is_local=True,
+        detect_by_base_keyword="1234",
+        default_api_base="http://localhost:1234/v1",
     ),
     # === OpenVINO Model Server (direct, local, OpenAI-compatible at /v3) ===
     ProviderSpec(
