@@ -229,6 +229,12 @@ def test_interrupt_command_updates_harness_using_explicit_workspace_root(tmp_pat
     loop.sessions.get_or_create.return_value = MagicMock(metadata={})
     loop.sessions.save = MagicMock()
     loop.persist_interrupted_turn = MagicMock(return_value=None)
+    loop.coordinator = MagicMock(
+        has_normal_queued_work=MagicMock(return_value=False),
+        has_turn_slot=MagicMock(return_value=False),
+        reserve_turn_slot=MagicMock(return_value=False),
+    )
+    loop._dispatch = AsyncMock()
     msg = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/interrupt")
     ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop)
 
