@@ -298,23 +298,8 @@ class SubagentManager:
         session_key: str | None,
         resolution: SubagentResolution | None = None,
     ) -> None:
-        status = SubagentStatus(
-            task_id=task_id,
-            label=label,
-            task_description=task,
-            started_at=time.monotonic(),
-        )
-        self._task_statuses[task_id] = status
         bg_task = asyncio.create_task(
-            self._run_subagent(
-                task_id,
-                task,
-                label,
-                origin,
-                status,
-                lease=lease,
-                resolution=resolution,
-            )
+            self._run_subagent(task_id, task, label, origin, lease, resolution)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -407,6 +392,16 @@ class SubagentManager:
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        # Legacy compatibility: older callers passed (lease, resolution) as the
+        # 5th/6th positional args, before status tracking existed.
+        if isinstance(status, SubagentLease):
+            if isinstance(lease, SubagentResolution) and resolution is None:
+                resolution = lease
+            lease = status
+            status = None
+        elif isinstance(status, SubagentResolution):
+            resolution = status
+            status = None
         status = status or SubagentStatus(
             task_id=task_id,
             label=label,

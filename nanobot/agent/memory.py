@@ -713,6 +713,7 @@ class MemoryConsolidator:
         session: Session,
         *,
         max_history_messages: int = 0,
+        session_summary: str | None = None,
     ) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
         history = session.get_history(max_messages=max_history_messages)
@@ -767,7 +768,11 @@ class MemoryConsolidator:
                 return True
         return True
 
-    async def maybe_consolidate_by_tokens(self, session: Session) -> bool:
+    async def maybe_consolidate_by_tokens(
+        self,
+        session: Session,
+        session_summary: str | None = None,
+    ) -> bool:
         """Loop: archive old messages until prompt fits within safe budget.
 
         Returns True when consolidation completed cleanly (or was unnecessary),
@@ -784,7 +789,10 @@ class MemoryConsolidator:
         async with lock:
             budget = self.prompt_budget()
             target = self.target_prompt_tokens()
-            estimated, source = self.estimate_session_prompt_tokens(session)
+            estimated, source = self.estimate_session_prompt_tokens(
+                session,
+                session_summary=session_summary,
+            )
             if estimated <= 0:
                 return True
             if estimated < budget:
@@ -847,7 +855,10 @@ class MemoryConsolidator:
                     active_end_idx = None
                     active_round = None
 
-                    estimated, source = self.estimate_session_prompt_tokens(session)
+                    estimated, source = self.estimate_session_prompt_tokens(
+                        session,
+                        session_summary=session_summary,
+                    )
                     if estimated <= 0:
                         return True
                 return True
@@ -877,5 +888,33 @@ class MemoryConsolidator:
                             len(active_chunk),
                             self.store._consecutive_failures,
                         )
-                    return False
-                raise
+                return False
+
+
+class Consolidator(MemoryConsolidator):
+    """Legacy compatibility wrapper used by older tests and call sites."""
+
+    def __init__(
+        self,
+        store: MemoryStore,
+        provider: LLMProvider,
+        model: str,
+        sessions: SessionManager,
+        context_window_tokens: int,
+        build_messages: Callable[..., list[dict[str, Any]]],
+        get_tool_definitions: Callable[[], list[dict[str, Any]]],
+        max_completion_tokens: int = 4096,
+    ):
+        workspace = Path(getattr(store, "workspace", Path(".")))
+        super().__init__(
+            workspace=workspace,
+            provider=provider,
+            model=model,
+            sessions=sessions,
+            context_window_tokens=context_window_tokens,
+            build_messages=build_messages,
+            get_tool_definitions=get_tool_definitions,
+            max_completion_tokens=max_completion_tokens,
+        )
+        self.store = store
+        self.archive = self.archive_messages
