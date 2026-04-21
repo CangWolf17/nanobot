@@ -1369,6 +1369,46 @@ class AgentLoop:
         # Dispatch via _dispatch (this will also update dispatch_state)
         await self._dispatch(synthesized_msg)
 
+    async def _maybe_dispatch_race_window_merge(self, session_key: str) -> None:
+        """Race window: if late normal arrived while /tq slot was reserved, merge into one turn."""
+        normals, turn_item = self.coordinator.peek_and_assemble_race_window(
+            session_key, self._unified_session
+        )
+        if not normals or not turn_item:
+            return
+
+        # Consume both
+        consumed_normals, metrics = self.coordinator.consume_normal_batch(
+            session_key, self._unified_session, max_items=10, max_chars=8000
+        )
+        self.coordinator.consume_turn_slot(session_key, self._unified_session)
+
+        # Merge: normals first, then turn item
+        parts = [item.content for item in consumed_normals]
+        parts.append(turn_item.content)
+        synthesized_content = "\n---\n".join(parts)
+
+        provenance = {
+            "kind": "race_window_merge",
+            "item_count": len(consumed_normals) + 1,
+            "normal_ids": [item.provenance_id for item in consumed_normals],
+            "turn_id": turn_item.provenance_id,
+        }
+
+        synthesized_msg = InboundMessage(
+            channel=turn_item.channel,
+            sender_id=turn_item.sender_id,
+            chat_id=turn_item.chat_id,
+            content=synthesized_content,
+            metadata={"_queued_batch": provenance, "_race_window": True},
+        )
+
+        # Dispatch the merged turn
+        self.coordinator.set_dispatch_state(
+            session_key, DispatchState.DISPATCHING_RESERVED_TURN, self._unified_session
+        )
+        await self._dispatch(synthesized_msg)
+
     async def _run_pre_reply_consolidation(self, session: Session) -> bool:
         """Best-effort pre-reply consolidation. Returns True if it completed cleanly."""
         if not self.memory_config.enabled:
@@ -1828,12 +1868,15 @@ class AgentLoop:
             sender_id=msg.sender_id,
         )
 
-        # Safe boundary: consume queued normal items after iteration settles
+        # Safe boundary: mark turn closing, then consume any pending queue
         key = session_key or msg.session_key
         effective_key = (
             UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else key
         )
+        self.coordinator.set_dispatch_state(effective_key, DispatchState.TURN_CLOSING, self._unified_session)
+        await self._maybe_dispatch_race_window_merge(effective_key)
         await self._maybe_consume_normal_queue(effective_key)
+        self.coordinator.set_dispatch_state(effective_key, DispatchState.IDLE, self._unified_session)
 
         final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
         final_content, key_principle_notice = self._extract_terminal_key_principle(final_content)

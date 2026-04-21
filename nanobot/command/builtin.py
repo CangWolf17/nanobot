@@ -108,6 +108,8 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     snapshot = session.messages[session.last_consolidated:]
     session.clear()
     clear_runtime_session_state(loop=loop, session=session, session_key=ctx.key)
+    if hasattr(loop, "coordinator"):
+        loop.coordinator.clear_queue(ctx.key, getattr(loop, "_unified_session", False))
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
     schedule_session_archive(loop, snapshot)
