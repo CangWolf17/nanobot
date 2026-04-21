@@ -24,10 +24,12 @@ _NANOBOT_ROOT = Path(__file__).resolve().parents[2]
 _models_path = _NANOBOT_ROOT / "nanobot" / "harness" / "models.py"
 
 import importlib.util
-_spec = importlib.util.spec_from_file_location("nanobot.harness.models", _models_path)
+_spec = importlib.util.spec_from_file_location("tests._isolated_harness_models", _models_path)
 _models = importlib.util.module_from_spec(_spec)
-# Register module before exec so dataclass __module__ resolves correctly
-sys.modules["nanobot.harness.models"] = _models
+# Register module before exec so dataclass __module__ resolves correctly,
+# but do not overwrite the canonical nanobot.harness.models entry used by
+# the rest of the test suite.
+sys.modules["tests._isolated_harness_models"] = _models
 _spec.loader.exec_module(_models)
 
 HarnessRecord = _models.HarnessRecord
