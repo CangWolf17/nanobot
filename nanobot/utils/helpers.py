@@ -399,9 +399,11 @@ def build_status_content(
     context_window_tokens: int,
     session_msg_count: int,
     context_tokens_estimate: int,
+    max_completion_tokens: int | None = None,
     interrupt_summary: str | None = None,
     harness_summary: str | None = None,
     search_usage_text: str | None = None,
+    active_task_count: int = 0,
 ) -> str:
     """Build a human-readable runtime status snapshot.
     
@@ -424,7 +426,11 @@ def build_status_content(
     last_out = last_usage.get("completion_tokens", 0)
     cached = last_usage.get("cached_tokens", 0)
     ctx_total = max(context_window_tokens, 0)
-    ctx_pct = int((context_tokens_estimate / ctx_total) * 100) if ctx_total > 0 else 0
+    input_budget = ctx_total
+    if max_completion_tokens is not None:
+        input_budget = max(ctx_total - max_completion_tokens - 1024, 0)
+    ctx_pct = int((context_tokens_estimate / input_budget) * 100) if input_budget > 0 else 0
+    ctx_pct = min(ctx_pct, 999)
     ctx_used_str = f"{context_tokens_estimate // 1000}k" if context_tokens_estimate >= 1000 else str(context_tokens_estimate)
     ctx_total_str = f"{ctx_total // 1000}k" if ctx_total > 0 else "n/a"
     token_line = f"\U0001f4ca Tokens: {last_in} in / {last_out} out"
@@ -434,16 +440,17 @@ def build_status_content(
         f"\U0001f408 nanobot v{version}",
         f"\U0001f9e0 Model: {model}",
         token_line,
-        f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
+        f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}% of input budget)",
         f"\U0001f4ac Session: {session_msg_count} messages",
         f"\u23f1 Uptime: {uptime}",
     ]
+    lines.append(f"⚙️ Tasks: {active_task_count} active")
     status_interrupt = str(harness_summary or interrupt_summary or "").strip()
     if status_interrupt:
         lines.append(f"⏸ Interrupt: {status_interrupt}")
     if search_usage_text:
         lines.append(search_usage_text)
-    return "\n".join(lines)    
+    return "\n".join(lines)
 
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
