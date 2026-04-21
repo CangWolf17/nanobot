@@ -1,5 +1,10 @@
 """Configuration schema using Pydantic."""
 
+# T13C disposition: retain current.
+# The migration-branch schema stays in place because config migration tests are
+# green, while the T13 blockers were resolved in loop/subagent compatibility
+# layers rather than by changing config ownership surfaces here.
+
 from pathlib import Path
 from typing import Literal
 

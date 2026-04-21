@@ -1,5 +1,10 @@
 """Configuration loading utilities."""
 
+# T13C disposition: retain current.
+# Current migration-branch loader behavior is the chosen truth for now because
+# tests/config/test_config_migration.py passes and no config-local change is
+# required to unblock the T13 compatibility tranche.
+
 import json
 import os
 import re
