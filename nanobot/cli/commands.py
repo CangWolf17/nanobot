@@ -994,7 +994,7 @@ def _run_gateway(
             logger.warning("Startup notify target channel {} is not enabled; skipping online notice", channel)
             return
 
-        deadline = asyncio.get_running_loop().time() + 15.0
+        deadline = asyncio.get_running_loop().time() + 90.0
         while asyncio.get_running_loop().time() < deadline:
             channel_obj = channels.get_channel(channel)
             if _channel_ready_for_startup_notice(channel_obj):
@@ -1123,11 +1123,12 @@ def _run_gateway(
 
     async def run():
         channels_task: asyncio.Task | None = None
+        startup_notice_task: asyncio.Task | None = None
         try:
             await cron.start()
             await heartbeat.start()
             channels_task = asyncio.create_task(channels.start_all())
-            await _send_startup_online_notice()
+            startup_notice_task = asyncio.create_task(_send_startup_online_notice())
             tasks = [
                 agent.run(),
                 channels_task,
@@ -1144,6 +1145,12 @@ def _run_gateway(
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
+            if startup_notice_task is not None:
+                startup_notice_task.cancel()
+                try:
+                    await startup_notice_task
+                except asyncio.CancelledError:
+                    pass
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
