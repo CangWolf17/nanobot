@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import inspect
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -12,6 +13,9 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
 from nanobot.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
+
+if TYPE_CHECKING:
+    from nanobot.session.manager import SessionManager
 
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
 _SEND_RETRY_DELAYS = (1, 2, 4)
@@ -27,9 +31,15 @@ class ChannelManager:
     - Route outbound messages
     """
 
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        session_manager: "SessionManager | None" = None,
+    ):
         self.config = config
         self.bus = bus
+        self.session_manager = session_manager
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -54,7 +64,13 @@ class ChannelManager:
             if not enabled:
                 continue
             try:
-                channel = cls(section, self.bus)
+                kwargs: dict[str, Any] = {}
+                try:
+                    if "session_manager" in inspect.signature(cls.__init__).parameters:
+                        kwargs["session_manager"] = self.session_manager
+                except (TypeError, ValueError):
+                    pass
+                channel = cls(section, self.bus, **kwargs)
                 channel.transcription_provider = transcription_provider
                 channel.transcription_api_key = transcription_key
                 self.channels[name] = channel
