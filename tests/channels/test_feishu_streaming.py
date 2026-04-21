@@ -279,6 +279,7 @@ class TestSendDelta:
         ch.config.streaming_completion_notice_mention_user = False
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(
@@ -302,6 +303,7 @@ class TestSendDelta:
         ch.config.streaming_completion_notice_mention_user = True
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(
@@ -319,19 +321,17 @@ class TestSendDelta:
         args = mock_send.call_args[0]
         assert args[0] == "chat_id"
         assert args[1] == "oc_chat1"
-        assert args[2] == "post"
-        assert '"tag": "at"' in args[3]
-        assert '"user_id": "ou_runtime_user"' in args[3]
-        assert '"user_name": "你"' not in args[3]
-        assert '"text": " ✅ 回复完成"' in args[3]
+        assert args[2] == "interactive"
+        assert '<at id=ou_runtime_user></at> ✅ 回复完成' in args[3]
 
     @pytest.mark.asyncio
-    async def test_send_completion_notice_in_direct_message_emits_mention_post_without_fallback_name(self):
+    async def test_send_completion_notice_in_direct_message_emits_interactive_markdown_at_notice(self):
         ch = _make_channel()
         ch.config.streaming_completion_notice_enabled = True
         ch.config.streaming_completion_notice_mention_user = True
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(
@@ -349,20 +349,18 @@ class TestSendDelta:
         args = mock_send.call_args[0]
         assert args[0] == "open_id"
         assert args[1] == "ou_runtime_user"
-        assert args[2] == "post"
-        assert '"tag": "at"' in args[3]
-        assert '"user_id": "ou_runtime_user"' in args[3]
-        assert '"user_name": "你"' not in args[3]
-        assert '"text": " ✅ 回复完成"' in args[3]
+        assert args[2] == "interactive"
+        assert '<at id=ou_runtime_user></at> ✅ 回复完成' in args[3]
 
     @pytest.mark.asyncio
-    async def test_send_completion_notice_uses_configured_fallback_name_when_present(self):
+    async def test_send_completion_notice_ignores_fallback_name_and_uses_runtime_markdown_at(self):
         ch = _make_channel()
         ch.config.streaming_completion_notice_enabled = True
         ch.config.streaming_completion_notice_mention_user = True
         ch.config.streaming_completion_notice_mention_fallback_name = "Tim"
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(
@@ -378,9 +376,9 @@ class TestSendDelta:
             ))
 
         args = mock_send.call_args[0]
-        assert args[2] == "post"
-        assert '"user_name": "Tim"' in args[3]
-        assert '"user_name": "你"' not in args[3]
+        assert args[2] == "interactive"
+        assert '<at id=ou_runtime_user></at> ✅ 回复完成' in args[3]
+        assert "Tim" not in args[3]
 
     @pytest.mark.asyncio
     async def test_send_completion_notice_uses_fallback_user_id_when_runtime_id_missing(self):
@@ -390,6 +388,7 @@ class TestSendDelta:
         ch.config.streaming_completion_notice_mention_fallback_user_id = "ou_fallback_user"
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(
@@ -404,8 +403,8 @@ class TestSendDelta:
             ))
 
         args = mock_send.call_args[0]
-        assert args[2] == "post"
-        assert '"user_id": "ou_fallback_user"' in args[3]
+        assert args[2] == "interactive"
+        assert '<at id=ou_fallback_user></at> ✅ 回复完成' in args[3]
 
     @pytest.mark.asyncio
     async def test_send_completion_notice_skips_when_no_runtime_or_fallback_user_id(self):
@@ -414,6 +413,7 @@ class TestSendDelta:
         ch.config.streaming_completion_notice_mention_user = True
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(
@@ -555,6 +555,7 @@ class TestSendDelta:
         ch = _make_channel()
 
         from unittest.mock import patch
+
         from nanobot.bus.events import OutboundMessage
         with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
             await ch.send(OutboundMessage(

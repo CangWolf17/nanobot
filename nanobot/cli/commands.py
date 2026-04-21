@@ -8,6 +8,7 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 # Force UTF-8 encoding for Windows console
 if sys.platform == "win32":
@@ -33,6 +34,15 @@ from rich.table import Table
 from rich.text import Text
 
 from nanobot import __logo__, __version__
+from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
+from nanobot.config.paths import get_workspace_path, is_default_workspace
+from nanobot.config.schema import Config
+from nanobot.utils.helpers import sync_workspace_templates
+from nanobot.utils.restart import (
+    consume_restart_notice_from_env,
+    format_restart_completed_message,
+    should_show_cli_restart_notice,
+)
 
 
 class SafeFileHistory(FileHistory):
@@ -46,15 +56,6 @@ class SafeFileHistory(FileHistory):
     def store_string(self, string: str) -> None:
         safe = string.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
         super().store_string(safe)
-from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
-from nanobot.config.paths import get_workspace_path, is_default_workspace
-from nanobot.config.schema import Config
-from nanobot.utils.helpers import sync_workspace_templates
-from nanobot.utils.restart import (
-    consume_restart_notice_from_env,
-    format_restart_completed_message,
-    should_show_cli_restart_notice,
-)
 
 app = typer.Typer(
     name="nanobot",
@@ -532,6 +533,41 @@ def _migrate_cron_store(config: "Config") -> None:
         shutil.move(str(legacy_path), str(new_path))
 
 
+def _describe_runtime_provider(config: Config, model: str | None = None) -> str:
+    """Return a user-facing provider label for runtime status/notifications."""
+    provider_name = config.get_provider_name(model) or "unknown"
+
+    api_base = (config.get_api_base(model) or "").strip()
+    if api_base:
+        parsed = urlparse(api_base if "://" in api_base else f"https://{api_base}")
+        hostname = (parsed.hostname or "").strip().lower()
+        if hostname.startswith("www."):
+            hostname = hostname[4:]
+        if hostname:
+            return hostname
+
+    return provider_name
+
+
+def _build_weather_brief_prompt(task_message: str) -> str:
+    normalized = (task_message or "").strip() or "🌤️ 早上好！今日天气预报：重庆南岸区 + 你的飞书日程"
+    return (
+        "你正在执行固定版 08:00 天气早报。\n"
+        "目标：生成一条面向用户的早报，版式强制对齐 3月29日那套固定版式；不要自由发挥成散文或口水话。\n"
+        "硬规则：\n"
+        "1. 只关注重庆南岸区天气。\n"
+        "2. 必须使用表格 + 分段标题，结构固定。\n"
+        "3. 必须包含 `### 📍 重庆南岸区天气`、`### 📅 今日日程`、`### 📌 提醒` 三段。\n"
+        "4. 今日日程段先不要调用飞书日历；直接写 `📭 **飞书日历暂未接入**`。\n"
+        "5. 不要调用飞书日历、不要搜索 workspace 里的日历脚本、不要解释限制来源。\n"
+        "6. 天气数据必须优先使用本地脚本 `/home/admin/.nanobot/workspace/scripts/weather.py`，不要自己写 curl，也不要搜索别的天气工具。\n"
+        "7. 先执行 `/home/admin/.nanobot/workspace/venv/bin/python /home/admin/.nanobot/workspace/scripts/weather.py 重庆南岸区 forecast`。如果 `重庆南岸区` 获取失败，立即改用固定坐标 29.5,106.5 对应的南岸区天气结果，不要把失败过程写给用户。\n"
+        "8. 必须保留 `###` 标题、Markdown 表格和 `---` 分隔线，不要把表格改写成自然语言段落。\n"
+        "9. 输出末尾不要追加多余总结，只输出固定版早报正文。\n\n"
+        f"原始任务：{normalized}"
+    )
+
+
 # ============================================================================
 # OpenAI-Compatible API Server
 # ============================================================================
@@ -554,6 +590,7 @@ def serve(
         raise typer.Exit(1)
 
     from loguru import logger
+
     from nanobot.agent.loop import AgentLoop
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
@@ -652,6 +689,7 @@ def _run_gateway(
 ) -> None:
     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
     from nanobot.agent.loop import AgentLoop
+    from nanobot.agent.subagent_resources import probe_due_provider_routes
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
@@ -665,6 +703,7 @@ def _run_gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
+    provider_label = _describe_runtime_provider(config, config.agents.defaults.model)
     session_manager = SessionManager(config.workspace_path)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
@@ -721,6 +760,18 @@ def _run_gateway(
             f"Task '{job.name}' has been triggered.\n"
             f"Scheduled instruction: {job.payload.message}"
         )
+        metadata: dict[str, Any] | None = {
+            "_origin_sender_id": str(job.payload.creator_sender_id or "").strip(),
+        }
+        if str(job.payload.completion_notice_text or "").strip():
+            metadata["_completion_notice_text"] = str(job.payload.completion_notice_text).strip()
+        weather_task = "重庆南岸区" in (job.payload.message or "") and "天气预报" in (job.payload.message or "")
+        if weather_task:
+            metadata = {
+                **(metadata or {}),
+                "workspace_agent_cmd": "weather_brief",
+                "workspace_agent_input": _build_weather_brief_prompt(job.payload.message),
+            }
 
         cron_tool = agent.tools.get("cron")
         cron_token = None
@@ -732,17 +783,30 @@ def _run_gateway(
 
         try:
             resp = await agent.process_direct(
-                reminder_note,
+                job.payload.message if weather_task else reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
                 on_progress=_silent,
+                metadata=metadata,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
 
         response = resp.content if resp else ""
+        response_metadata = dict(resp.metadata or {}) if resp else {}
+        completion_notice_text = str(
+            response_metadata.get("_completion_notice_text")
+            or job.payload.completion_notice_text
+            or ""
+        ).strip()
+        completion_notice_user_id = str(
+            response_metadata.get("_completion_notice_mention_user_id")
+            or response_metadata.get("_origin_sender_id")
+            or job.payload.creator_sender_id
+            or ""
+        ).strip()
 
         message_tool = agent.tools.get("message")
         if job.payload.deliver and isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
@@ -750,7 +814,7 @@ def _run_gateway(
 
         if job.payload.deliver and job.payload.to and response:
             should_notify = await evaluate_response(
-                response, reminder_note, provider, agent.model,
+                response, job.payload.message, provider, agent.model,
             )
             if should_notify:
                 from nanobot.bus.events import OutboundMessage
@@ -758,7 +822,21 @@ def _run_gateway(
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to,
                     content=response,
+                    metadata=response_metadata,
                 ))
+                if completion_notice_text:
+                    notice_metadata = {
+                        "_completion_notice": True,
+                        "_completion_notice_text": completion_notice_text,
+                    }
+                    if completion_notice_user_id:
+                        notice_metadata["_completion_notice_mention_user_id"] = completion_notice_user_id
+                    await bus.publish_outbound(OutboundMessage(
+                        channel=job.payload.channel or "cli",
+                        chat_id=job.payload.to,
+                        content="",
+                        metadata=notice_metadata,
+                    ))
         return response
 
     cron.on_job = on_cron_job
@@ -783,25 +861,96 @@ def _run_gateway(
         # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
 
+    def _build_heartbeat_execution_message(tasks: str) -> str:
+        normalized = (tasks or "").strip()
+        return (
+            "[HEARTBEAT EXECUTION — not background metadata; do not treat this as a request for authorization]\n"
+            "A prior heartbeat decision already determined that active tasks exist and execution should proceed now.\n"
+            "Do not summarize the task and wait. Do not ask for permission. Do not classify this as metadata only.\n"
+            "Start executing immediately, using tools when needed, and report concrete progress/results.\n\n"
+            f"Heartbeat task:\n{normalized}"
+        ).strip()
+
+    def _heartbeat_execution_session_key() -> str:
+        return "heartbeat:exec"
+
+    async def _resolve_heartbeat_workspace_metadata(
+        raw_task: str,
+        *,
+        channel: str,
+        chat_id: str,
+    ) -> tuple[dict[str, Any], str | None]:
+        stripped = (raw_task or "").strip()
+        if not stripped.startswith("/"):
+            return {}, None
+
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.router import CommandContext
+        from nanobot.command.workspace_bridge import cmd_workspace_bridge
+
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="heartbeat",
+            chat_id=chat_id,
+            content=stripped,
+            metadata={},
+        )
+        ctx = CommandContext(
+            msg=msg,
+            session=None,
+            key=f"{channel}:{chat_id}",
+            raw=stripped,
+            loop=agent,
+        )
+        bridge_result = await cmd_workspace_bridge(ctx)
+        if bridge_result is not None:
+            return {}, bridge_result.content
+        return dict(msg.metadata or {}), None
+
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
         channel, chat_id = _pick_heartbeat_target()
+        heartbeat_message = _build_heartbeat_execution_message(tasks)
+        heartbeat_session_key = _heartbeat_execution_session_key()
+        heartbeat_metadata, direct_response = await _resolve_heartbeat_workspace_metadata(
+            tasks,
+            channel=channel,
+            chat_id=chat_id,
+        )
+        if direct_response is not None:
+            return direct_response
+        heartbeat_raw_task = (tasks or "").strip()
+        direct_content = heartbeat_raw_task if heartbeat_metadata else heartbeat_message
+        if heartbeat_metadata:
+            prepared_workspace_input = str(heartbeat_metadata.get("workspace_agent_input") or "").strip()
+            combined_workspace_input = heartbeat_message
+            if prepared_workspace_input:
+                combined_workspace_input = (
+                    f"{heartbeat_message}\n\n"
+                    "[WORKSPACE PREPARED INPUT]\n"
+                    f"{prepared_workspace_input}"
+                ).strip()
+            heartbeat_metadata = {
+                **heartbeat_metadata,
+                "workspace_agent_input": combined_workspace_input,
+            }
 
         async def _silent(*_args, **_kwargs):
             pass
 
         resp = await agent.process_direct(
-            tasks,
-            session_key="heartbeat",
+            direct_content,
+            session_key=heartbeat_session_key,
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
+            metadata=heartbeat_metadata or None,
         )
 
         # Keep a small tail of heartbeat history so the loop stays bounded
         # without losing all short-term context between runs.
-        session = agent.sessions.get_or_create("heartbeat")
+        session = agent.sessions.get_or_create(heartbeat_session_key)
         session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
         agent.sessions.save(session)
 
@@ -815,6 +964,56 @@ def _run_gateway(
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
+    async def on_heartbeat_maintenance() -> None:
+        probe_due_provider_routes(workspace=config.workspace_path)
+
+    def _channel_ready_for_startup_notice(channel_obj) -> bool:
+        if channel_obj is None or not getattr(channel_obj, "is_running", False):
+            return False
+        if hasattr(channel_obj, "_bot_username") or hasattr(channel_obj, "_bot_user_id"):
+            if getattr(channel_obj, "_bot_username", None) or getattr(channel_obj, "_bot_user_id", None):
+                return True
+        if hasattr(channel_obj, "_client"):
+            return getattr(channel_obj, "_client", None) is not None
+        if hasattr(channel_obj, "_app"):
+            return getattr(channel_obj, "_app", None) is not None
+        return True
+
+    async def _send_startup_online_notice() -> None:
+        from nanobot.bus.events import OutboundMessage
+
+        startup_cfg = hb_cfg.startup_notify
+        if not startup_cfg.enabled:
+            return
+        channel = (startup_cfg.channel or "").strip()
+        chat_id = (startup_cfg.chat_id or "").strip()
+        if not channel or not chat_id:
+            logger.warning("Startup notify enabled but channel/chat_id missing; skipping online notice")
+            return
+        if channel not in channels.enabled_channels:
+            logger.warning("Startup notify target channel {} is not enabled; skipping online notice", channel)
+            return
+
+        deadline = asyncio.get_running_loop().time() + 15.0
+        while asyncio.get_running_loop().time() < deadline:
+            channel_obj = channels.get_channel(channel)
+            if _channel_ready_for_startup_notice(channel_obj):
+                await bus.publish_outbound(
+                    OutboundMessage(
+                        channel=channel,
+                        chat_id=chat_id,
+                        content=(
+                            f"nanobot 已上线（model: {agent.model}, "
+                            f"provider: {provider_label}, heartbeat: {hb_cfg.interval_s}s）"
+                        ),
+                        metadata={"render_as": "interactive"},
+                    )
+                )
+                return
+            await asyncio.sleep(0.2)
+
+        logger.warning("Startup notify target {} did not become ready in time; skipping online notice", channel)
+
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
@@ -822,6 +1021,7 @@ def _run_gateway(
         model=agent.model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
+        on_maintenance=on_heartbeat_maintenance,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
@@ -922,12 +1122,15 @@ def _run_gateway(
             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
 
     async def run():
+        channels_task: asyncio.Task | None = None
         try:
             await cron.start()
             await heartbeat.start()
+            channels_task = asyncio.create_task(channels.start_all())
+            await _send_startup_online_notice()
             tasks = [
                 agent.run(),
-                channels.start_all(),
+                channels_task,
                 _health_server(config.gateway.host, port),
             ]
             if open_browser_url:

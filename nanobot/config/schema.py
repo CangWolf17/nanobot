@@ -145,12 +145,21 @@ class ProvidersConfig(Base):
     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
 
 
+class StartupNotifyConfig(Base):
+    """Optional startup online-notice target."""
+
+    enabled: bool = False
+    channel: str = ""
+    chat_id: str = ""
+
+
 class HeartbeatConfig(Base):
     """Heartbeat service configuration."""
 
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
     keep_recent_messages: int = 8
+    startup_notify: StartupNotifyConfig = Field(default_factory=StartupNotifyConfig)
 
 
 class ApiConfig(Base):

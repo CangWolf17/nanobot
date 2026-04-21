@@ -12,7 +12,14 @@ from typing import Any, Callable, Coroutine, Literal
 from filelock import FileLock
 from loguru import logger
 
-from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronRunRecord, CronSchedule, CronStore
+from nanobot.cron.types import (
+    CronJob,
+    CronJobState,
+    CronPayload,
+    CronRunRecord,
+    CronSchedule,
+    CronStore,
+)
 
 
 def _now_ms() -> int:
@@ -106,6 +113,8 @@ class CronService:
                         payload=CronPayload(
                             kind=j["payload"].get("kind", "agent_turn"),
                             message=j["payload"].get("message", ""),
+                            completion_notice_text=j["payload"].get("completionNoticeText", ""),
+                            creator_sender_id=j["payload"].get("creatorSenderId", ""),
                             deliver=j["payload"].get("deliver", False),
                             channel=j["payload"].get("channel"),
                             to=j["payload"].get("to"),
@@ -207,6 +216,8 @@ class CronService:
                     "payload": {
                         "kind": j.payload.kind,
                         "message": j.payload.message,
+                        "completionNoticeText": j.payload.completion_notice_text,
+                        "creatorSenderId": j.payload.creator_sender_id,
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
@@ -375,6 +386,8 @@ class CronService:
         name: str,
         schedule: CronSchedule,
         message: str,
+        completion_notice_text: str = "",
+        creator_sender_id: str = "",
         deliver: bool = False,
         channel: str | None = None,
         to: str | None = None,
@@ -392,6 +405,8 @@ class CronService:
             payload=CronPayload(
                 kind="agent_turn",
                 message=message,
+                completion_notice_text=completion_notice_text,
+                creator_sender_id=creator_sender_id,
                 deliver=deliver,
                 channel=channel,
                 to=to,

@@ -23,6 +23,8 @@ class CronPayload:
     """What to do when the job runs."""
     kind: Literal["system_event", "agent_turn"] = "agent_turn"
     message: str = ""
+    completion_notice_text: str = ""
+    creator_sender_id: str = ""
     # Deliver response to channel
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"

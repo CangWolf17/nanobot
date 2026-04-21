@@ -76,7 +76,10 @@ class CronTool(Tool):
                     "enum": ["add", "list", "remove"],
                     "description": "Action to perform",
                 },
-                "message": {"type": "string", "description": "Reminder message (for add)"},
+                "message": {
+                    "type": "string",
+                    "description": "Reminder message. REQUIRED when action='add'.",
+                },
                 "every_seconds": {
                     "type": "integer",
                     "description": "Interval in seconds (for recurring tasks)",
@@ -99,7 +102,10 @@ class CronTool(Tool):
                         f"(e.g. '2026-02-12T10:30:00'). Naive values default to {self._default_timezone}."
                     ),
                 },
-                "job_id": {"type": "string", "description": "Job ID (for remove)"},
+                "job_id": {
+                    "type": "string",
+                    "description": "Job ID to remove. REQUIRED when action='remove'.",
+                },
             },
             "required": ["action"],
         }
@@ -134,7 +140,7 @@ class CronTool(Tool):
         at: str | None,
     ) -> str:
         if not message:
-            return "Error: message is required for add"
+            return "Error: message is required for add. Retry with action='add' plus a message."
         if not self._channel or not self._chat_id:
             return "Error: no session context (channel/chat_id)"
         if tz and not cron_expr:
