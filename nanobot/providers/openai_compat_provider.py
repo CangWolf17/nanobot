@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import os
 import secrets
 import string
@@ -31,6 +32,20 @@ _DEFAULT_OPENROUTER_HEADERS = {
     "X-OpenRouter-Title": "nanobot",
     "X-OpenRouter-Categories": "cli-agent,personal-agent",
 }
+
+
+async def _next_with_timeout(stream_iter: Any, timeout_s: float) -> Any:
+    task = asyncio.create_task(stream_iter.__anext__())
+    try:
+        return await asyncio.wait_for(task, timeout=timeout_s)
+    except Exception:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+        raise
 
 
 def _short_tool_id() -> str:
@@ -136,6 +151,7 @@ class OpenAICompatProvider(LLMProvider):
             base_url=effective_base,
             default_headers=default_headers,
             timeout=60.0,
+            max_retries=0,
         )
 
     def _setup_env(self, api_key: str, api_base: str | None) -> None:
@@ -195,6 +211,7 @@ class OpenAICompatProvider(LLMProvider):
 
     def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Strip non-standard keys, normalize tool_call IDs."""
+        messages = LLMProvider._enforce_role_alternation(messages)
         sanitized = LLMProvider._sanitize_request_messages(messages, _ALLOWED_MSG_KEYS)
         id_map: dict[str, str] = {}
 
@@ -204,6 +221,8 @@ class OpenAICompatProvider(LLMProvider):
             return id_map.setdefault(value, self._normalize_tool_call_id(value))
 
         for clean in sanitized:
+            if clean.get("role") == "assistant" and clean.get("tool_calls"):
+                clean["content"] = None
             if isinstance(clean.get("tool_calls"), list):
                 normalized = []
                 for tc in clean["tool_calls"]:
@@ -244,8 +263,10 @@ class OpenAICompatProvider(LLMProvider):
         kwargs: dict[str, Any] = {
             "model": model_name,
             "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
-            "temperature": temperature,
         }
+
+        if self._supports_temperature(model_name, reasoning_effort):
+            kwargs["temperature"] = temperature
 
         if spec and getattr(spec, "supports_max_completion_tokens", False):
             kwargs["max_completion_tokens"] = max(1, max_tokens)
@@ -262,11 +283,85 @@ class OpenAICompatProvider(LLMProvider):
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
 
+        extra_body = self._reasoning_extra_body(reasoning_effort)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
         return kwargs
+
+    @staticmethod
+    def _supports_temperature(
+        model_name: str,
+        reasoning_effort: str | None = None,
+    ) -> bool:
+        if reasoning_effort:
+            return False
+        model_lower = model_name.lower()
+        return not any(token in model_lower for token in ("gpt-5", "o1", "o3", "o4"))
+
+    def _should_use_responses_api(
+        self,
+        model_name: str,
+        reasoning_effort: str | None = None,
+    ) -> bool:
+        if getattr(self._spec, "name", None) != "openai":
+            return False
+        model_lower = model_name.lower()
+        return bool(reasoning_effort) or any(
+            token in model_lower for token in ("gpt-5", "o1", "o3", "o4")
+        )
+
+    @staticmethod
+    def _should_fallback_from_responses(exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code == 404:
+            return True
+        body = str(getattr(getattr(exc, "response", None), "text", "") or exc)
+        return status_code == 400 and "Unknown parameter" in body
+
+    def _build_responses_kwargs(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        max_tokens: int,
+        reasoning_effort: str | None,
+        tool_choice: str | dict[str, Any] | None,
+        *,
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        model_name = model or self.default_model
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "input": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "max_output_tokens": max(1, max_tokens),
+        }
+        if reasoning_effort:
+            kwargs["reasoning"] = {"effort": reasoning_effort}
+            kwargs["include"] = ["reasoning.encrypted_content"]
+        if tools:
+            kwargs["tools"] = tools
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
+        if stream:
+            kwargs["stream"] = True
+        return kwargs
+
+    def _reasoning_extra_body(self, reasoning_effort: str | None) -> dict[str, Any] | None:
+        if not reasoning_effort:
+            return None
+        provider_name = getattr(self._spec, "name", None)
+        if provider_name == "dashscope":
+            return {"enable_thinking": reasoning_effort != "minimal"}
+        if provider_name in {"volcengine", "byteplus"}:
+            return {"thinking": {"type": "disabled" if reasoning_effort == "minimal" else "enabled"}}
+        return None
 
     # ------------------------------------------------------------------
     # Response parsing
@@ -348,6 +443,86 @@ class OpenAICompatProvider(LLMProvider):
                 usage["cached_tokens"] = int(cached_tokens)
             return usage
         return {}
+
+    @classmethod
+    def _parse_responses_api(cls, response: Any) -> LLMResponse:
+        response_map = cls._maybe_mapping(response) or {}
+        output = response_map.get("output") or []
+        content_parts: list[str] = []
+        for item in output:
+            item_map = cls._maybe_mapping(item) or {}
+            if item_map.get("type") != "message":
+                continue
+            for part in item_map.get("content") or []:
+                part_map = cls._maybe_mapping(part) or {}
+                if part_map.get("type") == "output_text":
+                    text = part_map.get("text")
+                    if isinstance(text, str):
+                        content_parts.append(text)
+        usage_map = cls._maybe_mapping(response_map.get("usage")) or {}
+        usage = {
+            "prompt_tokens": int(usage_map.get("input_tokens") or 0),
+            "completion_tokens": int(usage_map.get("output_tokens") or 0),
+            "total_tokens": int(usage_map.get("total_tokens") or 0),
+        }
+        status = str(response_map.get("status") or "").strip().lower()
+        finish_reason = "stop" if status in {"completed", "succeeded"} else (status or None)
+        return LLMResponse(
+            content="".join(content_parts) or None,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+
+    @classmethod
+    async def _parse_responses_stream(
+        cls,
+        stream: Any,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        idle_timeout_s: int = 90,
+    ) -> LLMResponse:
+        content_parts: list[str] = []
+        finish_reason: str | None = None
+        usage: dict[str, int] = {}
+        stream_iter = stream.__aiter__()
+        effective_timeout_s = max(float(idle_timeout_s), 0.001)
+        while True:
+            try:
+                event = await _next_with_timeout(stream_iter, effective_timeout_s)
+            except StopAsyncIteration:
+                break
+            event_type = getattr(event, "type", "")
+            if event_type == "response.output_text.delta":
+                text = getattr(event, "delta", None)
+                if isinstance(text, str):
+                    content_parts.append(text)
+                    if on_content_delta:
+                        await on_content_delta(text)
+                continue
+            if event_type == "response.completed":
+                response = getattr(event, "response", None)
+                response_map = cls._maybe_mapping(response)
+                if response_map is not None:
+                    usage_map = cls._maybe_mapping(response_map.get("usage")) or {}
+                    usage = {
+                        "prompt_tokens": int(usage_map.get("input_tokens") or 0),
+                        "completion_tokens": int(usage_map.get("output_tokens") or 0),
+                        "total_tokens": int(usage_map.get("total_tokens") or 0),
+                    }
+                    status = str(response_map.get("status") or "").strip().lower()
+                else:
+                    raw_usage = getattr(response, "usage", None)
+                    usage = {
+                        "prompt_tokens": int(getattr(raw_usage, "input_tokens", 0) or 0),
+                        "completion_tokens": int(getattr(raw_usage, "output_tokens", 0) or 0),
+                        "total_tokens": int(getattr(raw_usage, "total_tokens", 0) or 0),
+                    }
+                    status = str(getattr(response, "status", "") or "").strip().lower()
+                finish_reason = "stop" if status in {"completed", "succeeded"} else (status or None)
+        return LLMResponse(
+            content="".join(content_parts) or None,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
 
     def _parse(self, response: Any) -> LLMResponse:
         if isinstance(response, str):
@@ -546,9 +721,19 @@ class OpenAICompatProvider(LLMProvider):
 
     @staticmethod
     def _handle_error(e: Exception) -> LLMResponse:
-        body = getattr(e, "doc", None) or getattr(getattr(e, "response", None), "text", None)
+        response = getattr(e, "response", None)
+        headers = getattr(response, "headers", None)
+        body = getattr(e, "doc", None) or getattr(response, "text", None)
         msg = f"Error: {body.strip()[:500]}" if body and body.strip() else f"Error calling LLM: {e}"
-        return LLMResponse(content=msg, finish_reason="error")
+        retry_after = LLMProvider._extract_retry_after_from_headers(headers)
+        if retry_after is None:
+            retry_after = LLMProvider._extract_retry_after(msg)
+        return LLMResponse(
+            content=msg,
+            finish_reason="error",
+            retry_after=retry_after,
+            error_retry_after_s=retry_after,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -564,8 +749,26 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
+        model_name = model or self.default_model
+        idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
+        if self._should_use_responses_api(model_name, reasoning_effort):
+            responses_kwargs = self._build_responses_kwargs(
+                messages,
+                tools,
+                model_name,
+                max_tokens,
+                reasoning_effort,
+                tool_choice,
+            )
+            try:
+                return self._parse_responses_api(
+                    await self._client.responses.create(**responses_kwargs)
+                )
+            except Exception as e:
+                if not self._should_fallback_from_responses(e):
+                    return self._handle_error(e)
         kwargs = self._build_kwargs(
-            messages, tools, model, max_tokens, temperature,
+            messages, tools, model_name, max_tokens, temperature,
             reasoning_effort, tool_choice,
         )
         try:
@@ -584,8 +787,39 @@ class OpenAICompatProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
+        model_name = model or self.default_model
+        idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
+        if self._should_use_responses_api(model_name, reasoning_effort):
+            responses_kwargs = self._build_responses_kwargs(
+                messages,
+                tools,
+                model_name,
+                max_tokens,
+                reasoning_effort,
+                tool_choice,
+                stream=True,
+            )
+            try:
+                stream = await self._client.responses.create(**responses_kwargs)
+                return await self._parse_responses_stream(
+                    stream,
+                    on_content_delta,
+                    idle_timeout_s=idle_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                return LLMResponse(
+                    content=(
+                        f"Error calling LLM: stream stalled for more than "
+                        f"{idle_timeout_s} seconds"
+                    ),
+                    finish_reason="error",
+                    error_kind="timeout",
+                )
+            except Exception as e:
+                if not self._should_fallback_from_responses(e):
+                    return self._handle_error(e)
         kwargs = self._build_kwargs(
-            messages, tools, model, max_tokens, temperature,
+            messages, tools, model_name, max_tokens, temperature,
             reasoning_effort, tool_choice,
         )
         kwargs["stream"] = True
@@ -593,13 +827,28 @@ class OpenAICompatProvider(LLMProvider):
         try:
             stream = await self._client.chat.completions.create(**kwargs)
             chunks: list[Any] = []
-            async for chunk in stream:
+            stream_iter = stream.__aiter__()
+            effective_timeout_s = max(float(idle_timeout_s), 0.001)
+            while True:
+                try:
+                    chunk = await _next_with_timeout(stream_iter, effective_timeout_s)
+                except StopAsyncIteration:
+                    break
                 chunks.append(chunk)
                 if on_content_delta and chunk.choices:
                     text = getattr(chunk.choices[0].delta, "content", None)
                     if text:
                         await on_content_delta(text)
             return self._parse_chunks(chunks)
+        except asyncio.TimeoutError:
+            return LLMResponse(
+                content=(
+                    f"Error calling LLM: stream stalled for more than "
+                    f"{idle_timeout_s} seconds"
+                ),
+                finish_reason="error",
+                error_kind="timeout",
+            )
         except Exception as e:
             return self._handle_error(e)
 

@@ -10,6 +10,7 @@ from urllib.parse import urljoin
 
 import httpx
 import json_repair
+from openai import AsyncOpenAI
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
@@ -48,6 +49,12 @@ class AzureOpenAIProvider(LLMProvider):
         if not api_base.endswith('/'):
             api_base += '/'
         self.api_base = api_base
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=api_base,
+            timeout=60.0,
+            max_retries=0,
+        )
 
     def _build_chat_url(self, deployment_name: str) -> str:
         """Build the Azure OpenAI chat completions URL."""
@@ -158,10 +165,27 @@ class AzureOpenAIProvider(LLMProvider):
                 return self._parse_response(response_data)
 
         except Exception as e:
-            return LLMResponse(
-                content=f"Error calling Azure OpenAI: {repr(e)}",
-                finish_reason="error",
-            )
+            return self._handle_error(e)
+
+    @classmethod
+    def _handle_error(cls, e: Exception) -> LLMResponse:
+        response = getattr(e, "response", None)
+        headers = getattr(response, "headers", None)
+        body = getattr(e, "body", None) or getattr(response, "text", None)
+        if body is None:
+            msg = f"Error calling Azure OpenAI: {repr(e)}"
+        else:
+            body_text = str(body).strip()
+            msg = f"Error: {body_text[:500]}" if body_text else f"Error calling Azure OpenAI: {repr(e)}"
+        retry_after = cls._extract_retry_after_from_headers(headers)
+        if retry_after is None:
+            retry_after = cls._extract_retry_after(msg)
+        return LLMResponse(
+            content=msg,
+            finish_reason="error",
+            retry_after=retry_after,
+            error_retry_after_s=retry_after,
+        )
 
     def _parse_response(self, response: dict[str, Any]) -> LLMResponse:
         """Parse Azure OpenAI response into our standard format."""
