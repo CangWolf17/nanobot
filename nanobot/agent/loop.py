@@ -15,10 +15,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.compact_state import CompactStateManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
-from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.memory import Dream, MemoryConsolidator
 from nanobot.agent.policy.dev_discipline import should_disable_concurrent_tools
 from nanobot.agent.retrieval import (
     MetadataRetrievalProvider,
@@ -54,6 +55,47 @@ if TYPE_CHECKING:
         WebSearchConfig,
     )
     from nanobot.cron.service import CronService
+
+
+UNIFIED_SESSION_KEY = "unified:default"
+
+
+def _default_memory_config() -> Any:
+    """Return a consolidation config object even when schema drift removed it."""
+    try:
+        from nanobot.config.schema import MemoryConsolidationConfig
+
+        return MemoryConsolidationConfig()
+    except ImportError:
+        return SimpleNamespace(
+            enabled=True,
+            compact_state_enabled=True,
+            compact_state_model="",
+            compact_state_max_chars=4000,
+            pre_reply_timeout_seconds=8.0,
+            background_timeout_seconds=20.0,
+            recent_history_fallback_messages=80,
+            model="",
+            retrieval_enabled=False,
+            retrieval_max_chars=1600,
+        )
+
+
+def _default_web_config(
+    web_search_config: "WebSearchConfig | None",
+    web_proxy: str | None,
+) -> Any:
+    """Return a web tools config object with the legacy .search/.proxy surface."""
+    try:
+        from nanobot.config.schema import WebToolsConfig
+
+        return WebToolsConfig()
+    except ImportError:
+        return SimpleNamespace(
+            enable=True,
+            proxy=web_proxy,
+            search=web_search_config,
+        )
 
 
 class _LoopHookChain(AgentHook):
@@ -150,6 +192,8 @@ class AgentLoop:
     _STREAM_COMPLETION_NOTICE_MIN_SECONDS = 8.0
     _STREAM_COMPLETION_NOTICE_MIN_CHARS = 600
     _STREAM_COMPLETION_NOTICE_MIN_CHUNKS = 12
+    _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
+    _PENDING_USER_TURN_KEY = "pending_user_turn"
 
     def _redirect_workspace_harness_if_interrupted(
         self,
@@ -388,8 +432,17 @@ class AgentLoop:
         archive_model: str | None = None,
         retrieval_provider: RetrievalProvider | None = None,
         hooks: list[AgentHook] | None = None,
+        context_block_limit: int | None = None,
+        max_tool_result_chars: int | None = None,
+        provider_retry_mode: str | None = None,
+        web_config: Any | None = None,
+        unified_session: bool = False,
+        disabled_skills: list[str] | None = None,
+        session_ttl_minutes: int | None = None,
+        tools_config: Any | None = None,
+        **kwargs,
     ):
-        from nanobot.config.schema import ExecToolConfig, MemoryConsolidationConfig, WebSearchConfig
+        from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
         self.bus = bus
         self.channels_config = channels_config
@@ -398,12 +451,17 @@ class AgentLoop:
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
-        self.web_search_config = web_search_config or WebSearchConfig()
+        self.web_config = web_config or _default_web_config(web_search_config, web_proxy)
+        self.web_search_config = (
+            web_search_config
+            or getattr(self.web_config, "search", None)
+            or WebSearchConfig()
+        )
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
-        self.memory_config = memory_config or MemoryConsolidationConfig()
+        self.memory_config = memory_config or _default_memory_config()
         self.archive_provider = archive_provider or provider
         self.archive_model = (
             archive_model or self.memory_config.model or (model or provider.get_default_model())
@@ -414,6 +472,20 @@ class AgentLoop:
         self._extra_hooks: list[AgentHook] = hooks or []
         self.retrieval_provider = retrieval_provider or NullRetrievalProvider()
         self._metadata_retrieval_provider = MetadataRetrievalProvider()
+        # Store compat params referenced by self.py:334 and nanobot.py caller
+        self.provider_retry_mode = provider_retry_mode or "standard"
+        self.max_tool_result_chars = (
+            self._TOOL_RESULT_MAX_CHARS
+            if max_tool_result_chars is None
+            else max_tool_result_chars
+        )
+        self.unified_session = unified_session
+        self._unified_session = unified_session
+        self.disabled_skills = disabled_skills or []
+        self._context_block_limit = context_block_limit
+        self._session_ttl_minutes = session_ttl_minutes or 0
+        self._web_config = self.web_config
+        self._tools_config = tools_config
 
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
@@ -460,6 +532,16 @@ class AgentLoop:
         # `loop.consolidator.archive(...)` from the upstream Consolidator surface.
         self.consolidator = SimpleNamespace(
             archive=self.memory_consolidator.archive_messages,
+        )
+        self.auto_compact = AutoCompact(
+            sessions=self.sessions,
+            consolidator=self.consolidator,
+            session_ttl_minutes=self._session_ttl_minutes,
+        )
+        self.dream = Dream(
+            store=self.context.memory,
+            provider=provider,
+            model=self.model,
         )
         compact_model = self.memory_config.compact_state_model or self.archive_model
         self.compact_state = CompactStateManager(
@@ -950,6 +1032,7 @@ class AgentLoop:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
+                self.auto_compact.check_expired(self._schedule_background)
                 continue
             except asyncio.CancelledError:
                 # Preserve real task cancellation so shutdown can complete cleanly.
@@ -971,10 +1054,13 @@ class AgentLoop:
             if fastlane := await try_workspace_fastlane(msg, raw):
                 await self.bus.publish_outbound(fastlane)
                 continue
+            effective_key = (
+                UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
+            )
             task = asyncio.create_task(self._dispatch(msg))
-            self._active_tasks.setdefault(msg.session_key, []).append(task)
+            self._active_tasks.setdefault(effective_key, []).append(task)
             task.add_done_callback(
-                lambda t, k=msg.session_key: (
+                lambda t, k=effective_key: (
                     self._active_tasks.get(k, []) and self._active_tasks[k].remove(t)
                     if t in self._active_tasks.get(k, [])
                     else None
@@ -983,6 +1069,8 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
+        if self._unified_session and not msg.session_key_override:
+            msg.session_key_override = UNIFIED_SESSION_KEY
         lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
@@ -1354,6 +1442,98 @@ class AgentLoop:
             self._save_turn(session, entries, skip=0)
         return snapshot
 
+    def _clear_pending_user_turn(self, session: Session) -> None:
+        session.metadata.pop(self._PENDING_USER_TURN_KEY, None)
+
+    def _clear_runtime_checkpoint(self, session: Session) -> None:
+        session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+
+    @staticmethod
+    def _checkpoint_message_key(message: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            message.get("role"),
+            message.get("content"),
+            message.get("tool_call_id"),
+            message.get("name"),
+            message.get("tool_calls"),
+            message.get("reasoning_content"),
+            message.get("thinking_blocks"),
+        )
+
+    def _restore_runtime_checkpoint(self, session: Session) -> bool:
+        """Materialize an unfinished turn into history before processing resumes."""
+        from datetime import datetime
+
+        checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+        if not isinstance(checkpoint, dict):
+            return False
+
+        assistant_message = checkpoint.get("assistant_message")
+        completed_tool_results = checkpoint.get("completed_tool_results") or []
+        pending_tool_calls = checkpoint.get("pending_tool_calls") or []
+
+        restored_messages: list[dict[str, Any]] = []
+        if isinstance(assistant_message, dict):
+            restored = dict(assistant_message)
+            restored.setdefault("timestamp", datetime.now().isoformat())
+            restored_messages.append(restored)
+        for message in completed_tool_results:
+            if isinstance(message, dict):
+                restored = dict(message)
+                restored.setdefault("timestamp", datetime.now().isoformat())
+                restored_messages.append(restored)
+        for tool_call in pending_tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_id = tool_call.get("id")
+            name = ((tool_call.get("function") or {}).get("name")) or "tool"
+            restored_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "name": name,
+                    "content": "Error: Task interrupted before this tool finished.",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+
+        overlap = 0
+        max_overlap = min(len(session.messages), len(restored_messages))
+        for size in range(max_overlap, 0, -1):
+            existing = session.messages[-size:]
+            restored = restored_messages[:size]
+            if all(
+                self._checkpoint_message_key(left) == self._checkpoint_message_key(right)
+                for left, right in zip(existing, restored)
+            ):
+                overlap = size
+                break
+        session.messages.extend(restored_messages[overlap:])
+        session.updated_at = datetime.now()
+        self._clear_pending_user_turn(session)
+        self._clear_runtime_checkpoint(session)
+        return True
+
+    def _restore_pending_user_turn(self, session: Session) -> bool:
+        """Close a turn that only persisted the user message before crashing."""
+        from datetime import datetime
+
+        if not session.metadata.get(self._PENDING_USER_TURN_KEY):
+            return False
+
+        if session.messages and session.messages[-1].get("role") == "user":
+            session.messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Error: Task interrupted before a response was generated.",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+            session.updated_at = datetime.now()
+
+        self._clear_pending_user_turn(session)
+        return True
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1371,6 +1551,11 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
+            if self._restore_runtime_checkpoint(session):
+                self.sessions.save(session)
+            if self._restore_pending_user_turn(session):
+                self.sessions.save(session)
+            session, _pending_summary = self.auto_compact.prepare_session(session, key)
             await self._maybe_run_pre_reply_consolidation(session, msg=msg)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), msg.metadata, msg.sender_id)
             history = session.get_history(max_messages=0)
@@ -1420,6 +1605,11 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+        if self._restore_runtime_checkpoint(session):
+            self.sessions.save(session)
+        if self._restore_pending_user_turn(session):
+            self.sessions.save(session)
+        session, _pending_summary = self.auto_compact.prepare_session(session, key)
 
         # Slash commands
         raw = msg.content.strip()
