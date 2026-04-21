@@ -287,7 +287,7 @@ async def cmd_tq(ctx: CommandContext) -> OutboundMessage:
     if raw.startswith("/tq "):
         content = raw[4:]
     elif raw.startswith("/turnqueue "):
-        content = raw[12:]
+        content = raw[11:]
     elif raw in ("/tq", "/turnqueue"):
         content = ""
     else:
