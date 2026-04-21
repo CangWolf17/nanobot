@@ -1305,7 +1305,10 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
-                forced_interactive = (msg.metadata or {}).get("workspace_agent_cmd") == "weather_brief"
+                forced_interactive = (
+                    (msg.metadata or {}).get("render_as") == "interactive"
+                    or (msg.metadata or {}).get("workspace_agent_cmd") == "weather_brief"
+                )
                 fmt = "interactive" if forced_interactive else self._detect_msg_format(msg.content)
 
                 if fmt == "text":
