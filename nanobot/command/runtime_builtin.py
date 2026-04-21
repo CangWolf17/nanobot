@@ -7,12 +7,14 @@ import subprocess
 from pathlib import Path
 from time import time
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command.harness import cmd_harness
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.command.workspace_bridge import cmd_workspace_bridge
 from nanobot.config.paths import get_workspace_path
 from nanobot.harness.service import HarnessService
+
+UNIFIED_SESSION_KEY = "unified:default"
 
 
 def build_help_text() -> str:
@@ -163,52 +165,193 @@ def schedule_session_archive(loop: object, snapshot: list[dict]) -> None:
 
 
 async def cmd_interrupt(ctx: CommandContext) -> OutboundMessage:
-    """Interrupt current execution while preserving session context."""
-    _cancelled, _sub_cancelled, total = await cancel_session_work(ctx)
+    """Interrupt current execution. If queue has work, auto-dispatch it after cancel."""
     msg = ctx.msg
     loop = ctx.loop
-    session = ctx.session or loop.sessions.get_or_create(ctx.key)
-    if total:
-        preserved = None
-        if hasattr(loop, "persist_interrupted_turn"):
-            preserved = loop.persist_interrupted_turn(session, ctx.key)
-        summary = "interrupted — waiting for redirect"
-        service = HarnessService.for_workspace(_resolve_workspace_root(loop))
-        runtime_meta = service.runtime_metadata(session_key=ctx.key)
-        harness_id = ""
-        active_harness = runtime_meta.get("active_harness") if isinstance(runtime_meta, dict) else None
-        if isinstance(active_harness, dict):
-            harness_id = str(active_harness.get("id") or "").strip()
-        service.interrupt_active(summary, session_key=ctx.key, harness_id=harness_id)
-        interrupt_state = {
-            "status": "interrupted",
-            "reason": "user_interrupt",
-            "session_key": ctx.key,
-            "interrupted_at": time(),
-            "summary": summary,
-        }
-        if harness_id:
-            interrupt_state["workspace_harness_id"] = harness_id
-        if isinstance(preserved, dict):
-            partial_preview = str(preserved.get("assistant_partial") or "").strip()
-            user_content = str(preserved.get("content") or "").strip()
-            if user_content:
-                interrupt_state["preserved_user_content"] = user_content
-            if partial_preview:
-                interrupt_state["partial_assistant_preview"] = partial_preview[:1000]
-        session.metadata["interrupt_state"] = interrupt_state
-        loop.sessions.save(session)
-    content = (
-        f"Interrupted {total} task(s). Context preserved — tell me how to redirect."
-        if total
-        else "No active task to interrupt."
-    )
+    effective_key = loop._unified_session and UNIFIED_SESSION_KEY or ctx.key
+
+    # Cancel active work
+    cancelled, sub_cancelled, total = await cancel_session_work(ctx)
+
+    # Check queue state
+    has_normal = loop.coordinator.has_normal_queued_work(effective_key, loop._unified_session)
+    has_turn = loop.coordinator.has_turn_slot(effective_key, loop._unified_session)
+
+    if not has_normal and not has_turn:
+        # No queue — legacy behavior
+        session = ctx.session or loop.sessions.get_or_create(ctx.key)
+        if total:
+            preserved = None
+            if hasattr(loop, "persist_interrupted_turn"):
+                preserved = loop.persist_interrupted_turn(session, ctx.key)
+            summary = "interrupted — waiting for redirect"
+            service = HarnessService.for_workspace(_resolve_workspace_root(loop))
+            runtime_meta = service.runtime_metadata(session_key=ctx.key)
+            harness_id = ""
+            active_harness = runtime_meta.get("active_harness") if isinstance(runtime_meta, dict) else None
+            if isinstance(active_harness, dict):
+                harness_id = str(active_harness.get("id") or "").strip()
+            service.interrupt_active(summary, session_key=ctx.key, harness_id=harness_id)
+            interrupt_state = {
+                "status": "interrupted",
+                "reason": "user_interrupt",
+                "session_key": ctx.key,
+                "interrupted_at": time(),
+                "summary": summary,
+            }
+            if harness_id:
+                interrupt_state["workspace_harness_id"] = harness_id
+            if isinstance(preserved, dict):
+                partial_preview = str(preserved.get("assistant_partial") or "").strip()
+                user_content = str(preserved.get("content") or "").strip()
+                if user_content:
+                    interrupt_state["preserved_user_content"] = user_content
+                if partial_preview:
+                    interrupt_state["partial_assistant_preview"] = partial_preview[:1000]
+            session.metadata["interrupt_state"] = interrupt_state
+            loop.sessions.save(session)
+        content = (
+            f"Interrupted {total} task(s). Context preserved — tell me how to redirect."
+            if total
+            else "No active task to interrupt."
+        )
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata={**dict(msg.metadata or {})},
+        )
+
+    # Queue has work — assemble and auto-dispatch
+    # Priority: turn slot > normal buffer
+    synthesized_msg = None
+    if has_turn:
+        turn_item = loop.coordinator.consume_turn_slot(effective_key, loop._unified_session)
+        if turn_item:
+            synthesized_msg = InboundMessage(
+                channel=turn_item.channel,
+                sender_id=turn_item.sender_id,
+                chat_id=turn_item.chat_id,
+                content=turn_item.content,
+                metadata={**turn_item.metadata, "_queued_turn": True, "_from_interrupt": True},
+            )
+    elif has_normal:
+        consumed, metrics = loop.coordinator.consume_normal_batch(
+            effective_key, loop._unified_session, max_items=10, max_chars=8000
+        )
+        if consumed:
+            synthesized_content = "\n---\n".join(item.content for item in consumed)
+            first = consumed[0]
+            synthesized_msg = InboundMessage(
+                channel=first.channel,
+                sender_id=first.sender_id,
+                chat_id=first.chat_id,
+                content=synthesized_content,
+                metadata={
+                    "_queued_batch": {
+                        "item_count": metrics.last_item_count,
+                        "char_count": metrics.last_char_count,
+                        "provenance_ids": [item.provenance_id for item in consumed],
+                    },
+                    "_from_interrupt": True,
+                },
+            )
+
+    if synthesized_msg:
+        # Auto-dispatch the synthesized message
+        asyncio.create_task(loop._dispatch(synthesized_msg))
+        content = f"Interrupted {total} task(s) and queued next message."
+    else:
+        content = f"Interrupted {total} task(s). Context preserved — tell me how to redirect."
+
     return OutboundMessage(
         channel=msg.channel,
         chat_id=msg.chat_id,
         content=content,
-        metadata=dict(msg.metadata or {}),
+        metadata={**dict(msg.metadata or {})},
     )
+
+
+async def cmd_tq(ctx: CommandContext) -> OutboundMessage:
+    """
+    /tq <message> — queue a message for the next turn slot.
+    /turnqueue <message> — alias.
+
+    One slot only. Second /tq while slot occupied → reject.
+    Idle session → immediately starts next turn.
+    """
+    msg = ctx.msg
+    raw = ctx.raw
+
+    # Extract content after /tq or /turnqueue
+    if raw.startswith("/tq "):
+        content = raw[4:]
+    elif raw.startswith("/turnqueue "):
+        content = raw[12:]
+    elif raw in ("/tq", "/turnqueue"):
+        content = ""
+    else:
+        content = ""
+
+    if not content.strip():
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="Usage: /tq <message> — queues your message for the next turn\n/turnqueue is an alias for /tq.",
+            metadata={**dict(msg.metadata or {}), "render_as": "text"},
+        )
+
+    loop = ctx.loop
+    effective_key = (
+        UNIFIED_SESSION_KEY if loop._unified_session and not msg.session_key_override else msg.session_key
+    )
+
+    # Check if session is idle
+    active_tasks = loop._active_tasks.get(effective_key, [])
+    has_active = any(not t.done() for t in active_tasks) if active_tasks else False
+
+    if not has_active:
+        # Idle: immediately dispatch — rewrite message to just content and let _dispatch handle it
+        new_msg = InboundMessage(
+            channel=msg.channel,
+            sender_id=msg.sender_id,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata={**dict(msg.metadata or {}), "_tq_turn": True},
+        )
+        task = asyncio.create_task(loop._dispatch(new_msg))
+        loop._active_tasks.setdefault(effective_key, []).append(task)
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="Queued for immediate turn.",
+            metadata={**dict(msg.metadata or {})},
+        )
+
+    # Active: reserve turn slot
+    reserved = loop.coordinator.reserve_turn_slot(
+        content=content,
+        channel=msg.channel,
+        chat_id=msg.chat_id,
+        sender_id=msg.sender_id,
+        session_key=effective_key,
+        unified=loop._unified_session,
+        metadata={"raw": raw, "_tq_turn": True},
+    )
+    if reserved:
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="Queued for the next turn.",
+            metadata={**dict(msg.metadata or {})},
+        )
+    else:
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="A turn is already queued. Wait for it to complete.",
+            metadata={**dict(msg.metadata or {})},
+        )
 
 
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
@@ -246,6 +389,8 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
 def register_runtime_commands(router: CommandRouter) -> None:
     """Register runtime-only builtins layered on top of the upstream command set."""
     router.priority("/interrupt", cmd_interrupt)
+    router.exact("/tq", cmd_tq)
+    router.exact("/turnqueue", cmd_tq)
     router.exact("/harness", cmd_harness)
     router.prefix("/harness ", cmd_harness)
     router.exact("/help", cmd_help)

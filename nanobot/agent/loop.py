@@ -294,6 +294,10 @@ class AgentLoop:
         return bool(self._decide_harness_auto_reentry(msg).get("should_fire"))
 
     async def _schedule_harness_auto_continue(self, msg: InboundMessage) -> None:
+        # Harness auto-continue defers to user queue work
+        effective_key = self._unified_session and "unified:default" or msg.session_key
+        if self.coordinator.has_queued_work(effective_key, self._unified_session):
+            return
         service = HarnessService.for_workspace(self.workspace)
         decision = self._decide_harness_auto_reentry(msg)
         if not bool(decision.get("should_fire")):
@@ -1057,6 +1061,35 @@ class AgentLoop:
             effective_key = (
                 UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
             )
+
+            # --- pre-lock admission ---
+            raw = msg.content.strip()
+            # Plain user message — check if session is active (has running tasks)
+            active_tasks = self._active_tasks.get(effective_key, [])
+            has_active = any(not t.done() for t in active_tasks) if active_tasks else False
+            if has_active:
+                # Session is active — admit to normal queue, do NOT spawn _dispatch
+                self.coordinator.enqueue_normal(
+                    content=msg.content,
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    sender_id=msg.sender_id,
+                    session_key=effective_key,
+                    unified=self._unified_session,
+                    metadata={},
+                )
+                # Acknowledge queued
+                response = OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Message queued. Will be sent when the current turn finishes.",
+                    metadata=dict(msg.metadata or {}),
+                )
+                await self.bus.publish_outbound(response)
+                continue
+            # else: fall through to normal _dispatch
+            # --- end pre-lock admission ---
+
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(effective_key, []).append(task)
             task.add_done_callback(
