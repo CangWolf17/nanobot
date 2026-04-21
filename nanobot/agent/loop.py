@@ -1298,6 +1298,8 @@ class AgentLoop:
                         content="Sorry, I encountered an error.",
                     )
                 )
+            finally:
+                self.coordinator.set_dispatch_state(effective_key, DispatchState.IDLE, self._unified_session)
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -1825,6 +1827,13 @@ class AgentLoop:
             message_id=msg.metadata.get("message_id"),
             sender_id=msg.sender_id,
         )
+
+        # Safe boundary: consume queued normal items after iteration settles
+        key = session_key or msg.session_key
+        effective_key = (
+            UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else key
+        )
+        await self._maybe_consume_normal_queue(effective_key)
 
         final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
         final_content, key_principle_notice = self._extract_terminal_key_principle(final_content)
