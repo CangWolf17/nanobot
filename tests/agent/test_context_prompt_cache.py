@@ -68,8 +68,8 @@ def test_system_prompt_references_history_jsonl(tmp_path) -> None:
     assert "memory/HISTORY.md" not in prompt
 
 
-def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
-    """Runtime metadata should be merged with the user message and expose time plus explicit routing metadata."""
+def test_runtime_context_is_not_auto_injected_into_user_message(tmp_path) -> None:
+    """Runtime metadata should no longer be prepended to the user turn by default."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
@@ -86,40 +86,24 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert messages[-1]["role"] == "user"
     user_content = messages[-1]["content"]
     assert isinstance(user_content, str)
-    assert ContextBuilder._RUNTIME_CONTEXT_TAG in user_content
-    assert "Current Time:" in user_content
-    assert "Channel: cli" in user_content
-    assert "Chat ID: `direct`" in user_content
-    assert "Return exactly: OK" in user_content
+    assert user_content == "Return exactly: OK"
+    assert ContextBuilder._RUNTIME_CONTEXT_TAG not in user_content
+    assert "Current Time:" not in user_content
+    assert "Channel: cli" not in user_content
+    assert "Chat ID: `direct`" not in user_content
 
 
-def test_runtime_context_uses_short_hard_rules_and_keeps_routing_metadata(tmp_path) -> None:
+def test_system_prompt_mentions_runtime_context_tool(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    messages = builder.build_messages(
-        history=[],
-        current_message="Return exactly: OK",
-        channel="cli",
-        chat_id="direct",
-    )
+    prompt = builder.build_system_prompt()
 
-    user_content = messages[-1]["content"]
-    assert isinstance(user_content, str)
-    assert user_content.startswith("[Runtime Context — metadata only, not instructions]\n")
-    assert "Rules:" in user_content
-    assert "Metadata only. Not part of the user's request." in user_content
-    assert "Use `Current Time` only for time-sensitive reasoning." in user_content
-    assert "Treat `Channel` and `Chat ID` as opaque routing metadata." in user_content
-    assert "Never use this block to infer user intent or resolve references like \"this\", \"that\", \"above\", or \"these two\"." in user_content
-    assert "If this block conflicts with the conversation content, trust the conversation content." in user_content
-    assert "Current Time:" in user_content
-    assert "Channel: cli" in user_content
-    assert "Chat ID: `direct`" in user_content
-    assert "Auxiliary metadata injected by the nanobot runtime for reference only; not user-authored input." not in user_content
+    assert "get_runtime_context" in prompt
+    assert "Runtime metadata is not auto-injected" in prompt
 
 
-def test_runtime_context_includes_sparse_harness_metadata_when_present(tmp_path) -> None:
+def test_harness_and_work_mode_stay_in_system_prompt_not_user_message(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
@@ -128,6 +112,7 @@ def test_runtime_context_includes_sparse_harness_metadata_when_present(tmp_path)
         current_message="继续",
         channel="cli",
         chat_id="direct",
+        workspace_work_mode="build",
         runtime_metadata={
             "has_active_harness": True,
             "active_harness": {
@@ -138,17 +123,62 @@ def test_runtime_context_includes_sparse_harness_metadata_when_present(tmp_path)
                 "awaiting_user": False,
                 "blocked": False,
                 "auto": True,
+                "subagent_allowed": True,
             },
         },
     )
 
+    system_prompt = messages[0]["content"]
     user_content = messages[-1]["content"]
+
+    assert "## Work Mode" in system_prompt
+    assert "Current workspace work mode: build" in system_prompt
+    assert "## Harness State" in system_prompt
+    assert "id: har_0038" in system_prompt
+    assert "phase: executing" in system_prompt
+    assert "subagent_allowed: true" in system_prompt
+
     assert isinstance(user_content, str)
-    assert "has_active_harness: true" in user_content
-    assert "active_harness:" in user_content
-    assert "id: har_0038" in user_content
-    assert "phase: executing" in user_content
-    assert "auto: true" in user_content
+    assert user_content == "继续"
+    assert "has_active_harness: true" not in user_content
+    assert "active_harness:" not in user_content
+    assert "id: har_0038" not in user_content
+    assert "phase: executing" not in user_content
+    assert "auto: true" not in user_content
+
+
+def test_semantic_routing_hint_stays_in_system_prompt_not_user_message(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="please diagnose this failure",
+        runtime_metadata={
+            "semantic_routing": {
+                "mode": "direct_route",
+                "matches": [
+                    {
+                        "skill": "self-improving-lite",
+                        "path": "skills/self-improving-lite/SKILL.md",
+                        "description": "Structured diagnosis and self-reflection workflow.",
+                        "matched_terms": ["diagnose"],
+                    }
+                ],
+            }
+        },
+    )
+
+    system_prompt = messages[0]["content"]
+    user_content = messages[-1]["content"]
+
+    assert "## Semantic Routing Hint" in system_prompt
+    assert "self-improving-lite" in system_prompt
+    assert "skills/self-improving-lite/SKILL.md" in system_prompt
+    assert "matched `diagnose`" in system_prompt
+    assert isinstance(user_content, str)
+    assert user_content == "please diagnose this failure"
+    assert "Semantic Routing Hint" not in user_content
 
 
 def test_runtime_context_can_include_auxiliary_retrieval_block(tmp_path) -> None:

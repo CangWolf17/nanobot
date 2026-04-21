@@ -456,7 +456,7 @@ async def test_system_subagent_followup_is_persisted_before_prompt_assembly(tmp_
     non_system = [m for m in seen["initial_messages"] if m.get("role") != "system"]
     assert [m["content"] for m in non_system[:2]] == ["question", "working"]
     assert non_system[2]["content"].count("subagent result") == 1
-    assert "Current Time:" in non_system[2]["content"]
+    assert "Current Time:" not in non_system[2]["content"]
 
     loop.sessions.invalidate("cli:test")
     persisted = loop.sessions.get_or_create("cli:test")

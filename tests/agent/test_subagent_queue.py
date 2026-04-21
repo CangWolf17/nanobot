@@ -151,3 +151,38 @@ async def test_default_profile_does_not_register_sensitive_tools(tmp_path) -> No
 
     assert tools.get("message") is None
     assert tools.get("spawn") is None
+
+
+def test_subagent_prompt_keeps_work_mode_and_harness_constraints(tmp_path) -> None:
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+
+    prompt = mgr._build_subagent_prompt(
+        origin={
+            "channel": "feishu",
+            "chat_id": "chat-1",
+            "metadata": {
+                "workspace_runtime": {
+                    "work_mode": "build",
+                    "active_harness": {
+                        "id": "har_0038",
+                        "status": "active",
+                        "phase": "executing",
+                        "subagent_allowed": True,
+                    }
+                }
+            },
+        }
+    )
+
+    assert "## Work Mode" in prompt
+    assert "Current workspace work mode: build" in prompt
+    assert "## Harness State" in prompt
+    assert "id: har_0038" in prompt
+    assert "phase: executing" in prompt
+    assert "subagent_allowed: true" in prompt

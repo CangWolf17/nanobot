@@ -14,6 +14,7 @@ from pathlib import Path
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command.fastlane import build_workspace_env, try_workspace_fastlane
 from nanobot.command.router import CommandContext
+from nanobot.command.semantic_router import SemanticSkillRouter
 from nanobot.config.paths import get_workspace_path
 
 WORKSPACE_ROUTER = Path.home() / ".nanobot" / "workspace" / "scripts" / "router.py"
@@ -169,13 +170,40 @@ def prepare_active_workflow_continuation(
     return True
 
 
+def apply_semantic_skill_routing(
+    msg: InboundMessage,
+    *,
+    workspace_root: Path | None = None,
+) -> bool:
+    raw = (msg.content or "").strip()
+    if not raw or raw.startswith("/"):
+        return False
+    meta = msg.metadata if isinstance(msg.metadata, dict) else {}
+    if meta.get("workspace_agent_cmd"):
+        return False
+
+    root = workspace_root or _workspace_root_from_router()
+    routed = SemanticSkillRouter(root).route(raw)
+    if not routed:
+        return False
+
+    runtime_meta = meta.get("workspace_runtime")
+    merged_runtime = dict(runtime_meta) if isinstance(runtime_meta, dict) else {}
+    merged_runtime["semantic_routing"] = routed
+    meta["workspace_runtime"] = merged_runtime
+    msg.metadata = meta
+    return True
+
+
 async def cmd_workspace_bridge(ctx: CommandContext) -> OutboundMessage | None:
     raw = (ctx.raw or "").strip()
     if not raw.startswith("/"):
         workspace_root = None
         if ctx.loop is not None:
             workspace_root = get_workspace_path(getattr(ctx.loop, "workspace", None))
-        prepare_active_workflow_continuation(ctx.msg, workspace_root=workspace_root)
+        continued = prepare_active_workflow_continuation(ctx.msg, workspace_root=workspace_root)
+        if not continued:
+            apply_semantic_skill_routing(ctx.msg, workspace_root=workspace_root)
         return None
     if raw.lower() == "/harness" or raw.lower().startswith("/harness "):
         return None

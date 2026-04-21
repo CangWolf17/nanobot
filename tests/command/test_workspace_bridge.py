@@ -81,6 +81,46 @@ def test_workspace_bridge_prepares_active_merge_workflow_continuation_for_non_sl
     assert result is None
     assert ctx.msg.metadata["workspace_agent_cmd"] == "merge"
     assert ctx.msg.metadata["workspace_agent_input"] == "prepared merge continuation"
+
+
+def test_workspace_bridge_injects_advisory_semantic_skill_routing_for_plain_message(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "skills").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "skills" / "skill-map.json").write_text(
+        """{
+  "self-improving-lite": {
+    "path": "skills/self-improving-lite/SKILL.md",
+    "keywords": ["reflect", "improve"],
+    "description": "Structured diagnosis and self-reflection workflow."
+  }
+}""",
+        encoding="utf-8",
+    )
+    ctx = CommandContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="ou_test",
+            content="please diagnose this failure",
+            metadata={},
+        ),
+        session=None,
+        key="feishu:ou_test",
+        raw="please diagnose this failure",
+        args="",
+        loop=None,
+    )
+
+    with patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"):
+        (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
+        result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is None
+    semantic = ctx.msg.metadata["workspace_runtime"]["semantic_routing"]
+    assert semantic["mode"] == "direct_route"
+    assert semantic["preserve_explicit_commands"] is True
+    assert semantic["matches"][0]["skill"] == "self-improving-lite"
     completed = MagicMock(stdout="Autopilot: idle\n", stderr="", returncode=0)
     ctx = CommandContext(
         msg=InboundMessage(

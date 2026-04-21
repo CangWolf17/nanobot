@@ -38,6 +38,7 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.runtime_context import RuntimeContextTool
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
@@ -325,11 +326,17 @@ class AgentLoop:
                 )
         except Exception:
             service_meta = {"has_active_harness": False}
+        explicit_runtime_payload = (
+            dict(explicit_runtime) if isinstance(explicit_runtime, dict) else {}
+        )
         if bool(service_meta.get("has_active_harness")):
             runtime_meta.update(service_meta)
+            for key, value in explicit_runtime_payload.items():
+                if key not in runtime_meta:
+                    runtime_meta[key] = value
             return runtime_meta
-        if isinstance(explicit_runtime, dict) and explicit_runtime:
-            runtime_meta.update(explicit_runtime)
+        if explicit_runtime_payload:
+            runtime_meta.update(explicit_runtime_payload)
             return runtime_meta
         runtime_meta.update(service_meta)
         return runtime_meta
@@ -864,6 +871,9 @@ class AgentLoop:
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        self.tools.register(
+            RuntimeContextTool(workspace=self.workspace, timezone=self.context.timezone)
+        )
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(
@@ -896,12 +906,14 @@ class AgentLoop:
         sender_id: str = "",
     ) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "get_runtime_context"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     if name == "message":
                         tool.set_context(channel, chat_id, message_id)
                     elif name == "spawn":
+                        tool.set_context(channel, chat_id, metadata)
+                    elif name == "get_runtime_context":
                         tool.set_context(channel, chat_id, metadata)
                     else:
                         tool.set_context(channel, chat_id, sender_id)
@@ -1996,12 +2008,21 @@ class AgentLoop:
                 msg=msg,
                 session_summary=pending_summary,
             )
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), msg.metadata, msg.sender_id)
+            runtime_metadata = self._extract_runtime_metadata(msg)
+            tool_metadata = dict(msg.metadata or {})
+            if runtime_metadata:
+                tool_metadata["workspace_runtime"] = runtime_metadata
+            self._set_tool_context(
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                tool_metadata,
+                msg.sender_id,
+            )
             history = session.get_history(max_messages=0)
             if inserted_subagent_followup and history:
                 history = history[:-1]
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
-            runtime_metadata = self._extract_runtime_metadata(msg)
             retrieval_context = await self._build_retrieval_context(
                 history=history,
                 current_message=msg.content,
