@@ -21,6 +21,7 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Dream, MemoryConsolidator
 from nanobot.agent.policy.dev_discipline import should_disable_concurrent_tools
+from nanobot.agent.queue import SessionQueueCoordinator
 from nanobot.agent.retrieval import (
     MetadataRetrievalProvider,
     NullRetrievalProvider,
@@ -554,6 +555,7 @@ class AgentLoop:
         self._register_default_tools()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+        self.coordinator = SessionQueueCoordinator()
 
     async def _maybe_consolidate_and_sync_compact_state(self, session: Session) -> bool:
         completed = await self.memory_consolidator.maybe_consolidate_by_tokens(session)
