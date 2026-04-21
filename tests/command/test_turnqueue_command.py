@@ -6,9 +6,8 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from nanobot.bus.events import InboundMessage
-from nanobot.command.runtime_builtin import cmd_tq
 from nanobot.command.router import CommandContext
-
+from nanobot.command.runtime_builtin import cmd_tq
 
 # ---------------------------------------------------------------------------
 # Fake loop — uses real dict for _active_tasks so iteration works correctly
@@ -29,6 +28,19 @@ class _FakeLoop:
             self._active_tasks["cli:direct"] = active_tasks
         self._dispatch = AsyncMock()
         self.coordinator = coordinator or MagicMock()
+
+    def _spawn_dispatch_task(self, msg: InboundMessage, *, effective_key: str | None = None):
+        key = effective_key or "cli:direct"
+        task = asyncio.create_task(self._dispatch(msg))
+        self._active_tasks.setdefault(key, []).append(task)
+
+        def _remove(done):
+            tasks = self._active_tasks.get(key, [])
+            if done in tasks:
+                tasks.remove(done)
+
+        task.add_done_callback(_remove)
+        return task
 
     def __getattr__(self, name: str):
         # Fall through for any unset attributes
@@ -202,3 +214,33 @@ def test_unified_session_key_override_skips_unified():
 
     assert result.content == "Queued for immediate turn."
     assert "cli:direct" in loop._active_tasks
+
+
+def test_idle_tq_tracks_and_prunes_dispatch_task():
+    """Immediate /tq dispatch should be tracked like a normal turn, then pruned when done."""
+
+    async def _run():
+        loop = _FakeLoop(active_tasks=[])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _dispatch(msg):
+            started.set()
+            await release.wait()
+
+        loop._dispatch = AsyncMock(side_effect=_dispatch)
+        ctx = _make_ctx("/tq tracked", loop)
+
+        result = await cmd_tq(ctx)
+
+        assert result.content == "Queued for immediate turn."
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert any(not task.done() for task in loop._active_tasks["cli:direct"])
+        release.set()
+        for _ in range(5):
+            if loop._active_tasks["cli:direct"] == []:
+                break
+            await asyncio.sleep(0)
+        assert loop._active_tasks["cli:direct"] == []
+
+    asyncio.run(_run())

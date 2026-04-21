@@ -55,7 +55,14 @@ class Session:
         out: list[dict[str, Any]] = []
         for message in sliced:
             entry: dict[str, Any] = {"role": message["role"], "content": message.get("content", "")}
-            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
+            for key in (
+                "tool_calls",
+                "tool_call_id",
+                "name",
+                "reasoning_content",
+                "injected_event",
+                "subagent_task_id",
+            ):
                 if key in message:
                     entry[key] = message[key]
             out.append(entry)
@@ -120,6 +127,20 @@ class SessionManager:
         """Legacy global session path (~/.nanobot/sessions/)."""
         return self.legacy_sessions_dir / f"{self.safe_key(key)}.jsonl"
 
+    def _recover_misarchived_session_path(self, key: str, target_path: Path) -> bool:
+        """Recover a uniquely misarchived local session from sessions.migrated.* directories."""
+        pattern = f"{self.safe_key(key)}.jsonl"
+        candidates = sorted(self.workspace.glob(f"sessions.migrated.*/{pattern}"))
+        if len(candidates) != 1:
+            return False
+        try:
+            shutil.move(str(candidates[0]), str(target_path))
+            logger.info("Recovered session {} from misarchived path {}", key, candidates[0])
+            return True
+        except Exception:
+            logger.exception("Failed to recover misarchived session {}", key)
+            return False
+
     def get_or_create(self, key: str) -> Session:
         """
         Get an existing session or create a new one.
@@ -151,6 +172,8 @@ class SessionManager:
                     logger.info("Migrated session {} from legacy path", key)
                 except Exception:
                     logger.exception("Failed to migrate session {}", key)
+            else:
+                self._recover_misarchived_session_path(key, path)
 
         if not path.exists():
             return None

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import dis
+import inspect
 import json
 import os
 import re
@@ -19,7 +21,7 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.compact_state import CompactStateManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
-from nanobot.agent.memory import Dream, MemoryConsolidator
+from nanobot.agent.memory import Consolidator, Dream, MemoryConsolidator
 from nanobot.agent.policy.dev_discipline import should_disable_concurrent_tools
 from nanobot.agent.queue import DispatchState, SessionQueueCoordinator
 from nanobot.agent.retrieval import (
@@ -161,6 +163,53 @@ class _LoopHookChain(AgentHook):
         return self._extras.finalize_content(context, content)
 
 
+class _RunLoopResult:
+    """Compatibility wrapper so older call sites can unpack either 3 or 5 values."""
+
+    __slots__ = ("final_content", "tools_used", "messages", "stop_reason", "metadata_flag")
+
+    def __init__(
+        self,
+        final_content: str | None,
+        tools_used: list[str],
+        messages: list[dict],
+        stop_reason: str | None = None,
+        metadata_flag: bool = False,
+    ) -> None:
+        self.final_content = final_content
+        self.tools_used = tools_used
+        self.messages = messages
+        self.stop_reason = stop_reason
+        self.metadata_flag = metadata_flag
+
+    def _expected_unpack_count(self) -> int:
+        frame = inspect.currentframe()
+        caller = frame.f_back if frame is not None else None
+        while caller is not None:
+            for instruction in dis.get_instructions(caller.f_code):
+                if instruction.offset != caller.f_lasti:
+                    continue
+                if instruction.opname == "UNPACK_SEQUENCE":
+                    return int(instruction.arg or 0)
+                if instruction.opname == "UNPACK_EX":
+                    arg = int(instruction.arg or 0)
+                    return (arg & 0xFF) + (arg >> 8) + 1
+                break
+            caller = caller.f_back
+        return 3
+
+    def __iter__(self):
+        expected = self._expected_unpack_count()
+        values = [
+            self.final_content,
+            self.tools_used,
+            self.messages,
+            self.stop_reason,
+            self.metadata_flag,
+        ]
+        yield from values[: expected or 5]
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -196,6 +245,36 @@ class AgentLoop:
     _STREAM_COMPLETION_NOTICE_MIN_CHUNKS = 12
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
+
+    def _track_active_task(self, effective_key: str, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        """Register a dispatch task under the effective session key and auto-prune it on completion."""
+        self._active_tasks.setdefault(effective_key, []).append(task)
+
+        def _remove_task(done: asyncio.Task[Any], key: str = effective_key) -> None:
+            tasks = self._active_tasks.get(key, [])
+            if done in tasks:
+                tasks.remove(done)
+
+        task.add_done_callback(_remove_task)
+        return task
+
+    def _spawn_dispatch_task(
+        self,
+        msg: InboundMessage,
+        *,
+        effective_key: str | None = None,
+    ) -> asyncio.Task[Any]:
+        """Create and track a dispatch task so queue admission and /stop stay accurate."""
+        key = effective_key or (
+            UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
+        )
+        task = asyncio.create_task(self._dispatch(msg))
+        return self._track_active_task(key, task)
+
+    @staticmethod
+    def _is_queueable_followup(raw: str) -> bool:
+        """Only plain user messages join the normal queue; slash commands keep command semantics."""
+        return bool(raw) and not raw.startswith("/")
 
     def _redirect_workspace_harness_if_interrupted(
         self,
@@ -535,10 +614,15 @@ class AgentLoop:
             archive_provider=self.archive_provider,
             archive_model=self.archive_model,
         )
-        # Compatibility shim for tests/runtime paths that still expect
-        # `loop.consolidator.archive(...)` from the upstream Consolidator surface.
-        self.consolidator = SimpleNamespace(
-            archive=self.memory_consolidator.archive_messages,
+        self.consolidator = Consolidator(
+            store=self.context.memory,
+            provider=provider,
+            model=self.model,
+            sessions=self.sessions,
+            context_window_tokens=context_window_tokens,
+            build_messages=self.context.build_messages,
+            get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=provider.generation.max_tokens,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
@@ -561,8 +645,16 @@ class AgentLoop:
         register_builtin_commands(self.commands)
         self.coordinator = SessionQueueCoordinator()
 
-    async def _maybe_consolidate_and_sync_compact_state(self, session: Session) -> bool:
-        completed = await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+    async def _maybe_consolidate_and_sync_compact_state(
+        self,
+        session: Session,
+        *,
+        session_summary: str | None = None,
+    ) -> bool:
+        completed = await self.consolidator.maybe_consolidate_by_tokens(
+            session,
+            session_summary=session_summary,
+        )
         if not completed or not self.memory_config.compact_state_enabled:
             return completed
         synced = await self.compact_state.sync_session(session)
@@ -936,7 +1028,8 @@ class AgentLoop:
         chat_id: str = "direct",
         message_id: str | None = None,
         sender_id: str = "user",
-    ) -> tuple[str | None, list[str], list[dict]]:
+        session: Session | None = None,
+    ) -> _RunLoopResult:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
@@ -1024,7 +1117,13 @@ class AgentLoop:
             logger.error(
                 "LLM returned error: {}", ((result.error or result.final_content) or "")[:200]
             )
-        return result.final_content, result.tools_used, result.messages
+        return _RunLoopResult(
+            result.final_content,
+            result.tools_used,
+            result.messages,
+            result.stop_reason,
+            False,
+        )
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -1067,7 +1166,7 @@ class AgentLoop:
             # Plain user message — check if session is active (has running tasks)
             active_tasks = self._active_tasks.get(effective_key, [])
             has_active = any(not t.done() for t in active_tasks) if active_tasks else False
-            if has_active:
+            if has_active and self._is_queueable_followup(raw):
                 # Session is active — admit to normal queue, do NOT spawn _dispatch
                 self.coordinator.enqueue_normal(
                     content=msg.content,
@@ -1090,15 +1189,7 @@ class AgentLoop:
             # else: fall through to normal _dispatch
             # --- end pre-lock admission ---
 
-            task = asyncio.create_task(self._dispatch(msg))
-            self._active_tasks.setdefault(effective_key, []).append(task)
-            task.add_done_callback(
-                lambda t, k=effective_key: (
-                    self._active_tasks.get(k, []) and self._active_tasks[k].remove(t)
-                    if t in self._active_tasks.get(k, [])
-                    else None
-                )
-            )
+            self._spawn_dispatch_task(msg, effective_key=effective_key)
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
@@ -1301,6 +1392,11 @@ class AgentLoop:
             finally:
                 self.coordinator.set_dispatch_state(effective_key, DispatchState.IDLE, self._unified_session)
 
+        if pending_msg := self.coordinator.pop_pending_dispatch(
+            effective_key, self._unified_session
+        ):
+            self._spawn_dispatch_task(pending_msg, effective_key=effective_key)
+
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
         if self._background_tasks:
@@ -1327,13 +1423,14 @@ class AgentLoop:
         task.add_done_callback(self._background_tasks.remove)
 
     async def _maybe_consume_normal_queue(self, session_key: str) -> None:
-        """Called at safe boundaries — check if normal queue has items and consume."""
+        """Called at safe boundaries — queue a post-lock dispatch for normal items."""
         if not self.coordinator.has_normal_queued_work(session_key, self._unified_session):
             return
 
-        # Don't consume if turn is closing or dispatching reserved turn
+        # Safe-boundary normal consumption is allowed during TURN_CLOSING, but not while
+        # a reserved turn is already being dispatched.
         state = self.coordinator.get_dispatch_state(session_key, self._unified_session)
-        if state == DispatchState.TURN_CLOSING or state == DispatchState.DISPATCHING_RESERVED_TURN:
+        if state == DispatchState.DISPATCHING_RESERVED_TURN:
             return
 
         consumed, metrics = self.coordinator.consume_normal_batch(
@@ -1366,11 +1463,14 @@ class AgentLoop:
             metadata={"_queued_batch": provenance},
         )
 
-        # Dispatch via _dispatch (this will also update dispatch_state)
-        await self._dispatch(synthesized_msg)
+        self.coordinator.set_pending_dispatch(
+            session_key,
+            synthesized_msg,
+            self._unified_session,
+        )
 
     async def _maybe_dispatch_race_window_merge(self, session_key: str) -> None:
-        """Race window: if late normal arrived while /tq slot was reserved, merge into one turn."""
+        """Race window: if late normal arrived while /tq slot was reserved, queue one merged post-lock dispatch."""
         normals, turn_item = self.coordinator.peek_and_assemble_race_window(
             session_key, self._unified_session
         )
@@ -1407,9 +1507,18 @@ class AgentLoop:
         self.coordinator.set_dispatch_state(
             session_key, DispatchState.DISPATCHING_RESERVED_TURN, self._unified_session
         )
-        await self._dispatch(synthesized_msg)
+        self.coordinator.set_pending_dispatch(
+            session_key,
+            synthesized_msg,
+            self._unified_session,
+        )
 
-    async def _run_pre_reply_consolidation(self, session: Session) -> bool:
+    async def _run_pre_reply_consolidation(
+        self,
+        session: Session,
+        *,
+        session_summary: str | None = None,
+    ) -> bool:
         """Best-effort pre-reply consolidation. Returns True if it completed cleanly."""
         if not self.memory_config.enabled:
             return True
@@ -1422,7 +1531,10 @@ class AgentLoop:
                 self.archive_model,
             )
             completed = await asyncio.wait_for(
-                self._maybe_consolidate_and_sync_compact_state(session),
+                self._maybe_consolidate_and_sync_compact_state(
+                    session,
+                    session_summary=session_summary,
+                ),
                 timeout=timeout,
             )
             return completed
@@ -1431,7 +1543,7 @@ class AgentLoop:
                 "Pre-reply consolidation timed out for {} after {}s", session.key, timeout
             )
             try:
-                await self.memory_consolidator.handle_timeout(session, phase="pre-reply")
+                await self.consolidator.handle_timeout(session, phase="pre-reply")
             except Exception:
                 logger.exception(
                     "Failed to record pre-reply consolidation timeout for {}", session.key
@@ -1446,14 +1558,21 @@ class AgentLoop:
         session: Session,
         *,
         msg: InboundMessage | None = None,
+        session_summary: str | None = None,
     ) -> tuple[bool, str]:
         if not self.memory_config.enabled:
             return False, "memory_disabled"
         if msg is not None and bool((msg.metadata or {}).get("workspace_harness_auto")):
             return False, self._PRE_REPLY_CONSOLIDATION_SKIP_REASON_HARNESS_AUTO
-        over_budget, _estimated, _source = self.memory_consolidator.is_over_budget(session)
+        if session_summary:
+            return True, "pending_summary"
+        over_budget, estimated, source = self.consolidator.is_over_budget(
+            session,
+            session_summary=session_summary,
+        )
         if not over_budget:
             return False, self._PRE_REPLY_CONSOLIDATION_SKIP_REASON_UNDER_BUDGET
+        self.consolidator.prime_budget_estimate(session.key, estimated, source)
         return True, "over_budget"
 
     async def _maybe_run_pre_reply_consolidation(
@@ -1461,12 +1580,20 @@ class AgentLoop:
         session: Session,
         *,
         msg: InboundMessage | None = None,
+        session_summary: str | None = None,
     ) -> bool:
-        should_run, reason = self._should_run_pre_reply_consolidation(session, msg=msg)
+        should_run, reason = self._should_run_pre_reply_consolidation(
+            session,
+            msg=msg,
+            session_summary=session_summary,
+        )
         if not should_run:
             logger.debug("Pre-reply consolidation skipped for {}: {}", session.key, reason)
             return True
-        return await self._run_pre_reply_consolidation(session)
+        return await self._run_pre_reply_consolidation(
+            session,
+            session_summary=session_summary,
+        )
 
     async def _run_background_consolidation(self, session: Session) -> None:
         """Best-effort background consolidation with a looser timeout."""
@@ -1487,7 +1614,7 @@ class AgentLoop:
                 "Background consolidation timed out for {} after {}s", session.key, timeout
             )
             try:
-                await self.memory_consolidator.handle_timeout(session, phase="background")
+                await self.consolidator.handle_timeout(session, phase="background")
             except Exception:
                 logger.exception(
                     "Failed to record background consolidation timeout for {}", session.key
@@ -1510,7 +1637,7 @@ class AgentLoop:
             return history
 
         fallback_max = max(1, int(self.memory_config.recent_history_fallback_messages))
-        over_budget, estimated, source = self.memory_consolidator.is_over_budget(session)
+        over_budget, estimated, source = self.consolidator.is_over_budget(session)
         if not over_budget:
             return history
 
@@ -1547,6 +1674,16 @@ class AgentLoop:
     def _discard_inflight_turn(self, session_key: str) -> None:
         self._inflight_turns.pop(session_key, None)
 
+    @staticmethod
+    def _coerce_run_loop_result(
+        result: _RunLoopResult | tuple[Any, ...] | list[Any],
+    ) -> tuple[str | None, list[str], list[dict]]:
+        if isinstance(result, _RunLoopResult):
+            return result.final_content, result.tools_used, result.messages
+        if isinstance(result, (tuple, list)) and len(result) >= 3:
+            return result[0], result[1] or [], result[2] or []
+        raise TypeError("Unexpected _run_agent_loop result shape")
+
     def _pop_inflight_turn_snapshot(self, session_key: str) -> dict[str, str] | None:
         turn = self._inflight_turns.pop(session_key, None)
         if not isinstance(turn, dict):
@@ -1574,8 +1711,36 @@ class AgentLoop:
     def _clear_pending_user_turn(self, session: Session) -> None:
         session.metadata.pop(self._PENDING_USER_TURN_KEY, None)
 
+    def _set_pending_user_turn(self, session: Session) -> None:
+        session.metadata[self._PENDING_USER_TURN_KEY] = True
+        self.sessions.save(session)
+
     def _clear_runtime_checkpoint(self, session: Session) -> None:
         session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+
+    def _set_runtime_checkpoint(self, session: Session, payload: dict[str, Any]) -> None:
+        session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
+        self.sessions.save(session)
+
+    def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
+        """Persist system/subagent follow-up as a standalone assistant history entry."""
+        content = str(msg.content or "").strip()
+        if not content or msg.sender_id != "subagent":
+            return False
+        task_id = str((msg.metadata or {}).get("subagent_task_id") or "").strip()
+        if task_id and any(
+            item.get("injected_event") == "subagent_result"
+            and item.get("subagent_task_id") == task_id
+            for item in session.messages
+        ):
+            return False
+        session.add_message(
+            "assistant",
+            content,
+            injected_event="subagent_result",
+            **({"subagent_task_id": task_id} if task_id else {}),
+        )
+        return True
 
     @staticmethod
     def _checkpoint_message_key(message: dict[str, Any]) -> tuple[Any, ...]:
@@ -1684,10 +1849,19 @@ class AgentLoop:
                 self.sessions.save(session)
             if self._restore_pending_user_turn(session):
                 self.sessions.save(session)
-            session, _pending_summary = self.auto_compact.prepare_session(session, key)
-            await self._maybe_run_pre_reply_consolidation(session, msg=msg)
+            inserted_subagent_followup = self._persist_subagent_followup(session, msg)
+            if inserted_subagent_followup:
+                self.sessions.save(session)
+            session, pending_summary = self.auto_compact.prepare_session(session, key)
+            await self._maybe_run_pre_reply_consolidation(
+                session,
+                msg=msg,
+                session_summary=pending_summary,
+            )
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), msg.metadata, msg.sender_id)
             history = session.get_history(max_messages=0)
+            if inserted_subagent_followup and history:
+                history = history[:-1]
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             runtime_metadata = self._extract_runtime_metadata(msg)
             retrieval_context = await self._build_retrieval_context(
@@ -1709,15 +1883,19 @@ class AgentLoop:
                 runtime_metadata=runtime_metadata,
                 retrieval_context=retrieval_context,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
+            run_result = await self._run_agent_loop(
                 messages,
                 channel=channel,
                 chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
                 sender_id=msg.sender_id,
+                session=session,
             )
+            final_content, _, all_msgs = self._coerce_run_loop_result(run_result)
             final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
-            self._save_turn(session, all_msgs, 1 + len(history))
+            self._save_turn(session, all_msgs, (2 if inserted_subagent_followup else 1) + len(history))
+            self._clear_pending_user_turn(session)
+            self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
             self._schedule_background(self._run_background_consolidation(session))
             if self._should_schedule_harness_auto_continue(msg):
@@ -1738,7 +1916,7 @@ class AgentLoop:
             self.sessions.save(session)
         if self._restore_pending_user_turn(session):
             self.sessions.save(session)
-        session, _pending_summary = self.auto_compact.prepare_session(session, key)
+        session, pending_summary = self.auto_compact.prepare_session(session, key)
 
         # Slash commands
         raw = msg.content.strip()
@@ -1753,7 +1931,11 @@ class AgentLoop:
             )
             self.sessions.save(session)
 
-        preflight_ok = await self._maybe_run_pre_reply_consolidation(session, msg=msg)
+        preflight_ok = await self._maybe_run_pre_reply_consolidation(
+            session,
+            msg=msg,
+            session_summary=pending_summary,
+        )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             workspace_cmd = (msg.metadata or {}).get("workspace_agent_cmd")
@@ -1822,6 +2004,14 @@ class AgentLoop:
         self._register_inflight_turn(
             msg.session_key, role=persisted_role, content=persisted_turn_content
         )
+        early_persisted_user_turn = False
+        if persisted_role == "user":
+            session.add_message("user", persisted_turn_content)
+            self._set_pending_user_turn(session)
+            history = session.get_history(max_messages=0)
+            if history:
+                history = history[:-1]
+            early_persisted_user_turn = True
         effective_on_stream = on_stream
         if on_stream is not None:
 
@@ -1857,7 +2047,7 @@ class AgentLoop:
             if persisted_messages:
                 persisted_current_content = persisted_messages[-1].get("content")
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        run_result = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=effective_on_stream,
@@ -1866,7 +2056,9 @@ class AgentLoop:
             chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
             sender_id=msg.sender_id,
+            session=session,
         )
+        final_content, _, all_msgs = self._coerce_run_loop_result(run_result)
 
         # Safe boundary: mark turn closing, then consume any pending queue
         key = session_key or msg.session_key
@@ -1900,7 +2092,9 @@ class AgentLoop:
                     "content": persisted_current_content,
                 }
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        self._save_turn(session, all_msgs, (2 if early_persisted_user_turn else 1) + len(history))
+        self._clear_pending_user_turn(session)
+        self._clear_runtime_checkpoint(session)
         self._discard_inflight_turn(msg.session_key)
         self.sessions.save(session)
         self._schedule_background(self._run_background_consolidation(session))

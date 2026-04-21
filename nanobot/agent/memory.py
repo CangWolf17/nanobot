@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import weakref
@@ -12,7 +13,12 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain
+from nanobot.utils.helpers import (
+    ensure_dir,
+    estimate_message_tokens,
+    estimate_prompt_tokens_chain,
+    strip_think,
+)
 
 if TYPE_CHECKING:
     from nanobot.agent.runner import AgentRunSpec
@@ -52,6 +58,12 @@ def _ensure_text(value: Any) -> str:
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 
 
+def _clean_history_text(value: Any) -> str:
+    """Normalize persisted history text while dropping pure leak markers."""
+    text = strip_think(_ensure_text(value).strip())
+    return "" if text in {"<channel|>", "<|channel|>"} else text
+
+
 def _normalize_save_memory_args(args: Any) -> dict[str, Any] | None:
     """Normalize provider tool-call arguments to the expected dict shape."""
     if isinstance(args, str):
@@ -83,6 +95,8 @@ class MemoryStore:
     _RAW_CONTINUATION_PREFIXES = ("USER:", "ASSISTANT:", "TOOL:", "SYSTEM:")
 
     def __init__(self, workspace: Path, max_history_entries: int = 200):
+        from nanobot.utils.gitstore import GitStore
+
         self.workspace = workspace
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
@@ -94,7 +108,16 @@ class MemoryStore:
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
         self.max_history_entries = max_history_entries
         self._consecutive_failures = 0
+        self._git = GitStore(self.workspace, ["SOUL.md", "USER.md", "memory/MEMORY.md"])
         self._maybe_migrate_legacy_history()
+
+    @property
+    def git(self):
+        return self._git
+
+    @git.setter
+    def git(self, value) -> None:
+        self._git = value
 
     @staticmethod
     def read_file(path: Path) -> str:
@@ -318,10 +341,12 @@ At the end of both `history_entry` and `memory_update`, include the note: `Runti
             if not isinstance(parsed, dict):
                 continue
             cursor = parsed.get("cursor")
+            if cursor is None:
+                continue
             try:
-                parsed["cursor"] = int(cursor) if cursor is not None else idx
+                parsed["cursor"] = int(cursor)
             except (TypeError, ValueError):
-                parsed["cursor"] = idx
+                continue
             entries.append(parsed)
         return entries
 
@@ -434,10 +459,12 @@ At the end of both `history_entry` and `memory_update`, include the note: `Runti
             record.setdefault("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M"))
             if "content" not in record and isinstance(record.get("summary"), str):
                 record["content"] = record["summary"]
+            if isinstance(record.get("content"), str):
+                record["content"] = _clean_history_text(record["content"])
             return record
 
         record["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        record["content"] = _ensure_text(entry).strip()
+        record["content"] = _clean_history_text(entry)
         return record
 
 
@@ -466,6 +493,8 @@ class Dream:
         self.model = model
         self.max_batch_size = max_batch_size
         self.max_iterations = max_iterations
+        self.annotate_line_ages = True
+        self.stale_threshold_days = 14
         self._skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
         self._runner = AgentRunner(provider)
         self._tools = ToolRegistry()
@@ -519,7 +548,8 @@ class Dream:
                     "role": "system",
                     "content": (
                         "You triage archive entries for durable memory updates. "
-                        "Return concise analysis only."
+                        "Return concise analysis only. "
+                        f"In annotated MEMORY.md lines, a trailing `← Nd` means age in days; treat only N>{self.stale_threshold_days} as stale candidates."
                     ),
                 },
                 {
@@ -527,13 +557,40 @@ class Dream:
                     "content": (
                         "Review these archive entries and identify durable facts, preference changes, "
                         "conflicts, stale items to remove, and repeated workflows worth turning into skills.\n\n"
-                        f"{prompt}"
+                        f"## Pending Archive Entries\n{prompt}\n\n"
+                        f"## Current MEMORY.md\n{self._memory_with_age_annotations() or '(empty)'}\n\n"
+                        f"## Current SOUL.md\n{self.store.read_soul() or '(empty)'}\n\n"
+                        f"## Current USER.md\n{self.store.read_user() or '(empty)'}"
                     ),
                 },
             ],
             model=self.model,
         )
         return str(response.content or "").strip()
+
+    def _memory_with_age_annotations(self) -> str:
+        content = self.store.read_memory()
+        if not content or not self.annotate_line_ages:
+            return content
+        ages = self.git.line_ages("memory/MEMORY.md")
+        if not ages:
+            return content
+        lines = content.splitlines()
+        non_blank = [line for line in lines if line.strip()]
+        if len(non_blank) != len(ages):
+            return content
+        age_iter = iter(ages)
+        rendered: list[str] = []
+        for line in lines:
+            if not line.strip():
+                rendered.append(line)
+                continue
+            age = next(age_iter)
+            if age.age_days > self.stale_threshold_days:
+                rendered.append(f"{line} ← {age.age_days}d")
+            else:
+                rendered.append(line)
+        return "\n".join(rendered)
 
     def _build_run_spec(
         self,
@@ -628,6 +685,7 @@ class MemoryConsolidator:
         self._get_tool_definitions = get_tool_definitions
         self._get_compact_state = get_compact_state
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._budget_estimate_overrides: dict[str, tuple[int, str]] = {}
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
@@ -736,6 +794,37 @@ class MemoryConsolidator:
             self._get_tool_definitions(),
         )
 
+    def _estimate_session_prompt_tokens_compat(
+        self,
+        session: Session,
+        *,
+        max_history_messages: int = 0,
+        session_summary: str | None = None,
+    ) -> tuple[int, str]:
+        """Call estimate_session_prompt_tokens with backward-compatible kwargs."""
+        estimator = self.estimate_session_prompt_tokens
+        try:
+            params = inspect.signature(estimator).parameters
+        except (TypeError, ValueError):
+            params = {}
+
+        kwargs: dict[str, Any] = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in params.values()
+        )
+        if "max_history_messages" in params:
+            kwargs["max_history_messages"] = max_history_messages
+        if "session_summary" in params or accepts_kwargs:
+            kwargs["session_summary"] = session_summary
+        return estimator(session, **kwargs)
+
+    def prime_budget_estimate(self, session_key: str, estimated: int, source: str) -> None:
+        """Seed the next consolidation pass with a previously computed estimate."""
+        self._budget_estimate_overrides[session_key] = (estimated, source)
+
+    def _take_budget_estimate_override(self, session_key: str) -> tuple[int, str] | None:
+        return self._budget_estimate_overrides.pop(session_key, None)
+
     def prompt_budget(self) -> int:
         """Prompt token budget for the main conversation path."""
         context_window = self.context_window_tokens
@@ -751,11 +840,17 @@ class MemoryConsolidator:
         return self.prompt_budget() // 2
 
     def is_over_budget(
-        self, session: Session, *, max_history_messages: int = 0
+        self,
+        session: Session,
+        *,
+        max_history_messages: int = 0,
+        session_summary: str | None = None,
     ) -> tuple[bool, int, str]:
         """Return whether the main conversation prompt is over the safe budget."""
-        estimated, source = self.estimate_session_prompt_tokens(
-            session, max_history_messages=max_history_messages
+        estimated, source = self._estimate_session_prompt_tokens_compat(
+            session,
+            max_history_messages=max_history_messages,
+            session_summary=session_summary,
         )
         return estimated >= self.prompt_budget(), estimated, source
 
@@ -789,10 +884,14 @@ class MemoryConsolidator:
         async with lock:
             budget = self.prompt_budget()
             target = self.target_prompt_tokens()
-            estimated, source = self.estimate_session_prompt_tokens(
-                session,
-                session_summary=session_summary,
-            )
+            cached_estimate = self._take_budget_estimate_override(session.key)
+            if cached_estimate is not None:
+                estimated, source = cached_estimate
+            else:
+                estimated, source = self._estimate_session_prompt_tokens_compat(
+                    session,
+                    session_summary=session_summary,
+                )
             if estimated <= 0:
                 return True
             if estimated < budget:
@@ -855,7 +954,7 @@ class MemoryConsolidator:
                     active_end_idx = None
                     active_round = None
 
-                    estimated, source = self.estimate_session_prompt_tokens(
+                    estimated, source = self._estimate_session_prompt_tokens_compat(
                         session,
                         session_summary=session_summary,
                     )
@@ -894,6 +993,8 @@ class MemoryConsolidator:
 class Consolidator(MemoryConsolidator):
     """Legacy compatibility wrapper used by older tests and call sites."""
 
+    _LEGACY_ARCHIVE_CHUNK_CAP = 50
+
     def __init__(
         self,
         store: MemoryStore,
@@ -918,3 +1019,101 @@ class Consolidator(MemoryConsolidator):
         )
         self.store = store
         self.archive = self.archive_messages
+
+    async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
+        return bool(await self.archive(messages))
+
+    async def maybe_consolidate_by_tokens(
+        self,
+        session: Session,
+        session_summary: str | None = None,
+    ) -> bool:
+        """Legacy token-budget flow that archives through ``self.archive`` with a 50-msg chunk cap."""
+        if not session.messages or self.context_window_tokens <= 0:
+            return True
+
+        lock = self.get_lock(session.key)
+        async with lock:
+            budget = self.prompt_budget()
+            target = self.target_prompt_tokens()
+            cached_estimate = self._take_budget_estimate_override(session.key)
+            if cached_estimate is not None:
+                estimated, _source = cached_estimate
+            else:
+                estimated, _source = self._estimate_session_prompt_tokens_compat(
+                    session,
+                    session_summary=session_summary,
+                )
+            if estimated <= 0 or estimated < budget:
+                return True
+
+            for _round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
+                if estimated <= target:
+                    return True
+
+                boundary = self.pick_consolidation_boundary(
+                    session,
+                    max(1, estimated - target),
+                )
+                if boundary is None:
+                    return True
+
+                start_idx = session.last_consolidated
+                end_idx = boundary[0]
+                if end_idx - start_idx > self._LEGACY_ARCHIVE_CHUNK_CAP:
+                    capped_end = start_idx + self._LEGACY_ARCHIVE_CHUNK_CAP
+                    rewind_idx = None
+                    for idx in range(min(capped_end, len(session.messages) - 1), start_idx, -1):
+                        if session.messages[idx].get("role") == "user":
+                            rewind_idx = idx
+                            break
+                    if rewind_idx is None:
+                        return True
+                    end_idx = rewind_idx
+
+                chunk = session.messages[start_idx:end_idx]
+                if not chunk:
+                    return True
+
+                last_active = session.updated_at
+                archive_result = await self.archive(chunk)
+                if not archive_result:
+                    return False
+
+                if isinstance(archive_result, str) and archive_result != "(nothing)":
+                    session.metadata["_last_summary"] = {
+                        "text": archive_result,
+                        "last_active": last_active.isoformat(),
+                    }
+
+                session.last_consolidated = end_idx
+                self.sessions.save(session)
+                estimated, _source = self._estimate_session_prompt_tokens_compat(
+                    session,
+                    session_summary=session_summary,
+                )
+            return True
+
+    async def archive_messages(self, messages: list[dict[str, object]]) -> str | None:
+        """Legacy archive API: return summary text on success, else raw-archive once and return None."""
+        if not messages:
+            return None
+
+        try:
+            response = await self.provider.chat_with_retry(messages=messages, model=self.model)
+        except Exception:
+            self.store._raw_archive(messages)
+            return None
+
+        finish_reason = str(getattr(response, "finish_reason", "") or "").strip().lower()
+        if finish_reason == "error":
+            self.store._raw_archive(messages)
+            return None
+
+        content = str(getattr(response, "content", "") or "").strip()
+        if not content:
+            self.store._raw_archive(messages)
+            return None
+
+        self.store.append_history(content)
+        return content

@@ -214,6 +214,21 @@ class SessionQueueCoordinator:
         state = self._ensure_state(session_key, unified)
         return state.pending_interrupt_consume
 
+    def set_pending_dispatch(
+        self,
+        session_key: str,
+        payload: Any,
+        unified: bool = False,
+    ) -> None:
+        state = self._ensure_state(session_key, unified)
+        state.pending_reserved_dispatch = payload
+
+    def pop_pending_dispatch(self, session_key: str, unified: bool = False) -> Any | None:
+        state = self._ensure_state(session_key, unified)
+        payload = state.pending_reserved_dispatch
+        state.pending_reserved_dispatch = None
+        return payload
+
     # --- queue existence checks ---
     def has_queued_work(self, session_key: str, unified: bool = False) -> bool:
         """True if any queued work exists (normal buffer or turn slot)."""

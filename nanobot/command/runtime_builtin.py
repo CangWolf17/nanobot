@@ -8,13 +8,13 @@ from pathlib import Path
 from time import time
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
-
-UNIFIED_SESSION_KEY = "unified:default"
 from nanobot.command.harness import cmd_harness
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.command.workspace_bridge import cmd_workspace_bridge
 from nanobot.config.paths import get_workspace_path
 from nanobot.harness.service import HarnessService
+
+UNIFIED_SESSION_KEY = "unified:default"
 
 
 def build_help_text() -> str:
@@ -222,44 +222,52 @@ async def cmd_interrupt(ctx: CommandContext) -> OutboundMessage:
             metadata={**dict(msg.metadata or {})},
         )
 
-    # Queue has work — assemble and auto-dispatch
-    # Priority: turn slot > normal buffer
+    # Queue has work — assemble and auto-dispatch in spec order:
+    # batched normal queue first, reserved /tq last.
     synthesized_msg = None
-    if has_turn:
-        turn_item = loop.coordinator.consume_turn_slot(effective_key, loop._unified_session)
-        if turn_item:
-            synthesized_msg = InboundMessage(
-                channel=turn_item.channel,
-                sender_id=turn_item.sender_id,
-                chat_id=turn_item.chat_id,
-                content=turn_item.content,
-                metadata={**turn_item.metadata, "_queued_turn": True, "_from_interrupt": True},
-            )
-    elif has_normal:
+    consumed = []
+    metrics = None
+    if has_normal:
         consumed, metrics = loop.coordinator.consume_normal_batch(
             effective_key, loop._unified_session, max_items=10, max_chars=8000
         )
-        if consumed:
-            synthesized_content = "\n---\n".join(item.content for item in consumed)
-            first = consumed[0]
-            synthesized_msg = InboundMessage(
-                channel=first.channel,
-                sender_id=first.sender_id,
-                chat_id=first.chat_id,
-                content=synthesized_content,
-                metadata={
-                    "_queued_batch": {
-                        "item_count": metrics.last_item_count,
-                        "char_count": metrics.last_char_count,
-                        "provenance_ids": [item.provenance_id for item in consumed],
-                    },
-                    "_from_interrupt": True,
-                },
-            )
+    turn_item = loop.coordinator.consume_turn_slot(effective_key, loop._unified_session) if has_turn else None
+
+    if consumed or turn_item:
+        parts = [item.content for item in consumed]
+        if turn_item:
+            parts.append(turn_item.content)
+
+        first = consumed[0] if consumed else turn_item
+        assert first is not None
+        queued_batch = {
+            "kind": "interrupt_queue" if turn_item and consumed else ("queued_turn" if turn_item else "queued_batch"),
+            "item_count": len(consumed) + (1 if turn_item else 0),
+            "provenance_ids": [item.provenance_id for item in consumed],
+        }
+        if metrics is not None:
+            queued_batch["char_count"] = metrics.last_char_count
+            if metrics.dropped_reason:
+                queued_batch["dropped_reason"] = metrics.dropped_reason
+        if turn_item:
+            queued_batch["turn_id"] = turn_item.provenance_id
+            queued_batch["turn_metadata"] = dict(turn_item.metadata or {})
+
+        synthesized_msg = InboundMessage(
+            channel=first.channel,
+            sender_id=first.sender_id,
+            chat_id=first.chat_id,
+            content="\n---\n".join(parts),
+            metadata={
+                "_queued_batch": queued_batch,
+                "_from_interrupt": True,
+                **({"_queued_turn": True} if turn_item and not consumed else {}),
+            },
+        )
 
     if synthesized_msg:
-        # Auto-dispatch the synthesized message
-        asyncio.create_task(loop._dispatch(synthesized_msg))
+        # Auto-dispatch the synthesized message as tracked session work.
+        loop._spawn_dispatch_task(synthesized_msg, effective_key=effective_key)
         content = f"Interrupted {total} task(s) and queued next message."
     else:
         content = f"Interrupted {total} task(s). Context preserved — tell me how to redirect."
@@ -319,8 +327,7 @@ async def cmd_tq(ctx: CommandContext) -> OutboundMessage:
             content=content,
             metadata={**dict(msg.metadata or {}), "_tq_turn": True},
         )
-        task = asyncio.create_task(loop._dispatch(new_msg))
-        loop._active_tasks.setdefault(effective_key, []).append(task)
+        loop._spawn_dispatch_task(new_msg, effective_key=effective_key)
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,

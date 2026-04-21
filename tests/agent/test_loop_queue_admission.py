@@ -1,12 +1,11 @@
 """Tests for pre-lock admission in AgentLoop.run()."""
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nanobot.agent.loop import AgentLoop
-from nanobot.agent.queue import SessionQueueCoordinator, QueuedItemKind
+from nanobot.agent.queue import QueuedItemKind, SessionQueueCoordinator
 from nanobot.bus.events import InboundMessage, OutboundMessage
 
 
@@ -293,3 +292,14 @@ class TestPreLockAdmissionBypass:
         raw = msg.content.strip()
         is_tq = raw.startswith("/tq ") or raw.startswith("/turnqueue ") or raw in ("/tq", "/turnqueue")
         assert is_tq is False
+
+
+class TestQueueableFollowupHelper:
+    def test_plain_message_is_queueable(self):
+        assert AgentLoop._is_queueable_followup("hello world") is True
+
+    def test_exact_slash_command_is_not_queueable(self):
+        assert AgentLoop._is_queueable_followup("/new") is False
+
+    def test_prefixed_slash_command_is_not_queueable(self):
+        assert AgentLoop._is_queueable_followup("/harness resume") is False

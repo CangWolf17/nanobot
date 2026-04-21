@@ -299,6 +299,16 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         retrieval_context: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
+        if (
+            current_role == "assistant"
+            and not media
+            and not current_message
+            and history
+            and history[-1].get("injected_event") == "subagent_result"
+        ):
+            current_message = str(history[-1].get("content") or "")
+            history = history[:-1]
+
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, runtime_metadata)
         retrieval_ctx = self._build_retrieval_context(retrieval_context)
         user_content = self._build_user_content(current_message, media)
