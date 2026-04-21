@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from loguru import logger
@@ -44,6 +46,7 @@ from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTo
 from nanobot.agent.tools.guarded import GuardedTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -65,6 +68,53 @@ class PendingSubagent:
     queue_tier: str = ""
 
 
+@dataclass(slots=True)
+class SubagentStatus:
+    """Real-time status of a running subagent."""
+
+    task_id: str
+    label: str
+    task_description: str
+    started_at: float
+    phase: str = "initializing"
+    iteration: int = 0
+    tool_events: list = field(default_factory=list)
+    usage: dict = field(default_factory=dict)
+    stop_reason: str | None = None
+    error: str | None = None
+
+
+class _SubagentHook(AgentHook):
+    """Hook for subagent execution — logs tool calls and updates compat status."""
+
+    def __init__(self, task_id: str, status: SubagentStatus | None = None) -> None:
+        super().__init__()
+        self._task_id = task_id
+        self._status = status
+
+    async def before_execute_tools(self, context: AgentHookContext) -> None:
+        if self._status is not None:
+            self._status.phase = "awaiting_tools"
+        for tool_call in context.tool_calls:
+            args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+            logger.debug(
+                "Subagent [{}] executing: {} with arguments: {}",
+                self._task_id,
+                tool_call.name,
+                args_str,
+            )
+
+    async def after_iteration(self, context: AgentHookContext) -> None:
+        if self._status is None:
+            return
+        self._status.iteration = context.iteration
+        self._status.tool_events = list(context.tool_events)
+        self._status.usage = dict(context.usage)
+        self._status.phase = "tools_completed"
+        if context.error:
+            self._status.error = str(context.error)
+
+
 class SubagentManager:
     """Manages background subagent execution."""
 
@@ -73,11 +123,14 @@ class SubagentManager:
         provider: LLMProvider,
         workspace: Path,
         bus: MessageBus,
+        max_tool_result_chars: int | None = None,
         model: str | None = None,
+        web_config: Any | None = None,
         web_search_config: "WebSearchConfig | None" = None,
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        disabled_skills: list[str] | None = None,
         resource_manager: Any | None = None,
         provider_probe: Any | None = None,
     ):
@@ -87,10 +140,26 @@ class SubagentManager:
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
-        self.web_search_config = web_search_config or WebSearchConfig()
-        self.web_proxy = web_proxy
+        self.max_tool_result_chars = max_tool_result_chars or 16_000
+        self.web_config = web_config
+        if self.web_config is not None:
+            self.web_search_config = (
+                web_search_config
+                or getattr(self.web_config, "search", None)
+                or WebSearchConfig()
+            )
+            self.web_proxy = web_proxy if web_proxy is not None else getattr(self.web_config, "proxy", None)
+        else:
+            self.web_search_config = web_search_config or WebSearchConfig()
+            self.web_proxy = web_proxy
+            self.web_config = SimpleNamespace(
+                enable=True,
+                proxy=self.web_proxy,
+                search=self.web_search_config,
+            )
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.disabled_skills = set(disabled_skills or [])
         self.provider_probe = provider_probe or run_default_provider_probe
         self.runner = AgentRunner(provider)
         if resource_manager is not None:
@@ -103,6 +172,7 @@ class SubagentManager:
         else:
             self.resource_manager = None
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}
         self._pending_tasks: dict[str, PendingSubagent] = {}
         self._pending_order: list[str] = []
@@ -237,6 +307,7 @@ class SubagentManager:
 
         def _cleanup(_: asyncio.Task) -> None:
             self._running_tasks.pop(task_id, None)
+            self._task_statuses.pop(task_id, None)
             if session_key and (ids := self._session_tasks.get(session_key)):
                 ids.discard(task_id)
                 if not ids:
@@ -315,11 +386,29 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, Any],
+        status: SubagentStatus | None = None,
         lease: SubagentLease | None = None,
         resolution: SubagentResolution | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        # Legacy compatibility: older callers passed (lease, resolution) as the
+        # 5th/6th positional args, before status tracking existed.
+        if isinstance(status, SubagentLease):
+            if isinstance(lease, SubagentResolution) and resolution is None:
+                resolution = lease
+            lease = status
+            status = None
+        elif isinstance(status, SubagentResolution):
+            resolution = status
+            status = None
+        status = status or SubagentStatus(
+            task_id=task_id,
+            label=label,
+            task_description=task,
+            started_at=time.monotonic(),
+        )
+        self._task_statuses[task_id] = status
         current_lease = lease
         current_resolution = resolution
 
@@ -331,17 +420,6 @@ class SubagentManager:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task_payload},
             ]
-
-            class _SubagentHook(AgentHook):
-                async def before_execute_tools(self, context: AgentHookContext) -> None:
-                    for tool_call in context.tool_calls:
-                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.debug(
-                            "Subagent [{}] executing: {} with arguments: {}",
-                            task_id,
-                            tool_call.name,
-                            args_str,
-                        )
 
             attempted_models: set[str] = set()
 
@@ -366,14 +444,18 @@ class SubagentManager:
                         tools=tools,
                         model=run_model,
                         max_iterations=15,
-                        hook=_SubagentHook(),
+                        hook=_SubagentHook(task_id, status),
                         max_iterations_message="Task completed but no final response was generated.",
                         error_message=None,
                         fail_on_tool_error=True,
                         concurrent_tools=not should_disable_concurrent_tools(self.workspace),
                     )
                 )
+                status.stop_reason = result.stop_reason
+                status.tool_events = list(result.tool_events)
+                status.usage = dict(result.usage)
                 if result.stop_reason == "tool_error":
+                    status.phase = "error"
                     await self._announce_result(
                         task_id,
                         label,
@@ -384,6 +466,8 @@ class SubagentManager:
                     )
                     return
                 if result.stop_reason == "error":
+                    status.phase = "error"
+                    status.error = result.error
                     if current_lease is not None and self.resource_manager is not None:
                         apply_provider_failure_to_manager(
                             self.resource_manager,
@@ -423,6 +507,7 @@ class SubagentManager:
                         "error",
                     )
                     return
+                status.phase = "done"
                 final_result = result.final_content or "Task completed but no final response was generated."
                 if current_lease is not None and self.resource_manager is not None:
                     refresh_provider_in_manager(self.resource_manager, route=current_lease.route)
@@ -434,6 +519,8 @@ class SubagentManager:
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
+            status.phase = "error"
+            status.error = str(e)
             if current_lease is not None and self.resource_manager is not None:
                 apply_provider_failure_to_manager(
                     self.resource_manager,
@@ -513,16 +600,28 @@ class SubagentManager:
         tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
         tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
         tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        tools.register(
-            ExecTool(
+        tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        try:
+            exec_tool = ExecTool(
+                working_dir=str(self.workspace),
+                timeout=self.exec_config.timeout,
+                restrict_to_workspace=self.restrict_to_workspace,
+                path_append=self.exec_config.path_append,
+                allowed_env_keys=self.exec_config.allowed_env_keys,
+            )
+        except TypeError:
+            exec_tool = ExecTool(
                 working_dir=str(self.workspace),
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
             )
-        )
-        tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
-        tools.register(WebFetchTool(proxy=self.web_proxy))
+            setattr(exec_tool, "allowed_env_keys", list(self.exec_config.allowed_env_keys))
+        tools.register(exec_tool)
+        if getattr(self.web_config, "enable", True):
+            tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
+            tools.register(WebFetchTool(proxy=self.web_proxy))
 
         run_context, tool_policy = self._resolve_subagent_policy(origin)
 
@@ -771,7 +870,21 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
         if injected:
             parts.append(injected)
 
-        skills_summary = SkillsLoader(self.workspace).build_skills_summary()
+        loader = SkillsLoader(self.workspace)
+        if self.disabled_skills:
+            skill_lines = ["<skills>"]
+            for skill in loader.list_skills(filter_unavailable=False):
+                if skill["name"] in self.disabled_skills:
+                    continue
+                skill_lines.append('  <skill available="true">')
+                skill_lines.append(f"    <name>{skill['name']}</name>")
+                skill_lines.append(f"    <description>{loader._get_skill_description(skill['name'])}</description>")
+                skill_lines.append(f"    <location>{skill['path']}</location>")
+                skill_lines.append("  </skill>")
+            skill_lines.append("</skills>")
+            skills_summary = "\n".join(skill_lines) if len(skill_lines) > 2 else ""
+        else:
+            skills_summary = loader.build_skills_summary()
         if skills_summary:
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
 

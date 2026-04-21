@@ -1,4 +1,4 @@
-"""Tests for exec tool internal URL blocking and strict dev-mode guards."""
+"""Tests for exec tool internal URL blocking."""
 
 from __future__ import annotations
 
@@ -18,29 +18,8 @@ def _fake_resolve_localhost(hostname, port, family=0, type_=0):
     return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 0))]
 
 
-def _write_strict_state(tmp_path, *, phase="planning", work_mode="plan"):
-    session_root = tmp_path / "sessions" / "ses_0001"
-    session_root.mkdir(parents=True)
-    (tmp_path / "sessions" / "control.json").write_text(
-        '{"active_session_id":"ses_0001"}', encoding="utf-8"
-    )
-    (tmp_path / "sessions" / "index.json").write_text(
-        '{"sessions":{"ses_0001":{"session_root":"' + str(session_root) + '"}}}',
-        encoding="utf-8",
-    )
-    (session_root / "dev_state.json").write_text(
-        '{"strict_dev_mode":"enforce","task_kind":"feature","phase":"'
-        + phase
-        + '","work_mode":"'
-        + work_mode
-        + '","gates":{"plan":{"required":true,"satisfied":true},"failing_test":{"required":'
-        + ("true" if phase != "build_allowed" else "true")
-        + ',"satisfied":'
-        + ("false" if phase == "planning" else "true")
-        + '},"verification":{"required":true,"satisfied":false}}}',
-        encoding="utf-8",
-    )
-    return session_root
+def _fake_resolve_public(hostname, port, family=0, type_=0):
+    return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
 
 
 @pytest.mark.asyncio
@@ -71,91 +50,135 @@ async def test_exec_allows_normal_commands():
 
 
 @pytest.mark.asyncio
-async def test_exec_blocks_shell_redirect_when_strict_phase_not_build(tmp_path):
-    _write_strict_state(tmp_path, phase="planning", work_mode="plan")
-
-    tool = ExecTool(working_dir=str(tmp_path), timeout=5)
-    result = await tool.execute(command="echo hi > src/out.txt")
-
-    assert "Error" in result
-    assert "strict dev mode" in result
-    assert "Shell mutation" in result or "blocked" in result
-
-
-@pytest.mark.asyncio
-async def test_exec_blocks_python_c_inline_file_write_in_strict_mode(tmp_path):
-    _write_strict_state(tmp_path, phase="planning", work_mode="plan")
-
-    tool = ExecTool(working_dir=str(tmp_path), timeout=5)
-    result = await tool.execute(command="python -c \"open('src/out.py','w').write('x')\"")
-
-    assert "Error" in result
-    assert "strict dev mode" in result
-
-
-@pytest.mark.asyncio
-async def test_exec_blocks_node_e_inline_file_write_in_strict_mode(tmp_path):
-    _write_strict_state(tmp_path, phase="planning", work_mode="plan")
-
-    tool = ExecTool(working_dir=str(tmp_path), timeout=5)
-    result = await tool.execute(command="node -e \"require('fs').writeFileSync('src/out.js','x')\"")
-
-    assert "Error" in result
-    assert "strict dev mode" in result
-
-
-@pytest.mark.asyncio
-async def test_exec_blocks_python_heredoc_in_strict_mode(tmp_path):
-    _write_strict_state(tmp_path, phase="planning", work_mode="plan")
-
-    tool = ExecTool(working_dir=str(tmp_path), timeout=5)
-    result = await tool.execute(command="python - <<'PY'\nopen('src/out.py','w').write('x')\nPY")
-
-    assert "Error" in result
-    assert "strict dev mode" in result
-
-
-@pytest.mark.asyncio
-async def test_exec_blocks_ambiguous_make_target_in_strict_mode(tmp_path):
-    _write_strict_state(tmp_path, phase="build_allowed", work_mode="build")
-
-    tool = ExecTool(working_dir=str(tmp_path), timeout=5)
-    result = await tool.execute(command="make release")
-
-    assert "Error" in result
-    assert "safe task-runner target set" in result or "looks mutating/risky" in result
-
-
-@pytest.mark.asyncio
-async def test_exec_allows_safe_make_test_target_in_strict_build_mode(tmp_path):
-    _write_strict_state(tmp_path, phase="build_allowed", work_mode="build")
-
-    tool = ExecTool(working_dir=str(tmp_path), timeout=5)
-    guard_result = tool._guard_command("make test", str(tmp_path))
-
+async def test_exec_allows_curl_to_public_url():
+    """Commands with public URLs should not be blocked by the internal URL check."""
+    tool = ExecTool()
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_public):
+        guard_result = tool._guard_command("curl https://example.com/api", "/tmp")
     assert guard_result is None
 
 
+@pytest.mark.asyncio
+async def test_exec_blocks_chained_internal_url():
+    """Internal URLs buried in chained commands should still be caught."""
+    tool = ExecTool()
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_private):
+        result = await tool.execute(
+            command="echo start && curl http://169.254.169.254/latest/meta-data/ && echo done"
+        )
+    assert "Error" in result
+
+
+# --- #2989: block writes to nanobot internal state files -----------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat foo >> history.jsonl",
+        "echo '{}' > history.jsonl",
+        "echo '{}' > memory/history.jsonl",
+        "echo '{}' > ./workspace/memory/history.jsonl",
+        "tee -a history.jsonl < foo",
+        "tee history.jsonl",
+        "cp /tmp/fake.jsonl history.jsonl",
+        "mv backup.jsonl memory/history.jsonl",
+        "dd if=/dev/zero of=memory/history.jsonl",
+        "sed -i 's/old/new/' history.jsonl",
+        "echo x > .dream_cursor",
+        "cp /tmp/x memory/.dream_cursor",
+    ],
+)
+def test_exec_blocks_writes_to_history_jsonl(command):
+    """Direct writes to history.jsonl / .dream_cursor must be blocked (#2989)."""
+    tool = ExecTool()
+    result = tool._guard_command(command, "/tmp")
+    assert result is not None
+    assert "dangerous pattern" in result.lower()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat history.jsonl",
+        "wc -l history.jsonl",
+        "tail -n 5 history.jsonl",
+        "grep foo history.jsonl",
+        "cp history.jsonl /tmp/history.backup",
+        "ls memory/",
+        "echo history.jsonl",
+    ],
+)
+def test_exec_allows_reads_of_history_jsonl(command):
+    """Read-only access to history.jsonl must still be allowed."""
+    tool = ExecTool()
+    result = tool._guard_command(command, "/tmp")
+    assert result is None
+
+
+# --- #2826: working_dir must not escape the configured workspace ---------
 
 
 @pytest.mark.asyncio
-async def test_exec_blocks_risky_npm_script_in_strict_mode(tmp_path):
-    _write_strict_state(tmp_path, phase="build_allowed", work_mode="build")
-
-    tool = ExecTool(working_dir=str(tmp_path), timeout=5)
-    guard_result = tool._guard_command("npm run release", str(tmp_path))
-
-    assert guard_result is not None
-    assert "looks mutating/risky" in guard_result or "safe script target set" in guard_result
+async def test_exec_blocks_working_dir_outside_workspace(tmp_path):
+    """An LLM-supplied working_dir outside the workspace must be rejected."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = await tool.execute(command="rm calendar.ics", working_dir="/etc")
+    assert "outside the configured workspace" in result
 
 
 @pytest.mark.asyncio
-async def test_exec_allows_safe_pnpm_lint_target_in_strict_build_mode(tmp_path):
-    _write_strict_state(tmp_path, phase="build_allowed", work_mode="build")
+async def test_exec_blocks_absolute_rm_via_hijacked_working_dir(tmp_path):
+    """Regression for #2826: `rm /abs/path` via working_dir hijack."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    victim_dir = tmp_path / "outside"
+    victim_dir.mkdir()
+    victim = victim_dir / "file.ics"
+    victim.write_text("data")
 
-    tool = ExecTool(working_dir=str(tmp_path), timeout=5)
-    guard_result = tool._guard_command("pnpm lint", str(tmp_path))
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+    result = await tool.execute(
+        command=f"rm {victim}",
+        working_dir=str(victim_dir),
+    )
+    assert "outside the configured workspace" in result
+    assert victim.exists(), "victim file must not have been deleted"
 
-    assert guard_result is None
+
+@pytest.mark.asyncio
+async def test_exec_allows_working_dir_within_workspace(tmp_path):
+    """A working_dir that is a subdirectory of the workspace is fine."""
+    workspace = tmp_path / "workspace"
+    subdir = workspace / "project"
+    subdir.mkdir(parents=True)
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True, timeout=5)
+    result = await tool.execute(command="echo ok", working_dir=str(subdir))
+    assert "ok" in result
+    assert "outside the configured workspace" not in result
 
 
+@pytest.mark.asyncio
+async def test_exec_allows_working_dir_equal_to_workspace(tmp_path):
+    """Passing working_dir equal to the workspace root must be allowed."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True, timeout=5)
+    result = await tool.execute(command="echo ok", working_dir=str(workspace))
+    assert "ok" in result
+    assert "outside the configured workspace" not in result
+
+
+@pytest.mark.asyncio
+async def test_exec_ignores_workspace_check_when_not_restricted(tmp_path):
+    """Without restrict_to_workspace, the LLM may still choose any working_dir."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=False, timeout=5)
+    result = await tool.execute(command="echo ok", working_dir=str(other))
+    assert "ok" in result
+    assert "outside the configured workspace" not in result

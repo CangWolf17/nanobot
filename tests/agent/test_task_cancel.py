@@ -231,6 +231,140 @@ class TestHandleStop:
         )
 
     @pytest.mark.asyncio
+    async def test_interrupt_with_normal_and_turn_queue_dispatches_merged_payload(self):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_interrupt
+        from nanobot.command.router import CommandContext
+
+        loop, _bus = _make_loop()
+        cancelled = asyncio.Event()
+        dispatch_started = asyncio.Event()
+        dispatch_release = asyncio.Event()
+
+        async def slow_task():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def fake_dispatch(msg):
+            captured["msg"] = msg
+            dispatch_started.set()
+            await dispatch_release.wait()
+
+        captured = {}
+        task = asyncio.create_task(slow_task())
+        await asyncio.sleep(0)
+        loop._active_tasks["test:c1"] = [task]
+        loop._dispatch = AsyncMock(side_effect=fake_dispatch)
+
+        loop.coordinator.enqueue_normal(
+            content="late normal",
+            channel="test",
+            chat_id="c1",
+            sender_id="u1",
+            session_key="test:c1",
+        )
+        loop.coordinator.reserve_turn_slot(
+            content="reserved turn",
+            channel="test",
+            chat_id="c1",
+            sender_id="u1",
+            session_key="test:c1",
+            metadata={"raw": "/tq reserved turn"},
+        )
+
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/interrupt")
+        ctx = CommandContext(
+            msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop
+        )
+        out = await cmd_interrupt(ctx)
+
+        assert cancelled.is_set()
+        assert "queued next message" in out.content.lower()
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+        dispatched = captured["msg"]
+        assert dispatched.content == "late normal\n---\nreserved turn"
+        assert dispatched.metadata["_from_interrupt"] is True
+        assert dispatched.metadata["_queued_batch"]["kind"] == "interrupt_queue"
+        assert dispatched.metadata["_queued_batch"]["item_count"] == 2
+        assert dispatched.metadata["_queued_batch"]["turn_metadata"]["raw"] == "/tq reserved turn"
+        assert any(not queued_task.done() for queued_task in loop._active_tasks["test:c1"])
+
+        dispatch_release.set()
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_safe_boundary_normal_queue_consumes_during_turn_closing(self):
+        from nanobot.agent.queue import DispatchState
+
+        loop, _bus = _make_loop()
+        loop.coordinator.enqueue_normal(
+            content="follow up",
+            channel="test",
+            chat_id="c1",
+            sender_id="u1",
+            session_key="test:c1",
+        )
+        loop.coordinator.set_dispatch_state("test:c1", DispatchState.TURN_CLOSING)
+
+        await loop._maybe_consume_normal_queue("test:c1")
+
+        dispatched = loop.coordinator.pop_pending_dispatch("test:c1")
+        assert dispatched is not None
+        assert dispatched.content == "follow up"
+        assert dispatched.metadata["_queued_batch"]["kind"] == "queued_batch"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_schedules_queued_followup_after_lock_without_deadlock(self):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.session.manager import Session
+
+        loop, _bus = _make_loop()
+        seen_messages: list[str] = []
+        session = Session(key="test:c1")
+        loop.sessions.get_or_create.return_value = session
+        loop.sessions.save = MagicMock()
+        loop._maybe_run_pre_reply_consolidation = AsyncMock(return_value=True)
+        loop._select_history_for_reply = MagicMock(
+            side_effect=lambda session, preflight_ok=True: session.get_history(max_messages=0)
+        )
+
+        def _build_messages(*, history, current_message, **kwargs):
+            seen_messages.append(current_message)
+            return list(history) + [{"role": "user", "content": current_message}]
+
+        async def fake_run_agent_loop(messages, **kwargs):
+            return "done", [], list(messages) + [{"role": "assistant", "content": "done"}]
+
+        loop.context.build_messages = MagicMock(side_effect=_build_messages)
+        loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+        loop._schedule_background = lambda coro: coro.close()
+        loop.tools.get = MagicMock(return_value=None)
+        loop.coordinator.enqueue_normal(
+            content="queued follow up",
+            channel="test",
+            chat_id="c1",
+            sender_id="u1",
+            session_key="test:c1",
+        )
+
+        await asyncio.wait_for(
+            loop._dispatch(
+                InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="first turn")
+            ),
+            timeout=1,
+        )
+
+        for _ in range(20):
+            if not any(not task.done() for task in loop._active_tasks.get("test:c1", [])):
+                break
+            await asyncio.sleep(0)
+
+        assert seen_messages[:2] == ["first turn", "queued follow up"]
+
+    @pytest.mark.asyncio
     async def test_interrupt_updates_workspace_harness_state_when_active_task_exists(
         self, tmp_path
     ):
@@ -287,14 +421,9 @@ class TestHandleStop:
             msg=msg, session=None, key=msg.session_key, raw="/interrupt", loop=loop
         )
 
-        with (
-            patch("nanobot.command.builtin.Path.home", return_value=tmp_path),
-            patch("nanobot.command.builtin.subprocess.run") as mock_run,
-        ):
-            out = await cmd_interrupt(ctx)
+        out = await cmd_interrupt(ctx)
 
         assert "No active task" in out.content
-        mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stop_does_not_set_interrupt_metadata(self):
@@ -351,12 +480,10 @@ class TestHandleStop:
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/new")
         ctx = CommandContext(msg=msg, session=session, key=msg.session_key, raw="/new", loop=loop)
 
-        with patch("nanobot.command.builtin.subprocess.run") as mock_run:
-            out = await cmd_new(ctx)
+        out = await cmd_new(ctx)
 
         assert "interrupt_state" not in session.metadata
         assert "new session started" in out.content.lower()
-        mock_run.assert_not_called()
         snapshot = service.store.load()
         record = next(iter(snapshot.records.values()))
         assert record.status == "interrupted"

@@ -450,7 +450,16 @@ async def connect_mcp_servers(
             return name, server_stack
 
         except Exception as e:
-            logger.error("MCP server '{}': failed to connect: {}", name, e)
+            message = str(e)
+            if transport_type == "stdio" and "Unexpected token" in message and "JSON-RPC" in message:
+                logger.error(
+                    "MCP server '{}': stdio protocol pollution detected; the server likely wrote logs "
+                    "to stdout/stderr before JSON-RPC headers: {}",
+                    name,
+                    message,
+                )
+            else:
+                logger.error("MCP server '{}': failed to connect: {}", name, e)
             try:
                 await server_stack.aclose()
             except Exception:

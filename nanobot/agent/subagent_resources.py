@@ -248,9 +248,44 @@ class SubagentResourceManager:
             default_model = self._clean(candidate)
             if not default_model:
                 continue
-            resolved = self.resolve_model_ref(default_model)
-            fallback_candidates.append(resolved if resolved else default_model)
-        return fallback_candidates
+            resolved = self.resolve_model_refs(default_model)
+            if resolved:
+                fallback_candidates.extend(resolved)
+            else:
+                fallback_candidates.append(default_model)
+        deduped: list[str] = []
+        for candidate in fallback_candidates:
+            if candidate not in deduped:
+                deduped.append(candidate)
+        return deduped
+
+    def resolve_model_refs(self, ref: str) -> list[str]:
+        candidate = self._clean(ref)
+        if not candidate:
+            return []
+        models = self.registry.get("models", {}) if isinstance(self.registry, dict) else {}
+        if not isinstance(models, dict):
+            return []
+        folded = candidate.casefold()
+        matches: list[str] = []
+        for model_id, raw in models.items():
+            if not isinstance(raw, dict):
+                continue
+            if not bool(raw.get("enabled", True)) or bool(raw.get("template", False)):
+                continue
+            if model_id.casefold() == folded:
+                matches.append(model_id)
+                continue
+            if str(raw.get("family") or "").strip().casefold() == folded:
+                matches.append(model_id)
+                continue
+            aliases = raw.get("aliases")
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    if isinstance(alias, str) and alias.casefold() == folded:
+                        matches.append(model_id)
+                        break
+        return matches
 
     def _tier_candidates(self, tier: str) -> list[str]:
         policy = self.tier_policies.get(tier, TierPolicy())

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import dis
+import inspect
 import json
 import os
 import re
@@ -15,11 +17,13 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.compact_state import CompactStateManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
-from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.memory import Consolidator, Dream, MemoryConsolidator
 from nanobot.agent.policy.dev_discipline import should_disable_concurrent_tools
+from nanobot.agent.queue import DispatchState, SessionQueueCoordinator
 from nanobot.agent.retrieval import (
     MetadataRetrievalProvider,
     NullRetrievalProvider,
@@ -34,6 +38,7 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -54,6 +59,47 @@ if TYPE_CHECKING:
         WebSearchConfig,
     )
     from nanobot.cron.service import CronService
+
+
+UNIFIED_SESSION_KEY = "unified:default"
+
+
+def _default_memory_config() -> Any:
+    """Return a consolidation config object even when schema drift removed it."""
+    try:
+        from nanobot.config.schema import MemoryConsolidationConfig
+
+        return MemoryConsolidationConfig()
+    except ImportError:
+        return SimpleNamespace(
+            enabled=True,
+            compact_state_enabled=True,
+            compact_state_model="",
+            compact_state_max_chars=4000,
+            pre_reply_timeout_seconds=8.0,
+            background_timeout_seconds=20.0,
+            recent_history_fallback_messages=80,
+            model="",
+            retrieval_enabled=False,
+            retrieval_max_chars=1600,
+        )
+
+
+def _default_web_config(
+    web_search_config: "WebSearchConfig | None",
+    web_proxy: str | None,
+) -> Any:
+    """Return a web tools config object with the legacy .search/.proxy surface."""
+    try:
+        from nanobot.config.schema import WebToolsConfig
+
+        return WebToolsConfig()
+    except ImportError:
+        return SimpleNamespace(
+            enable=True,
+            proxy=web_proxy,
+            search=web_search_config,
+        )
 
 
 class _LoopHookChain(AgentHook):
@@ -117,6 +163,53 @@ class _LoopHookChain(AgentHook):
         return self._extras.finalize_content(context, content)
 
 
+class _RunLoopResult:
+    """Compatibility wrapper so older call sites can unpack either 3 or 5 values."""
+
+    __slots__ = ("final_content", "tools_used", "messages", "stop_reason", "metadata_flag")
+
+    def __init__(
+        self,
+        final_content: str | None,
+        tools_used: list[str],
+        messages: list[dict],
+        stop_reason: str | None = None,
+        metadata_flag: bool = False,
+    ) -> None:
+        self.final_content = final_content
+        self.tools_used = tools_used
+        self.messages = messages
+        self.stop_reason = stop_reason
+        self.metadata_flag = metadata_flag
+
+    def _expected_unpack_count(self) -> int:
+        frame = inspect.currentframe()
+        caller = frame.f_back if frame is not None else None
+        while caller is not None:
+            for instruction in dis.get_instructions(caller.f_code):
+                if instruction.offset != caller.f_lasti:
+                    continue
+                if instruction.opname == "UNPACK_SEQUENCE":
+                    return int(instruction.arg or 0)
+                if instruction.opname == "UNPACK_EX":
+                    arg = int(instruction.arg or 0)
+                    return (arg & 0xFF) + (arg >> 8) + 1
+                break
+            caller = caller.f_back
+        return 3
+
+    def __iter__(self):
+        expected = self._expected_unpack_count()
+        values = [
+            self.final_content,
+            self.tools_used,
+            self.messages,
+            self.stop_reason,
+            self.metadata_flag,
+        ]
+        yield from values[: expected or 5]
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -150,6 +243,38 @@ class AgentLoop:
     _STREAM_COMPLETION_NOTICE_MIN_SECONDS = 8.0
     _STREAM_COMPLETION_NOTICE_MIN_CHARS = 600
     _STREAM_COMPLETION_NOTICE_MIN_CHUNKS = 12
+    _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
+    _PENDING_USER_TURN_KEY = "pending_user_turn"
+
+    def _track_active_task(self, effective_key: str, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        """Register a dispatch task under the effective session key and auto-prune it on completion."""
+        self._active_tasks.setdefault(effective_key, []).append(task)
+
+        def _remove_task(done: asyncio.Task[Any], key: str = effective_key) -> None:
+            tasks = self._active_tasks.get(key, [])
+            if done in tasks:
+                tasks.remove(done)
+
+        task.add_done_callback(_remove_task)
+        return task
+
+    def _spawn_dispatch_task(
+        self,
+        msg: InboundMessage,
+        *,
+        effective_key: str | None = None,
+    ) -> asyncio.Task[Any]:
+        """Create and track a dispatch task so queue admission and /stop stay accurate."""
+        key = effective_key or (
+            UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
+        )
+        task = asyncio.create_task(self._dispatch(msg))
+        return self._track_active_task(key, task)
+
+    @staticmethod
+    def _is_queueable_followup(raw: str) -> bool:
+        """Only plain user messages join the normal queue; slash commands keep command semantics."""
+        return bool(raw) and not raw.startswith("/")
 
     def _redirect_workspace_harness_if_interrupted(
         self,
@@ -248,6 +373,10 @@ class AgentLoop:
         return bool(self._decide_harness_auto_reentry(msg).get("should_fire"))
 
     async def _schedule_harness_auto_continue(self, msg: InboundMessage) -> None:
+        # Harness auto-continue defers to user queue work
+        effective_key = self._unified_session and "unified:default" or msg.session_key
+        if self.coordinator.has_queued_work(effective_key, self._unified_session):
+            return
         service = HarnessService.for_workspace(self.workspace)
         decision = self._decide_harness_auto_reentry(msg)
         if not bool(decision.get("should_fire")):
@@ -388,8 +517,17 @@ class AgentLoop:
         archive_model: str | None = None,
         retrieval_provider: RetrievalProvider | None = None,
         hooks: list[AgentHook] | None = None,
+        context_block_limit: int | None = None,
+        max_tool_result_chars: int | None = None,
+        provider_retry_mode: str | None = None,
+        web_config: Any | None = None,
+        unified_session: bool = False,
+        disabled_skills: list[str] | None = None,
+        session_ttl_minutes: int | None = None,
+        tools_config: Any | None = None,
+        **kwargs,
     ):
-        from nanobot.config.schema import ExecToolConfig, MemoryConsolidationConfig, WebSearchConfig
+        from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
         self.bus = bus
         self.channels_config = channels_config
@@ -398,12 +536,17 @@ class AgentLoop:
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
-        self.web_search_config = web_search_config or WebSearchConfig()
+        self.web_config = web_config or _default_web_config(web_search_config, web_proxy)
+        self.web_search_config = (
+            web_search_config
+            or getattr(self.web_config, "search", None)
+            or WebSearchConfig()
+        )
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
-        self.memory_config = memory_config or MemoryConsolidationConfig()
+        self.memory_config = memory_config or _default_memory_config()
         self.archive_provider = archive_provider or provider
         self.archive_model = (
             archive_model or self.memory_config.model or (model or provider.get_default_model())
@@ -414,6 +557,20 @@ class AgentLoop:
         self._extra_hooks: list[AgentHook] = hooks or []
         self.retrieval_provider = retrieval_provider or NullRetrievalProvider()
         self._metadata_retrieval_provider = MetadataRetrievalProvider()
+        # Store compat params referenced by self.py:334 and nanobot.py caller
+        self.provider_retry_mode = provider_retry_mode or "standard"
+        self.max_tool_result_chars = (
+            self._TOOL_RESULT_MAX_CHARS
+            if max_tool_result_chars is None
+            else max_tool_result_chars
+        )
+        self.unified_session = unified_session
+        self._unified_session = unified_session
+        self.disabled_skills = disabled_skills or []
+        self._context_block_limit = context_block_limit
+        self._session_ttl_minutes = session_ttl_minutes or 0
+        self._web_config = self.web_config
+        self._tools_config = tools_config
 
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
@@ -433,6 +590,7 @@ class AgentLoop:
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
+        self._mcp_stacks: dict[str, AsyncExitStack] = {}
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
@@ -456,10 +614,25 @@ class AgentLoop:
             archive_provider=self.archive_provider,
             archive_model=self.archive_model,
         )
-        # Compatibility shim for tests/runtime paths that still expect
-        # `loop.consolidator.archive(...)` from the upstream Consolidator surface.
-        self.consolidator = SimpleNamespace(
-            archive=self.memory_consolidator.archive_messages,
+        self.consolidator = Consolidator(
+            store=self.context.memory,
+            provider=provider,
+            model=self.model,
+            sessions=self.sessions,
+            context_window_tokens=context_window_tokens,
+            build_messages=self.context.build_messages,
+            get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=provider.generation.max_tokens,
+        )
+        self.auto_compact = AutoCompact(
+            sessions=self.sessions,
+            consolidator=self.consolidator,
+            session_ttl_minutes=self._session_ttl_minutes,
+        )
+        self.dream = Dream(
+            store=self.context.memory,
+            provider=provider,
+            model=self.model,
         )
         compact_model = self.memory_config.compact_state_model or self.archive_model
         self.compact_state = CompactStateManager(
@@ -470,9 +643,18 @@ class AgentLoop:
         self._register_default_tools()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+        self.coordinator = SessionQueueCoordinator()
 
-    async def _maybe_consolidate_and_sync_compact_state(self, session: Session) -> bool:
-        completed = await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+    async def _maybe_consolidate_and_sync_compact_state(
+        self,
+        session: Session,
+        *,
+        session_summary: str | None = None,
+    ) -> bool:
+        completed = await self.consolidator.maybe_consolidate_by_tokens(
+            session,
+            session_summary=session_summary,
+        )
         if not completed or not self.memory_config.compact_state_enabled:
             return completed
         synced = await self.compact_state.sync_session(session)
@@ -541,6 +723,8 @@ class AgentLoop:
         )
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+        for cls in (GlobTool, GrepTool):
+            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         if self.exec_config.enable:
             self.tools.register(
                 ExecTool(
@@ -567,18 +751,12 @@ class AgentLoop:
         from nanobot.agent.tools.mcp import connect_mcp_servers
 
         try:
-            self._mcp_stack = AsyncExitStack()
-            await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
-            self._mcp_connected = True
+            self._mcp_stacks = await connect_mcp_servers(self._mcp_servers, self.tools)
+            self._mcp_stack = None
+            self._mcp_connected = bool(self._mcp_stacks)
         except BaseException as e:
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
-            if self._mcp_stack:
-                try:
-                    await self._mcp_stack.aclose()
-                except Exception:
-                    pass
-                self._mcp_stack = None
+            await self.close_mcp()
         finally:
             self._mcp_connecting = False
 
@@ -850,7 +1028,8 @@ class AgentLoop:
         chat_id: str = "direct",
         message_id: str | None = None,
         sender_id: str = "user",
-    ) -> tuple[str | None, list[str], list[dict]]:
+        session: Session | None = None,
+    ) -> _RunLoopResult:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
@@ -938,7 +1117,13 @@ class AgentLoop:
             logger.error(
                 "LLM returned error: {}", ((result.error or result.final_content) or "")[:200]
             )
-        return result.final_content, result.tools_used, result.messages
+        return _RunLoopResult(
+            result.final_content,
+            result.tools_used,
+            result.messages,
+            result.stop_reason,
+            False,
+        )
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -950,6 +1135,7 @@ class AgentLoop:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
+                self.auto_compact.check_expired(self._schedule_background)
                 continue
             except asyncio.CancelledError:
                 # Preserve real task cancellation so shutdown can complete cleanly.
@@ -971,18 +1157,48 @@ class AgentLoop:
             if fastlane := await try_workspace_fastlane(msg, raw):
                 await self.bus.publish_outbound(fastlane)
                 continue
-            task = asyncio.create_task(self._dispatch(msg))
-            self._active_tasks.setdefault(msg.session_key, []).append(task)
-            task.add_done_callback(
-                lambda t, k=msg.session_key: (
-                    self._active_tasks.get(k, []) and self._active_tasks[k].remove(t)
-                    if t in self._active_tasks.get(k, [])
-                    else None
-                )
+            effective_key = (
+                UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
             )
+
+            # --- pre-lock admission ---
+            raw = msg.content.strip()
+            # Plain user message — check if session is active (has running tasks)
+            active_tasks = self._active_tasks.get(effective_key, [])
+            has_active = any(not t.done() for t in active_tasks) if active_tasks else False
+            if has_active and self._is_queueable_followup(raw):
+                # Session is active — admit to normal queue, do NOT spawn _dispatch
+                self.coordinator.enqueue_normal(
+                    content=msg.content,
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    sender_id=msg.sender_id,
+                    session_key=effective_key,
+                    unified=self._unified_session,
+                    metadata={},
+                )
+                # Acknowledge queued
+                response = OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Message queued. Will be sent when the current turn finishes.",
+                    metadata=dict(msg.metadata or {}),
+                )
+                await self.bus.publish_outbound(response)
+                continue
+            # else: fall through to normal _dispatch
+            # --- end pre-lock admission ---
+
+            self._spawn_dispatch_task(msg, effective_key=effective_key)
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
+        if self._unified_session and not msg.session_key_override:
+            msg.session_key_override = UNIFIED_SESSION_KEY
+        effective_key = (
+            UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
+        )
+        self.coordinator.set_dispatch_state(effective_key, DispatchState.RUNNING, self._unified_session)
         lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
@@ -1173,18 +1389,32 @@ class AgentLoop:
                         content="Sorry, I encountered an error.",
                     )
                 )
+            finally:
+                self.coordinator.set_dispatch_state(effective_key, DispatchState.IDLE, self._unified_session)
+
+        if pending_msg := self.coordinator.pop_pending_dispatch(
+            effective_key, self._unified_session
+        ):
+            self._spawn_dispatch_task(pending_msg, effective_key=effective_key)
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
+        for stack in self._mcp_stacks.values():
+            try:
+                await stack.aclose()
+            except (RuntimeError, BaseExceptionGroup):
+                pass  # MCP SDK cancel scope cleanup is noisy but harmless
+        self._mcp_stacks = {}
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
             self._mcp_stack = None
+        self._mcp_connected = False
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
@@ -1192,7 +1422,103 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
-    async def _run_pre_reply_consolidation(self, session: Session) -> bool:
+    async def _maybe_consume_normal_queue(self, session_key: str) -> None:
+        """Called at safe boundaries — queue a post-lock dispatch for normal items."""
+        if not self.coordinator.has_normal_queued_work(session_key, self._unified_session):
+            return
+
+        # Safe-boundary normal consumption is allowed during TURN_CLOSING, but not while
+        # a reserved turn is already being dispatched.
+        state = self.coordinator.get_dispatch_state(session_key, self._unified_session)
+        if state == DispatchState.DISPATCHING_RESERVED_TURN:
+            return
+
+        consumed, metrics = self.coordinator.consume_normal_batch(
+            session_key,
+            self._unified_session,
+            max_items=10,
+            max_chars=8000,
+        )
+        if not consumed:
+            return
+
+        # Assemble synthesized input from consumed items
+        synthesized_content = "\n---\n".join(item.content for item in consumed)
+
+        # Build provenance metadata
+        provenance = {
+            "kind": "queued_batch",
+            "item_count": metrics.last_item_count,
+            "char_count": metrics.last_char_count,
+            "provenance_ids": [item.provenance_id for item in consumed],
+        }
+
+        # Create a synthetic InboundMessage and dispatch it
+        first = consumed[0]
+        synthesized_msg = InboundMessage(
+            channel=first.channel,
+            sender_id=first.sender_id,
+            chat_id=first.chat_id,
+            content=synthesized_content,
+            metadata={"_queued_batch": provenance},
+        )
+
+        self.coordinator.set_pending_dispatch(
+            session_key,
+            synthesized_msg,
+            self._unified_session,
+        )
+
+    async def _maybe_dispatch_race_window_merge(self, session_key: str) -> None:
+        """Race window: if late normal arrived while /tq slot was reserved, queue one merged post-lock dispatch."""
+        normals, turn_item = self.coordinator.peek_and_assemble_race_window(
+            session_key, self._unified_session
+        )
+        if not normals or not turn_item:
+            return
+
+        # Consume both
+        consumed_normals, metrics = self.coordinator.consume_normal_batch(
+            session_key, self._unified_session, max_items=10, max_chars=8000
+        )
+        self.coordinator.consume_turn_slot(session_key, self._unified_session)
+
+        # Merge: normals first, then turn item
+        parts = [item.content for item in consumed_normals]
+        parts.append(turn_item.content)
+        synthesized_content = "\n---\n".join(parts)
+
+        provenance = {
+            "kind": "race_window_merge",
+            "item_count": len(consumed_normals) + 1,
+            "normal_ids": [item.provenance_id for item in consumed_normals],
+            "turn_id": turn_item.provenance_id,
+        }
+
+        synthesized_msg = InboundMessage(
+            channel=turn_item.channel,
+            sender_id=turn_item.sender_id,
+            chat_id=turn_item.chat_id,
+            content=synthesized_content,
+            metadata={"_queued_batch": provenance, "_race_window": True},
+        )
+
+        # Dispatch the merged turn
+        self.coordinator.set_dispatch_state(
+            session_key, DispatchState.DISPATCHING_RESERVED_TURN, self._unified_session
+        )
+        self.coordinator.set_pending_dispatch(
+            session_key,
+            synthesized_msg,
+            self._unified_session,
+        )
+
+    async def _run_pre_reply_consolidation(
+        self,
+        session: Session,
+        *,
+        session_summary: str | None = None,
+    ) -> bool:
         """Best-effort pre-reply consolidation. Returns True if it completed cleanly."""
         if not self.memory_config.enabled:
             return True
@@ -1205,7 +1531,10 @@ class AgentLoop:
                 self.archive_model,
             )
             completed = await asyncio.wait_for(
-                self._maybe_consolidate_and_sync_compact_state(session),
+                self._maybe_consolidate_and_sync_compact_state(
+                    session,
+                    session_summary=session_summary,
+                ),
                 timeout=timeout,
             )
             return completed
@@ -1214,7 +1543,7 @@ class AgentLoop:
                 "Pre-reply consolidation timed out for {} after {}s", session.key, timeout
             )
             try:
-                await self.memory_consolidator.handle_timeout(session, phase="pre-reply")
+                await self.consolidator.handle_timeout(session, phase="pre-reply")
             except Exception:
                 logger.exception(
                     "Failed to record pre-reply consolidation timeout for {}", session.key
@@ -1229,14 +1558,21 @@ class AgentLoop:
         session: Session,
         *,
         msg: InboundMessage | None = None,
+        session_summary: str | None = None,
     ) -> tuple[bool, str]:
         if not self.memory_config.enabled:
             return False, "memory_disabled"
         if msg is not None and bool((msg.metadata or {}).get("workspace_harness_auto")):
             return False, self._PRE_REPLY_CONSOLIDATION_SKIP_REASON_HARNESS_AUTO
-        over_budget, _estimated, _source = self.memory_consolidator.is_over_budget(session)
+        if session_summary:
+            return True, "pending_summary"
+        over_budget, estimated, source = self.consolidator.is_over_budget(
+            session,
+            session_summary=session_summary,
+        )
         if not over_budget:
             return False, self._PRE_REPLY_CONSOLIDATION_SKIP_REASON_UNDER_BUDGET
+        self.consolidator.prime_budget_estimate(session.key, estimated, source)
         return True, "over_budget"
 
     async def _maybe_run_pre_reply_consolidation(
@@ -1244,12 +1580,20 @@ class AgentLoop:
         session: Session,
         *,
         msg: InboundMessage | None = None,
+        session_summary: str | None = None,
     ) -> bool:
-        should_run, reason = self._should_run_pre_reply_consolidation(session, msg=msg)
+        should_run, reason = self._should_run_pre_reply_consolidation(
+            session,
+            msg=msg,
+            session_summary=session_summary,
+        )
         if not should_run:
             logger.debug("Pre-reply consolidation skipped for {}: {}", session.key, reason)
             return True
-        return await self._run_pre_reply_consolidation(session)
+        return await self._run_pre_reply_consolidation(
+            session,
+            session_summary=session_summary,
+        )
 
     async def _run_background_consolidation(self, session: Session) -> None:
         """Best-effort background consolidation with a looser timeout."""
@@ -1270,7 +1614,7 @@ class AgentLoop:
                 "Background consolidation timed out for {} after {}s", session.key, timeout
             )
             try:
-                await self.memory_consolidator.handle_timeout(session, phase="background")
+                await self.consolidator.handle_timeout(session, phase="background")
             except Exception:
                 logger.exception(
                     "Failed to record background consolidation timeout for {}", session.key
@@ -1293,7 +1637,7 @@ class AgentLoop:
             return history
 
         fallback_max = max(1, int(self.memory_config.recent_history_fallback_messages))
-        over_budget, estimated, source = self.memory_consolidator.is_over_budget(session)
+        over_budget, estimated, source = self.consolidator.is_over_budget(session)
         if not over_budget:
             return history
 
@@ -1330,6 +1674,16 @@ class AgentLoop:
     def _discard_inflight_turn(self, session_key: str) -> None:
         self._inflight_turns.pop(session_key, None)
 
+    @staticmethod
+    def _coerce_run_loop_result(
+        result: _RunLoopResult | tuple[Any, ...] | list[Any],
+    ) -> tuple[str | None, list[str], list[dict]]:
+        if isinstance(result, _RunLoopResult):
+            return result.final_content, result.tools_used, result.messages
+        if isinstance(result, (tuple, list)) and len(result) >= 3:
+            return result[0], result[1] or [], result[2] or []
+        raise TypeError("Unexpected _run_agent_loop result shape")
+
     def _pop_inflight_turn_snapshot(self, session_key: str) -> dict[str, str] | None:
         turn = self._inflight_turns.pop(session_key, None)
         if not isinstance(turn, dict):
@@ -1354,6 +1708,126 @@ class AgentLoop:
             self._save_turn(session, entries, skip=0)
         return snapshot
 
+    def _clear_pending_user_turn(self, session: Session) -> None:
+        session.metadata.pop(self._PENDING_USER_TURN_KEY, None)
+
+    def _set_pending_user_turn(self, session: Session) -> None:
+        session.metadata[self._PENDING_USER_TURN_KEY] = True
+        self.sessions.save(session)
+
+    def _clear_runtime_checkpoint(self, session: Session) -> None:
+        session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+
+    def _set_runtime_checkpoint(self, session: Session, payload: dict[str, Any]) -> None:
+        session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
+        self.sessions.save(session)
+
+    def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
+        """Persist system/subagent follow-up as a standalone assistant history entry."""
+        content = str(msg.content or "").strip()
+        if not content or msg.sender_id != "subagent":
+            return False
+        task_id = str((msg.metadata or {}).get("subagent_task_id") or "").strip()
+        if task_id and any(
+            item.get("injected_event") == "subagent_result"
+            and item.get("subagent_task_id") == task_id
+            for item in session.messages
+        ):
+            return False
+        session.add_message(
+            "assistant",
+            content,
+            injected_event="subagent_result",
+            **({"subagent_task_id": task_id} if task_id else {}),
+        )
+        return True
+
+    @staticmethod
+    def _checkpoint_message_key(message: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            message.get("role"),
+            message.get("content"),
+            message.get("tool_call_id"),
+            message.get("name"),
+            message.get("tool_calls"),
+            message.get("reasoning_content"),
+            message.get("thinking_blocks"),
+        )
+
+    def _restore_runtime_checkpoint(self, session: Session) -> bool:
+        """Materialize an unfinished turn into history before processing resumes."""
+        from datetime import datetime
+
+        checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+        if not isinstance(checkpoint, dict):
+            return False
+
+        assistant_message = checkpoint.get("assistant_message")
+        completed_tool_results = checkpoint.get("completed_tool_results") or []
+        pending_tool_calls = checkpoint.get("pending_tool_calls") or []
+
+        restored_messages: list[dict[str, Any]] = []
+        if isinstance(assistant_message, dict):
+            restored = dict(assistant_message)
+            restored.setdefault("timestamp", datetime.now().isoformat())
+            restored_messages.append(restored)
+        for message in completed_tool_results:
+            if isinstance(message, dict):
+                restored = dict(message)
+                restored.setdefault("timestamp", datetime.now().isoformat())
+                restored_messages.append(restored)
+        for tool_call in pending_tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_id = tool_call.get("id")
+            name = ((tool_call.get("function") or {}).get("name")) or "tool"
+            restored_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "name": name,
+                    "content": "Error: Task interrupted before this tool finished.",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+
+        overlap = 0
+        max_overlap = min(len(session.messages), len(restored_messages))
+        for size in range(max_overlap, 0, -1):
+            existing = session.messages[-size:]
+            restored = restored_messages[:size]
+            if all(
+                self._checkpoint_message_key(left) == self._checkpoint_message_key(right)
+                for left, right in zip(existing, restored)
+            ):
+                overlap = size
+                break
+        session.messages.extend(restored_messages[overlap:])
+        session.updated_at = datetime.now()
+        self._clear_pending_user_turn(session)
+        self._clear_runtime_checkpoint(session)
+        return True
+
+    def _restore_pending_user_turn(self, session: Session) -> bool:
+        """Close a turn that only persisted the user message before crashing."""
+        from datetime import datetime
+
+        if not session.metadata.get(self._PENDING_USER_TURN_KEY):
+            return False
+
+        if session.messages and session.messages[-1].get("role") == "user":
+            session.messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Error: Task interrupted before a response was generated.",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+            session.updated_at = datetime.now()
+
+        self._clear_pending_user_turn(session)
+        return True
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1371,9 +1845,23 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            await self._maybe_run_pre_reply_consolidation(session, msg=msg)
+            if self._restore_runtime_checkpoint(session):
+                self.sessions.save(session)
+            if self._restore_pending_user_turn(session):
+                self.sessions.save(session)
+            inserted_subagent_followup = self._persist_subagent_followup(session, msg)
+            if inserted_subagent_followup:
+                self.sessions.save(session)
+            session, pending_summary = self.auto_compact.prepare_session(session, key)
+            await self._maybe_run_pre_reply_consolidation(
+                session,
+                msg=msg,
+                session_summary=pending_summary,
+            )
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), msg.metadata, msg.sender_id)
             history = session.get_history(max_messages=0)
+            if inserted_subagent_followup and history:
+                history = history[:-1]
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             runtime_metadata = self._extract_runtime_metadata(msg)
             retrieval_context = await self._build_retrieval_context(
@@ -1395,15 +1883,19 @@ class AgentLoop:
                 runtime_metadata=runtime_metadata,
                 retrieval_context=retrieval_context,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
+            run_result = await self._run_agent_loop(
                 messages,
                 channel=channel,
                 chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
                 sender_id=msg.sender_id,
+                session=session,
             )
+            final_content, _, all_msgs = self._coerce_run_loop_result(run_result)
             final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
-            self._save_turn(session, all_msgs, 1 + len(history))
+            self._save_turn(session, all_msgs, (2 if inserted_subagent_followup else 1) + len(history))
+            self._clear_pending_user_turn(session)
+            self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
             self._schedule_background(self._run_background_consolidation(session))
             if self._should_schedule_harness_auto_continue(msg):
@@ -1420,6 +1912,11 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+        if self._restore_runtime_checkpoint(session):
+            self.sessions.save(session)
+        if self._restore_pending_user_turn(session):
+            self.sessions.save(session)
+        session, pending_summary = self.auto_compact.prepare_session(session, key)
 
         # Slash commands
         raw = msg.content.strip()
@@ -1434,7 +1931,11 @@ class AgentLoop:
             )
             self.sessions.save(session)
 
-        preflight_ok = await self._maybe_run_pre_reply_consolidation(session, msg=msg)
+        preflight_ok = await self._maybe_run_pre_reply_consolidation(
+            session,
+            msg=msg,
+            session_summary=pending_summary,
+        )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             workspace_cmd = (msg.metadata or {}).get("workspace_agent_cmd")
@@ -1503,6 +2004,14 @@ class AgentLoop:
         self._register_inflight_turn(
             msg.session_key, role=persisted_role, content=persisted_turn_content
         )
+        early_persisted_user_turn = False
+        if persisted_role == "user":
+            session.add_message("user", persisted_turn_content)
+            self._set_pending_user_turn(session)
+            history = session.get_history(max_messages=0)
+            if history:
+                history = history[:-1]
+            early_persisted_user_turn = True
         effective_on_stream = on_stream
         if on_stream is not None:
 
@@ -1538,7 +2047,7 @@ class AgentLoop:
             if persisted_messages:
                 persisted_current_content = persisted_messages[-1].get("content")
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        run_result = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=effective_on_stream,
@@ -1547,7 +2056,19 @@ class AgentLoop:
             chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
             sender_id=msg.sender_id,
+            session=session,
         )
+        final_content, _, all_msgs = self._coerce_run_loop_result(run_result)
+
+        # Safe boundary: mark turn closing, then consume any pending queue
+        key = session_key or msg.session_key
+        effective_key = (
+            UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else key
+        )
+        self.coordinator.set_dispatch_state(effective_key, DispatchState.TURN_CLOSING, self._unified_session)
+        await self._maybe_dispatch_race_window_merge(effective_key)
+        await self._maybe_consume_normal_queue(effective_key)
+        self.coordinator.set_dispatch_state(effective_key, DispatchState.IDLE, self._unified_session)
 
         final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
         final_content, key_principle_notice = self._extract_terminal_key_principle(final_content)
@@ -1571,7 +2092,9 @@ class AgentLoop:
                     "content": persisted_current_content,
                 }
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        self._save_turn(session, all_msgs, (2 if early_persisted_user_turn else 1) + len(history))
+        self._clear_pending_user_turn(session)
+        self._clear_runtime_checkpoint(session)
         self._discard_inflight_turn(msg.session_key)
         self.sessions.save(session)
         self._schedule_background(self._run_background_consolidation(session))

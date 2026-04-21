@@ -17,11 +17,13 @@ FASTLANE_ROUTE_TIMEOUT_SECONDS = 5
 
 
 def build_workspace_env(msg: InboundMessage) -> dict[str, str]:
+    config_path = Path.home() / ".nanobot" / "config.json"
     return {
         **os.environ.copy(),
         "NANOBOT_CHANNEL": msg.channel,
         "NANOBOT_CHAT_ID": msg.chat_id,
         "NANOBOT_MESSAGE_ID": msg.metadata.get("message_id", ""),
+        "NANOBOT_CONFIG_PATH": str(config_path),
     }
 
 

@@ -106,8 +106,6 @@ class CronService:
                         payload=CronPayload(
                             kind=j["payload"].get("kind", "agent_turn"),
                             message=j["payload"].get("message", ""),
-                            completion_notice_text=j["payload"].get("completion_notice_text", ""),
-                            creator_sender_id=j["payload"].get("creator_sender_id", ""),
                             deliver=j["payload"].get("deliver", False),
                             channel=j["payload"].get("channel"),
                             to=j["payload"].get("to"),
@@ -209,8 +207,6 @@ class CronService:
                     "payload": {
                         "kind": j.payload.kind,
                         "message": j.payload.message,
-                        "completion_notice_text": j.payload.completion_notice_text,
-                        "creator_sender_id": j.payload.creator_sender_id,
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
@@ -239,8 +235,6 @@ class CronService:
         }
 
         self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        if not self._running and self._action_path.exists():
-            self._action_path.write_text("", encoding="utf-8")
 
     async def start(self) -> None:
         """Start the cron service."""
@@ -381,8 +375,6 @@ class CronService:
         name: str,
         schedule: CronSchedule,
         message: str,
-        completion_notice_text: str = "",
-        creator_sender_id: str = "",
         deliver: bool = False,
         channel: str | None = None,
         to: str | None = None,
@@ -400,8 +392,6 @@ class CronService:
             payload=CronPayload(
                 kind="agent_turn",
                 message=message,
-                completion_notice_text=completion_notice_text,
-                creator_sender_id=creator_sender_id,
                 deliver=deliver,
                 channel=channel,
                 to=to,
@@ -417,9 +407,6 @@ class CronService:
             self._save_store()
             self._arm_timer()
         else:
-            store = self._load_store()
-            store.jobs = [existing for existing in store.jobs if existing.id != job.id]
-            store.jobs.append(job)
             self._append_action("add", asdict(job))
 
         logger.info("Cron: added job '{}' ({})", name, job.id)

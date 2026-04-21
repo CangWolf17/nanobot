@@ -7,6 +7,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 PROTOCOL_PHASE_SKILL_HINTS = {
@@ -25,10 +27,16 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        builtin_skills_dir: Path | None = None,
+        disabled_skills: set[str] | list[str] | None = None,
+    ):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
+        self.disabled_skills = set(disabled_skills or [])
 
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """
@@ -48,6 +56,8 @@ class SkillsLoader:
                 if skill_dir.is_dir():
                     skill_file = skill_dir / "SKILL.md"
                     if skill_file.exists():
+                        if skill_dir.name in self.disabled_skills:
+                            continue
                         skills.append(
                             {"name": skill_dir.name, "path": str(skill_file), "source": "workspace"}
                         )
@@ -57,7 +67,11 @@ class SkillsLoader:
             for skill_dir in self.builtin_skills.iterdir():
                 if skill_dir.is_dir():
                     skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
+                    if (
+                        skill_file.exists()
+                        and skill_dir.name not in self.disabled_skills
+                        and not any(s["name"] == skill_dir.name for s in skills)
+                    ):
                         skills.append(
                             {"name": skill_dir.name, "path": str(skill_file), "source": "builtin"}
                         )
@@ -179,6 +193,9 @@ class SkillsLoader:
 
     def _parse_nanobot_metadata(self, raw: str) -> dict:
         """Parse skill metadata JSON from frontmatter (supports nanobot and openclaw keys)."""
+        if isinstance(raw, dict):
+            data = raw
+            return data.get("nanobot", data.get("openclaw", {})) if isinstance(data, dict) else {}
         try:
             data = json.loads(raw)
             return data.get("nanobot", data.get("openclaw", {})) if isinstance(data, dict) else {}
@@ -233,12 +250,7 @@ class SkillsLoader:
         if content.startswith("---"):
             match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
             if match:
-                # Simple YAML parsing
-                metadata = {}
-                for line in match.group(1).split("\n"):
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        metadata[key.strip()] = value.strip().strip("\"'")
-                return metadata
+                loaded = yaml.safe_load(match.group(1))
+                return loaded if isinstance(loaded, dict) else None
 
         return None
