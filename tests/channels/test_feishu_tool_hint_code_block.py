@@ -101,6 +101,24 @@ async def test_tool_hint_without_metadata_sends_as_normal(mock_feishu_channel):
 
 
 @mark.asyncio
+async def test_hook_context_card_sends_interactive_card(mock_feishu_channel):
+    msg = OutboundMessage(
+        channel="feishu",
+        chat_id="oc_123456",
+        content="**硬约束已生效**\n- `work_mode=build`",
+        metadata={"_hook_context_card": True},
+    )
+
+    with patch.object(mock_feishu_channel, "_send_message_sync") as mock_send:
+        await mock_feishu_channel.send(msg)
+
+        assert mock_send.call_count == 1
+        card = _get_tool_hint_card(mock_send)
+        assert card["header"]["title"]["content"] == "🪝 Hook Summary"
+        assert card["elements"][0]["content"] == "**硬约束已生效**\n- `work_mode=build`"
+
+
+@mark.asyncio
 async def test_tool_hint_multiple_tools_in_one_message(mock_feishu_channel):
     """Multiple tool calls should each get the 🔧 prefix."""
     msg = OutboundMessage(

@@ -1180,6 +1180,30 @@ class FeishuChannel(BaseChannel):
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._send_message_sync, receive_id_type, msg.chat_id, "post", post_body)
 
+    async def _send_hook_context_card(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        content: str,
+    ) -> None:
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "🪝 Hook Summary"},
+                "template": "wathet",
+            },
+            "elements": [{"tag": "markdown", "content": content.strip()}],
+        }
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            self._send_message_sync,
+            receive_id_type,
+            receive_id,
+            "interactive",
+            json.dumps(card, ensure_ascii=False),
+        )
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
         if not self._client:
@@ -1189,6 +1213,15 @@ class FeishuChannel(BaseChannel):
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
+
+            if msg.metadata.get("_hook_context_card"):
+                if msg.content and msg.content.strip():
+                    await self._send_hook_context_card(
+                        receive_id_type,
+                        msg.chat_id,
+                        msg.content,
+                    )
+                return
 
             # Handle tool hint messages as code blocks in interactive cards.
             # When a streaming card is active for this chat, inline the hint into the card instead.

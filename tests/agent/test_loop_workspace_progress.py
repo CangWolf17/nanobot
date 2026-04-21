@@ -179,6 +179,45 @@ def test_stream_requested_without_deltas_keeps_final_reply_sendable(tmp_path: Pa
     asyncio.run(run())
 
 
+def test_stream_requested_feishu_emits_hook_context_card_before_stream_start(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="请帮我分析一下最近这个失败",
+            metadata={
+                "_wants_stream": True,
+                "workspace_work_mode": "build",
+                "workspace_runtime": {
+                    "semantic_routing": {
+                        "matches": [{"skill": "analyze", "path": "skills/analyze/SKILL.md"}]
+                    }
+                },
+            },
+        )
+        loop._build_retrieval_context = AsyncMock(return_value="retrieved snippet")
+
+        await loop._dispatch(msg)
+        hook_card = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        stream_start = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        stream_end = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+        assert hook_card.metadata["_hook_context_card"] is True
+        assert "硬约束已生效" in hook_card.content
+        assert "`work_mode=build`" in hook_card.content
+        assert "辅助上下文已附加" in hook_card.content
+        assert "skill route → `analyze`" in hook_card.content
+        assert "retrieval context 已附加" in hook_card.content
+        assert stream_start.metadata["_stream_start"] is True
+        assert stream_end.metadata["_stream_end"] is True
+        assert outbound.content == "done"
+
+    asyncio.run(run())
+
+
 def test_stream_requested_command_dispatch_closes_placeholder_stream(tmp_path: Path) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)

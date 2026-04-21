@@ -133,6 +133,7 @@ class TestTypedHeaderContract:
             "_progress",
             "_tool_hint",
             "_harness_closeout",
+            "_hook_context_card",
         }
         all_keys = workspace_keys | stream_keys | completion_keys | delivery_keys
         # Verify no duplicates across groups

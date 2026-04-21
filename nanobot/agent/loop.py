@@ -334,6 +334,133 @@ class AgentLoop:
         runtime_meta.update(service_meta)
         return runtime_meta
 
+    @staticmethod
+    def _dedupe_preserve_order(items: list[str]) -> list[str]:
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for raw in items:
+            item = str(raw or "").strip()
+            if not item:
+                continue
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _build_hook_context_card_content(
+        self,
+        msg: InboundMessage,
+        *,
+        runtime_metadata: dict[str, Any] | None,
+        retrieval_context: str | None,
+    ) -> str | None:
+        meta = msg.metadata if isinstance(msg.metadata, dict) else {}
+        if msg.channel != "feishu" or not bool(meta.get("_wants_stream")):
+            return None
+
+        runtime_meta = runtime_metadata if isinstance(runtime_metadata, dict) else {}
+        sources: list[str] = []
+        hard_constraints: list[str] = []
+        assist_context: list[str] = []
+
+        workspace_cmd = str(meta.get("workspace_agent_cmd") or "").strip()
+        if workspace_cmd:
+            sources.append(f"显式命令 `/{workspace_cmd}`")
+
+        work_mode = str(
+            meta.get("workspace_work_mode") or runtime_meta.get("work_mode") or ""
+        ).strip()
+        if work_mode in {"plan", "build"}:
+            hard_constraints.append(f"`work_mode={work_mode}`")
+
+        harness = runtime_meta.get("active_harness")
+        if isinstance(harness, dict):
+            harness_type = str(harness.get("type") or "harness").strip() or "harness"
+            harness_phase = str(
+                harness.get("phase") or harness.get("status") or "active"
+            ).strip() or "active"
+            mode_flags: list[str] = []
+            if isinstance(harness.get("auto"), bool):
+                mode_flags.append("auto" if harness.get("auto") else "manual")
+            if bool(harness.get("awaiting_user")):
+                mode_flags.append("awaiting_user")
+            if bool(harness.get("blocked")):
+                mode_flags.append("blocked")
+            rendered = f"`harness={harness_type}/{harness_phase}`"
+            if mode_flags:
+                rendered += f" ({', '.join(mode_flags)})"
+            hard_constraints.append(rendered)
+
+        semantic = runtime_meta.get("semantic_routing")
+        if isinstance(semantic, dict):
+            matches = semantic.get("matches")
+            rendered_skills: list[str] = []
+            if isinstance(matches, list):
+                for item in matches[:3]:
+                    if not isinstance(item, dict):
+                        continue
+                    skill = str(item.get("skill") or "").strip()
+                    if skill:
+                        rendered_skills.append(f"`{skill}`")
+            if rendered_skills:
+                sources.append("语义 hook")
+                assist_context.append(f"skill route → {', '.join(rendered_skills)}")
+
+        if retrieval_context and retrieval_context.strip():
+            assist_context.append("retrieval context 已附加")
+
+        sources = self._dedupe_preserve_order(sources)
+        hard_constraints = self._dedupe_preserve_order(hard_constraints)
+        assist_context = self._dedupe_preserve_order(assist_context)
+
+        if not hard_constraints and not assist_context:
+            return None
+
+        lines: list[str] = []
+        if sources:
+            lines.append("**命中来源**")
+            lines.extend(f"- {item}" for item in sources)
+        if hard_constraints:
+            if lines:
+                lines.append("")
+            lines.append("**硬约束已生效**")
+            lines.extend(f"- {item}" for item in hard_constraints)
+        if assist_context:
+            if lines:
+                lines.append("")
+            lines.append("**辅助上下文已附加**")
+            lines.extend(f"- {item}" for item in assist_context)
+        return "\n".join(lines).strip() or None
+
+    async def _publish_hook_context_card(
+        self,
+        msg: InboundMessage,
+        *,
+        runtime_metadata: dict[str, Any] | None,
+        retrieval_context: str | None,
+    ) -> bool:
+        content = self._build_hook_context_card_content(
+            msg,
+            runtime_metadata=runtime_metadata,
+            retrieval_context=retrieval_context,
+        )
+        if not content:
+            return False
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                metadata={
+                    "_hook_context_card": True,
+                    "message_id": (msg.metadata or {}).get("message_id"),
+                },
+            )
+        )
+        return True
+
     def _decide_harness_auto_reentry(self, msg: InboundMessage) -> dict[str, Any]:
         meta = msg.metadata or {}
         origin_sender_id = str(
@@ -1207,6 +1334,7 @@ class AgentLoop:
                 stream_base_id: str | None = None
                 stream_segment = 0
                 stream_end_sent = False
+                stream_start_sent = False
                 stream_started_at: float | None = None
                 stream_finished_at: float | None = None
                 stream_chunk_count = 0
@@ -1215,10 +1343,28 @@ class AgentLoop:
                 segment_stream_char_count = 0
                 terminal_key_principle_text = ""
 
+                async def _emit_stream_start_if_needed() -> None:
+                    nonlocal stream_start_sent
+                    if stream_base_id is None or stream_start_sent:
+                        return
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="",
+                            metadata={
+                                "_stream_start": True,
+                                "_stream_id": f"{stream_base_id}:0",
+                            },
+                        )
+                    )
+                    stream_start_sent = True
+
                 async def _emit_pending_stream_end() -> None:
                     nonlocal stream_end_sent, stream_finished_at
                     if stream_base_id is None or stream_end_sent:
                         return
+                    await _emit_stream_start_if_needed()
                     if stream_started_at is not None:
                         stream_finished_at = time.monotonic()
                     metadata = {
@@ -1242,18 +1388,6 @@ class AgentLoop:
                     # Split one answer into distinct stream segments.
                     stream_base_id = f"{msg.session_key}:{time.time_ns()}"
 
-                    await self.bus.publish_outbound(
-                        OutboundMessage(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            content="",
-                            metadata={
-                                "_stream_start": True,
-                                "_stream_id": f"{stream_base_id}:0",
-                            },
-                        )
-                    )
-
                     def _current_stream_id() -> str:
                         return f"{stream_base_id}:{stream_segment}"
 
@@ -1274,6 +1408,7 @@ class AgentLoop:
                             stream_char_count += len(delta)
                             segment_stream_chunk_count += 1
                             segment_stream_char_count += len(delta)
+                        await _emit_stream_start_if_needed()
                         await self.bus.publish_outbound(
                             OutboundMessage(
                                 channel=msg.channel,
@@ -1293,6 +1428,7 @@ class AgentLoop:
                             stream_finished_at, \
                             segment_stream_chunk_count, \
                             segment_stream_char_count
+                        await _emit_stream_start_if_needed()
                         if stream_started_at is not None:
                             stream_finished_at = time.monotonic()
                         metadata = {
@@ -1321,6 +1457,7 @@ class AgentLoop:
                     msg,
                     on_stream=on_stream,
                     on_stream_end=on_stream_end,
+                    emit_stream_start=_emit_stream_start_if_needed,
                 )
                 if response is not None:
                     terminal_key_principle_text = str(
@@ -1835,6 +1972,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        emit_stream_start: Callable[[], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -1883,6 +2021,8 @@ class AgentLoop:
                 runtime_metadata=runtime_metadata,
                 retrieval_context=retrieval_context,
             )
+            if emit_stream_start is not None:
+                await emit_stream_start()
             run_result = await self._run_agent_loop(
                 messages,
                 channel=channel,
@@ -1922,6 +2062,8 @@ class AgentLoop:
         raw = msg.content.strip()
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
         if result := await self.commands.dispatch(ctx):
+            if emit_stream_start is not None:
+                await emit_stream_start()
             return result
 
         if (interrupt_state := session.metadata.pop("interrupt_state", None)) is not None:
@@ -1999,6 +2141,11 @@ class AgentLoop:
             metadata=msg.metadata,
             runtime_metadata=runtime_metadata,
         )
+        await self._publish_hook_context_card(
+            msg,
+            runtime_metadata=runtime_metadata,
+            retrieval_context=retrieval_context,
+        )
         persisted_role = "assistant" if msg.sender_id == "subagent" else "user"
         persisted_turn_content = msg.content
         self._register_inflight_turn(
@@ -2047,6 +2194,8 @@ class AgentLoop:
             if persisted_messages:
                 persisted_current_content = persisted_messages[-1].get("content")
 
+        if emit_stream_start is not None:
+            await emit_stream_start()
         run_result = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
