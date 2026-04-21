@@ -8,13 +8,13 @@ from pathlib import Path
 from time import time
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
+
+UNIFIED_SESSION_KEY = "unified:default"
 from nanobot.command.harness import cmd_harness
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.command.workspace_bridge import cmd_workspace_bridge
 from nanobot.config.paths import get_workspace_path
 from nanobot.harness.service import HarnessService
-
-UNIFIED_SESSION_KEY = "unified:default"
 
 
 def build_help_text() -> str:
