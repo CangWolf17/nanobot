@@ -21,7 +21,7 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Dream, MemoryConsolidator
 from nanobot.agent.policy.dev_discipline import should_disable_concurrent_tools
-from nanobot.agent.queue import SessionQueueCoordinator
+from nanobot.agent.queue import DispatchState, SessionQueueCoordinator
 from nanobot.agent.retrieval import (
     MetadataRetrievalProvider,
     NullRetrievalProvider,
@@ -1104,6 +1104,10 @@ class AgentLoop:
         """Process a message: per-session serial, cross-session concurrent."""
         if self._unified_session and not msg.session_key_override:
             msg.session_key_override = UNIFIED_SESSION_KEY
+        effective_key = (
+            UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
+        )
+        self.coordinator.set_dispatch_state(effective_key, DispatchState.RUNNING, self._unified_session)
         lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
@@ -1319,6 +1323,49 @@ class AgentLoop:
         task = asyncio.create_task(coro)
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
+
+    async def _maybe_consume_normal_queue(self, session_key: str) -> None:
+        """Called at safe boundaries — check if normal queue has items and consume."""
+        if not self.coordinator.has_normal_queued_work(session_key, self._unified_session):
+            return
+
+        # Don't consume if turn is closing or dispatching reserved turn
+        state = self.coordinator.get_dispatch_state(session_key, self._unified_session)
+        if state == DispatchState.TURN_CLOSING or state == DispatchState.DISPATCHING_RESERVED_TURN:
+            return
+
+        consumed, metrics = self.coordinator.consume_normal_batch(
+            session_key,
+            self._unified_session,
+            max_items=10,
+            max_chars=8000,
+        )
+        if not consumed:
+            return
+
+        # Assemble synthesized input from consumed items
+        synthesized_content = "\n---\n".join(item.content for item in consumed)
+
+        # Build provenance metadata
+        provenance = {
+            "kind": "queued_batch",
+            "item_count": metrics.last_item_count,
+            "char_count": metrics.last_char_count,
+            "provenance_ids": [item.provenance_id for item in consumed],
+        }
+
+        # Create a synthetic InboundMessage and dispatch it
+        first = consumed[0]
+        synthesized_msg = InboundMessage(
+            channel=first.channel,
+            sender_id=first.sender_id,
+            chat_id=first.chat_id,
+            content=synthesized_content,
+            metadata={"_queued_batch": provenance},
+        )
+
+        # Dispatch via _dispatch (this will also update dispatch_state)
+        await self._dispatch(synthesized_msg)
 
     async def _run_pre_reply_consolidation(self, session: Session) -> bool:
         """Best-effort pre-reply consolidation. Returns True if it completed cleanly."""
