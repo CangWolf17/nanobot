@@ -165,7 +165,8 @@ def _create_bridge_stream_card_with_client(
     if not response.success():
         return {"ok": False, "fallback_reason": "stream_handle_unavailable", "code": response.code, "msg": response.msg}
 
-    card_id = getattr(response.data, "card_id", None)
+    raw_card_id = getattr(response.data, "card_id", None)
+    card_id = raw_card_id if isinstance(raw_card_id, str) else None
     if not card_id:
         return {"ok": False, "fallback_reason": "stream_handle_unavailable"}
 

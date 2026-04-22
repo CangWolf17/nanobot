@@ -257,6 +257,7 @@ class FeishuConfig(Base):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
     enabled: bool = False
+    domain: Literal["feishu", "lark"] = "feishu"
     app_id: str = ""
     app_secret: str = ""
     encrypt_key: str = ""
@@ -318,6 +319,7 @@ class FeishuChannel(BaseChannel):
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
+        self._bot_open_id: str | None = None
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -423,12 +425,19 @@ class FeishuChannel(BaseChannel):
         if "@_all" in raw_content:
             return True
 
+        bot_open_id = str(getattr(self, "_bot_open_id", "") or "").strip()
         for mention in getattr(message, "mentions", None) or []:
             mid = getattr(mention, "id", None)
             if not mid:
                 continue
-            # Bot mentions have no user_id (None or "") but a valid open_id
-            if not getattr(mid, "user_id", None) and (getattr(mid, "open_id", None) or "").startswith("ou_"):
+            mention_open_id = str(getattr(mid, "open_id", None) or "").strip()
+            mention_user_id = str(getattr(mid, "user_id", None) or "").strip()
+            if bot_open_id:
+                if mention_open_id == bot_open_id:
+                    return True
+                continue
+            # Fallback heuristic: bot mentions have no user_id but a valid open_id
+            if not mention_user_id and mention_open_id.startswith("ou_"):
                 return True
         return False
 
@@ -438,7 +447,37 @@ class FeishuChannel(BaseChannel):
             return True
         return self._is_bot_mentioned(message)
 
-    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
+    @staticmethod
+    def _resolve_mentions(text: str, mentions: list[Any] | None) -> str:
+        """Resolve Feishu mention placeholders to visible user labels."""
+        if not text:
+            return ""
+        if not mentions:
+            return text
+
+        resolved = text
+        for mention in mentions:
+            key = str(getattr(mention, "key", "") or "")
+            if not key or key not in resolved:
+                continue
+            mid = getattr(mention, "id", None)
+            if not mid:
+                continue
+            open_id = str(getattr(mid, "open_id", "") or "").strip()
+            user_id = str(getattr(mid, "user_id", "") or "").strip()
+            if not open_id and not user_id:
+                continue
+            name = str(getattr(mention, "name", "") or key.lstrip("@"))
+            if open_id and user_id:
+                replacement = f"@{name} ({open_id}, user id: {user_id})"
+            elif open_id:
+                replacement = f"@{name} ({open_id})"
+            else:
+                replacement = f"@{name} (user id: {user_id})"
+            resolved = resolved.replace(key, replacement)
+        return resolved
+
+    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> str | None:
         """Sync helper for adding reaction (runs in thread pool)."""
         from lark_oapi.api.im.v1 import (
             CreateMessageReactionRequest,
@@ -458,22 +497,51 @@ class FeishuChannel(BaseChannel):
 
             if not response.success():
                 logger.warning("Failed to add reaction: code={}, msg={}", response.code, response.msg)
-            else:
-                logger.debug("Added {} reaction to message {}", emoji_type, message_id)
+                return None
+            reaction_id = getattr(getattr(response, "data", None), "reaction_id", None)
+            if not reaction_id:
+                return None
+            logger.debug("Added {} reaction to message {}", emoji_type, message_id)
+            return str(reaction_id)
         except Exception as e:
             logger.warning("Error adding reaction: {}", e)
+            return None
 
-    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
+    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> str | None:
         """
         Add a reaction emoji to a message (non-blocking).
 
         Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
         """
         if not self._client:
-            return
+            return None
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+        return await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+
+    def _remove_reaction_sync(self, message_id: str, reaction_id: str) -> None:
+        """Sync helper for removing reaction (runs in thread pool)."""
+        from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+
+        try:
+            request = (
+                DeleteMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_id(reaction_id)
+                .build()
+            )
+            response = self._client.im.v1.message_reaction.delete(request)
+            if not response.success():
+                logger.warning("Failed to remove reaction: code={}, msg={}", response.code, response.msg)
+        except Exception as e:
+            logger.warning("Error removing reaction: {}", e)
+
+    async def _remove_reaction(self, message_id: str, reaction_id: str | None) -> None:
+        """Remove a reaction emoji from a message (non-blocking)."""
+        if not self._client or not reaction_id:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._remove_reaction_sync, message_id, reaction_id)
 
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -937,6 +1005,10 @@ class FeishuChannel(BaseChannel):
                 for chunk in self._split_elements_by_table_limit(self._build_card_elements(buf.text)):
                     card = json.dumps({"config": {"wide_screen_mode": True}, "elements": chunk}, ensure_ascii=False)
                     await loop.run_in_executor(None, self._send_message_sync, rid_type, chat_id, "interactive", card)
+            reaction_message_id = str(meta.get("message_id") or "").strip()
+            reaction_id = str(meta.get("reaction_id") or "").strip()
+            if reaction_message_id and reaction_id:
+                await self._remove_reaction(reaction_message_id, reaction_id)
             return
 
         # --- accumulate delta ---
@@ -1205,7 +1277,7 @@ class FeishuChannel(BaseChannel):
                 content_json = {}
 
             if msg_type == "text":
-                text = content_json.get("text", "")
+                text = self._resolve_mentions(content_json.get("text", ""), getattr(message, "mentions", None))
                 if text:
                     content_parts.append(text)
 
