@@ -151,157 +151,6 @@
     ],
     "description": "Create and scaffold Codex plugins and optional marketplace entries."
   },
-  "lark-calendar": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-calendar/SKILL.md",
-    "keywords": [
-      "lark calendar",
-      "飞书日历",
-      "会议室"
-    ],
-    "description": "Feishu calendar, scheduling, attendees, free/busy, and meeting rooms."
-  },
-  "lark-contact": {
-    "path": "/home/admin/.nanobot/workspace/skills/lark-contact/SKILL.md",
-    "keywords": [
-      "lark contact",
-      "飞书通讯录",
-      "找同事"
-    ],
-    "description": "Search users, look up profiles, and inspect organization structure in Feishu."
-  },
-  "lark-doc": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-doc/SKILL.md",
-    "keywords": [
-      "lark doc",
-      "飞书文档"
-    ],
-    "description": "Create, search, read, and edit Feishu docs."
-  },
-  "lark-drive": {
-    "path": "/home/admin/.nanobot/workspace/skills/lark-drive/SKILL.md",
-    "keywords": [
-      "lark drive",
-      "飞书云盘",
-      "上传文件"
-    ],
-    "description": "Manage Feishu cloud files, folders, permissions, imports, and downloads."
-  },
-  "lark-im": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-im/SKILL.md",
-    "keywords": [
-      "lark im",
-      "飞书消息",
-      "聊天记录"
-    ],
-    "description": "Send messages, search chat history, and manage group chats in Feishu."
-  },
-  "lark-approval": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-approval/SKILL.md",
-    "keywords": [
-      "approval task",
-      "审批",
-      "审批任务"
-    ],
-    "description": "Manage Feishu approval instances and approval tasks."
-  },
-  "lark-attendance": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-attendance/SKILL.md",
-    "keywords": [
-      "attendance record",
-      "考勤",
-      "打卡"
-    ],
-    "description": "Query personal attendance and punch records in Feishu."
-  },
-  "lark-task": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-task/SKILL.md",
-    "keywords": [
-      "lark task",
-      "飞书任务",
-      "待办"
-    ],
-    "description": "Create and manage Feishu tasks and task lists."
-  },
-  "lark-base": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-base/SKILL.md",
-    "keywords": [
-      "lark base",
-      "飞书多维表格",
-      "bitable"
-    ],
-    "description": "Operate Feishu Base / Bitable with schema, records, and workflow support."
-  },
-  "lark-sheets": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-sheets/SKILL.md",
-    "keywords": [
-      "lark sheets",
-      "飞书电子表格",
-      "sheet 单元格"
-    ],
-    "description": "Read and write Feishu spreadsheets and cell data."
-  },
-  "lark-mail": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-mail/SKILL.md",
-    "keywords": [
-      "lark mail",
-      "飞书邮箱",
-      "回复邮件"
-    ],
-    "description": "Draft, search, read, and send mail through Feishu Mail."
-  },
-  "lark-minutes": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-minutes/SKILL.md",
-    "keywords": [
-      "妙记",
-      "妙记详情"
-    ],
-    "description": "Search Feishu minutes, inspect minute metadata, and download associated audio/video files."
-  },
-  "lark-vc": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-vc/SKILL.md",
-    "keywords": [
-      "video meeting",
-      "会议记录",
-      "逐字稿",
-      "视频会议"
-    ],
-    "description": "Search completed video meeting records and fetch meeting-note, summary, todo, chapter, and transcript outputs."
-  },
-  "lark-okr": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-okr/SKILL.md",
-    "keywords": [
-      "okr",
-      "关键结果"
-    ],
-    "description": "View and manage Feishu OKR cycles, objectives, key results, and alignments."
-  },
-  "lark-slides": {
-    "path": "/home/admin/.nanobot/workspace/skills/lark-slides/SKILL.md",
-    "keywords": [
-      "lark slides",
-      "飞书幻灯片",
-      "ppt"
-    ],
-    "description": "Create, read, and manage Feishu slides and presentation content."
-  },
-  "lark-whiteboard": {
-    "path": "/home/admin/.nanobot/.agents/skills/lark-whiteboard/SKILL.md",
-    "keywords": [
-      "lark whiteboard",
-      "飞书画板",
-      "mermaid",
-      "plantuml"
-    ],
-    "description": "Read and edit Feishu whiteboards, including Mermaid and PlantUML flows."
-  },
-  "lark-wiki": {
-    "path": "/home/admin/.nanobot/workspace/skills/lark-wiki/SKILL.md",
-    "keywords": [
-      "lark wiki",
-      "飞书知识库"
-    ],
-    "description": "Manage Feishu knowledge spaces, members, and wiki nodes."
-  },
   "github": {
     "path": "/home/admin/nanobot-fork-live/nanobot/skills/github/SKILL.md",
     "keywords": [
@@ -344,6 +193,68 @@
     ],
     "description": "Search and install public agent skills from the ClawHub registry."
   },
+  "lark-approval": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-approval/SKILL.md",
+    "keywords": [
+      "approval task",
+      "审批",
+      "审批任务"
+    ],
+    "description": "Manage Feishu approval instances and approval tasks."
+  },
+  "lark-attendance": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-attendance/SKILL.md",
+    "keywords": [
+      "attendance record",
+      "考勤",
+      "打卡"
+    ],
+    "description": "Query personal attendance and punch records in Feishu."
+  },
+  "lark-base": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-base/SKILL.md",
+    "keywords": [
+      "lark base",
+      "飞书多维表格",
+      "bitable"
+    ],
+    "description": "Operate Feishu Base / Bitable with schema, records, and workflow support."
+  },
+  "lark-calendar": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-calendar/SKILL.md",
+    "keywords": [
+      "lark calendar",
+      "飞书日历",
+      "会议室"
+    ],
+    "description": "Feishu calendar, scheduling, attendees, free/busy, and meeting rooms."
+  },
+  "lark-contact": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-contact/SKILL.md",
+    "keywords": [
+      "lark contact",
+      "飞书通讯录",
+      "找同事"
+    ],
+    "description": "Search users, look up profiles, and inspect organization structure in Feishu."
+  },
+  "lark-doc": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-doc/SKILL.md",
+    "keywords": [
+      "lark doc",
+      "飞书文档"
+    ],
+    "description": "Create, search, read, and edit Feishu docs."
+  },
+  "lark-drive": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-drive/SKILL.md",
+    "keywords": [
+      "lark drive",
+      "飞书云盘",
+      "上传文件"
+    ],
+    "description": "Manage Feishu cloud files, folders, permissions, imports, and downloads."
+  },
   "lark-event": {
     "path": "/home/admin/.nanobot/workspace/skills/lark-event/SKILL.md",
     "keywords": [
@@ -353,6 +264,40 @@
     ],
     "description": "Subscribe to Feishu events and consume WebSocket event streams with agent-friendly routing."
   },
+  "lark-im": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-im/SKILL.md",
+    "keywords": [
+      "lark im",
+      "飞书消息",
+      "聊天记录"
+    ],
+    "description": "Send messages, search chat history, and manage group chats in Feishu."
+  },
+  "lark-mail": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-mail/SKILL.md",
+    "keywords": [
+      "lark mail",
+      "飞书邮箱",
+      "回复邮件"
+    ],
+    "description": "Draft, search, read, and send mail through Feishu Mail."
+  },
+  "lark-minutes": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-minutes/SKILL.md",
+    "keywords": [
+      "妙记",
+      "妙记详情"
+    ],
+    "description": "Search Feishu minutes, inspect minute metadata, and download associated audio/video files."
+  },
+  "lark-okr": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-okr/SKILL.md",
+    "keywords": [
+      "okr",
+      "关键结果"
+    ],
+    "description": "View and manage Feishu OKR cycles, objectives, key results, and alignments."
+  },
   "lark-openapi-explorer": {
     "path": "/home/admin/.nanobot/workspace/skills/lark-openapi-explorer/SKILL.md",
     "keywords": [
@@ -361,6 +306,15 @@
     ],
     "description": "Explore official Lark OpenAPI surfaces when existing lark-cli skills do not cover a capability."
   },
+  "lark-sheets": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-sheets/SKILL.md",
+    "keywords": [
+      "lark sheets",
+      "飞书电子表格",
+      "sheet 单元格"
+    ],
+    "description": "Read and write Feishu spreadsheets and cell data."
+  },
   "lark-skill-maker": {
     "path": "/home/admin/.nanobot/workspace/skills/lark-skill-maker/SKILL.md",
     "keywords": [
@@ -368,6 +322,52 @@
       "创建 lark skill"
     ],
     "description": "Guide creation and maintenance of custom Lark skills and adapter skill surfaces."
+  },
+  "lark-slides": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-slides/SKILL.md",
+    "keywords": [
+      "lark slides",
+      "飞书幻灯片",
+      "ppt"
+    ],
+    "description": "Create, read, and manage Feishu slides and presentation content."
+  },
+  "lark-task": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-task/SKILL.md",
+    "keywords": [
+      "lark task",
+      "飞书任务",
+      "待办"
+    ],
+    "description": "Create and manage Feishu tasks and task lists."
+  },
+  "lark-vc": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-vc/SKILL.md",
+    "keywords": [
+      "video meeting",
+      "会议记录",
+      "逐字稿",
+      "视频会议"
+    ],
+    "description": "Search completed video meeting records and fetch meeting-note, summary, todo, chapter, and transcript outputs."
+  },
+  "lark-whiteboard": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-whiteboard/SKILL.md",
+    "keywords": [
+      "lark whiteboard",
+      "飞书画板",
+      "mermaid",
+      "plantuml"
+    ],
+    "description": "Read and edit Feishu whiteboards, including Mermaid and PlantUML flows."
+  },
+  "lark-wiki": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-wiki/SKILL.md",
+    "keywords": [
+      "lark wiki",
+      "飞书知识库"
+    ],
+    "description": "Manage Feishu knowledge spaces, members, and wiki nodes."
   },
   "lark-workflow-meeting-summary": {
     "path": "/home/admin/.nanobot/workspace/skills/lark-workflow-meeting-summary/SKILL.md",
