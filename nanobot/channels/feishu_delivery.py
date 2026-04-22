@@ -6,6 +6,7 @@ import importlib.util
 import json
 from functools import lru_cache
 from pathlib import Path
+from typing import Callable
 from typing import Any
 
 from nanobot.channels.feishu_render import (
@@ -54,30 +55,48 @@ def _get_client() -> Any | None:
 
 def _send_message_sync(receive_id_type: str, receive_id: str, msg_type: str, content: str) -> dict[str, Any]:
     client = _get_client()
+    return _send_message_with_client(client, receive_id_type, receive_id, msg_type, content)
+
+
+def _send_message_with_client(
+    client: Any | None,
+    receive_id_type: str,
+    receive_id: str,
+    msg_type: str,
+    content: str,
+) -> dict[str, Any]:
     if client is None:
         return {"ok": False, "error": "delivery_contract_unavailable"}
 
     from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
-    request = (
-        CreateMessageRequest.builder()
-        .receive_id_type(receive_id_type)
-        .request_body(
-            CreateMessageRequestBody.builder()
-            .receive_id(receive_id)
-            .msg_type(msg_type)
-            .content(content)
+    try:
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type(receive_id_type)
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(receive_id)
+                .msg_type(msg_type)
+                .content(content)
+                .build()
+            )
             .build()
         )
-        .build()
-    )
-    response = client.im.v1.message.create(request)
+        response = client.im.v1.message.create(request)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "message_send_failed",
+            "detail": str(exc),
+        }
     if not response.success():
         return {
             "ok": False,
             "error": "message_send_failed",
             "code": response.code,
             "msg": response.msg,
+            "log_id": getattr(response, "get_log_id", lambda: None)(),
         }
     return {"ok": True, "message_id": getattr(response.data, "message_id", None)}
 
@@ -107,22 +126,41 @@ def send_text_message(receive_id: str, text: str, *, receive_id_type: str = "ope
 
 def create_bridge_stream_card(receive_id: str, *, receive_id_type: str = "chat_id", placeholder_text: str = "正在生成…") -> dict[str, Any]:
     client = _get_client()
+    return _create_bridge_stream_card_with_client(
+        client,
+        receive_id,
+        receive_id_type=receive_id_type,
+        placeholder_text=placeholder_text,
+    )
+
+
+def _create_bridge_stream_card_with_client(
+    client: Any | None,
+    receive_id: str,
+    *,
+    receive_id_type: str = "chat_id",
+    placeholder_text: str = "正在生成…",
+    send_message_fn: Callable[[str, str, str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     if client is None:
         return {"ok": False, "fallback_reason": "delivery_contract_unavailable"}
 
     from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
 
-    request = (
-        CreateCardRequest.builder()
-        .request_body(
-            CreateCardRequestBody.builder()
-            .type("card_json")
-            .data(build_streaming_placeholder_card_json(placeholder_text))
+    try:
+        request = (
+            CreateCardRequest.builder()
+            .request_body(
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(build_streaming_placeholder_card_json(placeholder_text))
+                .build()
+            )
             .build()
         )
-        .build()
-    )
-    response = client.cardkit.v1.card.create(request)
+        response = client.cardkit.v1.card.create(request)
+    except Exception as exc:
+        return {"ok": False, "fallback_reason": "stream_handle_unavailable", "detail": str(exc)}
     if not response.success():
         return {"ok": False, "fallback_reason": "stream_handle_unavailable", "code": response.code, "msg": response.msg}
 
@@ -130,7 +168,8 @@ def create_bridge_stream_card(receive_id: str, *, receive_id_type: str = "chat_i
     if not card_id:
         return {"ok": False, "fallback_reason": "stream_handle_unavailable"}
 
-    sent = _send_message_sync(
+    message_sender = send_message_fn or (lambda a, b, c, d: _send_message_with_client(client, a, b, c, d))
+    sent = message_sender(
         receive_id_type,
         receive_id,
         "interactive",
@@ -143,19 +182,31 @@ def create_bridge_stream_card(receive_id: str, *, receive_id_type: str = "chat_i
 
 def update_bridge_stream_card(card_id: str, content: str, sequence: int) -> dict[str, Any]:
     client = _get_client()
+    return _update_bridge_stream_card_with_client(client, card_id, content, sequence)
+
+
+def _update_bridge_stream_card_with_client(
+    client: Any | None,
+    card_id: str,
+    content: str,
+    sequence: int,
+) -> dict[str, Any]:
     if client is None:
         return {"ok": False, "error": "delivery_contract_unavailable"}
 
     from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
 
-    request = (
-        ContentCardElementRequest.builder()
-        .card_id(card_id)
-        .element_id(STREAM_ELEMENT_ID)
-        .request_body(ContentCardElementRequestBody.builder().content(content).sequence(sequence).build())
-        .build()
-    )
-    response = client.cardkit.v1.card_element.content(request)
+    try:
+        request = (
+            ContentCardElementRequest.builder()
+            .card_id(card_id)
+            .element_id(STREAM_ELEMENT_ID)
+            .request_body(ContentCardElementRequestBody.builder().content(content).sequence(sequence).build())
+            .build()
+        )
+        response = client.cardkit.v1.card_element.content(request)
+    except Exception as exc:
+        return {"ok": False, "error": "stream_update_failed", "detail": str(exc)}
     if not response.success():
         return {"ok": False, "error": "stream_update_failed", "code": response.code, "msg": response.msg}
     return {"ok": True}
@@ -163,24 +214,37 @@ def update_bridge_stream_card(card_id: str, content: str, sequence: int) -> dict
 
 def close_bridge_stream_card(card_id: str, sequence: int) -> dict[str, Any]:
     client = _get_client()
+    return _close_bridge_stream_card_with_client(client, card_id, sequence)
+
+
+def _close_bridge_stream_card_with_client(
+    client: Any | None,
+    card_id: str,
+    sequence: int,
+    *,
+    close_uuid: str = "workspace-bridge-close",
+) -> dict[str, Any]:
     if client is None:
         return {"ok": False, "error": "delivery_contract_unavailable"}
 
     from lark_oapi.api.cardkit.v1 import SettingsCardRequest, SettingsCardRequestBody
 
-    request = (
-        SettingsCardRequest.builder()
-        .card_id(card_id)
-        .request_body(
-            SettingsCardRequestBody.builder()
-            .settings(json.dumps({"config": {"streaming_mode": False}}, ensure_ascii=False))
-            .sequence(sequence)
-            .uuid("workspace-bridge-close")
+    try:
+        request = (
+            SettingsCardRequest.builder()
+            .card_id(card_id)
+            .request_body(
+                SettingsCardRequestBody.builder()
+                .settings(json.dumps({"config": {"streaming_mode": False}}, ensure_ascii=False))
+                .sequence(sequence)
+                .uuid(close_uuid)
+                .build()
+            )
             .build()
         )
-        .build()
-    )
-    response = client.cardkit.v1.card.settings(request)
+        response = client.cardkit.v1.card.settings(request)
+    except Exception as exc:
+        return {"ok": False, "error": "stream_close_failed", "detail": str(exc)}
     if not response.success():
         return {"ok": False, "error": "stream_close_failed", "code": response.code, "msg": response.msg}
     return {"ok": True}

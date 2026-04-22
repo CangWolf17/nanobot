@@ -1,7 +1,7 @@
 """Tests for Feishu streaming (send_delta) via CardKit streaming API."""
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -129,6 +129,21 @@ class TestCloseStreamingMode:
         ch._client.cardkit.v1.card.settings.side_effect = RuntimeError("err")
         assert ch._close_streaming_mode_sync("card_1", 10) is False
 
+    def test_delegates_to_shared_delivery_helper(self):
+        ch = _make_channel()
+        with patch(
+            "nanobot.channels.feishu.shared_close_bridge_stream_card_with_client",
+            return_value={"ok": True},
+        ) as mock_close:
+            assert ch._close_streaming_mode_sync("card_1", 10) is True
+
+        mock_close.assert_called_once_with(
+            ch._client,
+            "card_1",
+            10,
+            close_uuid="feishu-channel-close-10",
+        )
+
 
 class TestStreamUpdateText:
     def test_returns_true_on_success(self):
@@ -145,6 +160,50 @@ class TestStreamUpdateText:
         ch = _make_channel()
         ch._client.cardkit.v1.card_element.content.side_effect = RuntimeError("err")
         assert ch._stream_update_text_sync("card_1", "hello", 1) is False
+
+    def test_delegates_to_shared_delivery_helper(self):
+        ch = _make_channel()
+        with patch(
+            "nanobot.channels.feishu.shared_update_bridge_stream_card_with_client",
+            return_value={"ok": True},
+        ) as mock_update:
+            assert ch._stream_update_text_sync("card_1", "hello", 1) is True
+
+        mock_update.assert_called_once_with(ch._client, "card_1", "hello", 1)
+
+
+class TestSharedDeliveryDelegation:
+    def test_send_message_sync_delegates_to_shared_delivery_helper(self):
+        ch = _make_channel()
+        with patch(
+            "nanobot.channels.feishu.shared_send_message_with_client",
+            return_value={"ok": True, "message_id": "om_shared"},
+        ) as mock_send:
+            assert ch._send_message_sync("chat_id", "oc_chat1", "text", '{"text":"hi"}') == "om_shared"
+
+        mock_send.assert_called_once_with(
+            ch._client,
+            "chat_id",
+            "oc_chat1",
+            "text",
+            '{"text":"hi"}',
+        )
+
+    def test_create_streaming_card_sync_delegates_to_shared_delivery_helper(self):
+        ch = _make_channel()
+        ch.config.streaming_placeholder_text = "正在生成共享流…"
+        with patch(
+            "nanobot.channels.feishu.shared_create_bridge_stream_card_with_client",
+            return_value={"ok": True, "card_id": "card_shared"},
+        ) as mock_create:
+            assert ch._create_streaming_card_sync("chat_id", "oc_chat1") == "card_shared"
+
+        mock_create.assert_called_once_with(
+            ch._client,
+            "oc_chat1",
+            receive_id_type="chat_id",
+            placeholder_text="正在生成共享流…",
+        )
 
 
 class TestSendDelta:

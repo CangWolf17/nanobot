@@ -7,7 +7,6 @@ import os
 import re
 import threading
 import time
-import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -18,10 +17,15 @@ from pydantic import Field
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.feishu_delivery import (
+    _close_bridge_stream_card_with_client as shared_close_bridge_stream_card_with_client,
+    _create_bridge_stream_card_with_client as shared_create_bridge_stream_card_with_client,
+    _send_message_with_client as shared_send_message_with_client,
+    _update_bridge_stream_card_with_client as shared_update_bridge_stream_card_with_client,
+)
 from nanobot.channels.feishu_render import (
     STREAM_ELEMENT_ID as SHARED_STREAM_ELEMENT_ID,
     build_card_elements as shared_build_card_elements,
-    build_streaming_placeholder_card_json,
     detect_msg_format as shared_detect_msg_format,
     markdown_to_post as shared_markdown_to_post,
     parse_md_table as shared_parse_md_table,
@@ -780,82 +784,66 @@ class FeishuChannel(BaseChannel):
 
     def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str | None:
         """Send a single message and return the message_id on success."""
-        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-        try:
-            request = CreateMessageRequest.builder() \
-                .receive_id_type(receive_id_type) \
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(receive_id)
-                    .msg_type(msg_type)
-                    .content(content)
-                    .build()
-                ).build()
-            response = self._client.im.v1.message.create(request)
-            if not response.success():
-                logger.error(
-                    "Failed to send Feishu {} message: code={}, msg={}, log_id={}",
-                    msg_type, response.code, response.msg, response.get_log_id()
-                )
-                return None
-            msg_id = getattr(response.data, "message_id", None)
-            logger.debug("Feishu {} message sent to {}: {}", msg_type, receive_id, msg_id)
-            return msg_id
-        except Exception as e:
-            logger.error("Error sending Feishu {} message: {}", msg_type, e)
+        result = shared_send_message_with_client(
+            self._client,
+            receive_id_type,
+            receive_id,
+            msg_type,
+            content,
+        )
+        if not result.get("ok"):
+            logger.error(
+                "Failed to send Feishu {} message: code={}, msg={}, log_id={}, detail={}",
+                msg_type,
+                result.get("code"),
+                result.get("msg") or result.get("error"),
+                result.get("log_id"),
+                result.get("detail"),
+            )
             return None
+        msg_id = result.get("message_id")
+        logger.debug("Feishu {} message sent to {}: {}", msg_type, receive_id, msg_id)
+        return msg_id
 
     def _create_streaming_card_sync(self, receive_id_type: str, chat_id: str) -> str | None:
         """Create a CardKit streaming card, send it to chat, return card_id."""
-        from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
         placeholder = str(getattr(self.config, "streaming_placeholder_text", "") or "").strip()
-        try:
-            request = CreateCardRequest.builder().request_body(
-                CreateCardRequestBody.builder()
-                .type("card_json")
-                .data(build_streaming_placeholder_card_json(placeholder))
-                .build()
-            ).build()
-            response = self._client.cardkit.v1.card.create(request)
-            if not response.success():
-                logger.warning("Failed to create streaming card: code={}, msg={}", response.code, response.msg)
-                return None
-            card_id = getattr(response.data, "card_id", None)
-            if card_id:
-                message_id = self._send_message_sync(
-                    receive_id_type, chat_id, "interactive",
-                    json.dumps({"type": "card", "data": {"card_id": card_id}}),
-                )
-                if message_id:
-                    return card_id
-                logger.warning("Created streaming card {} but failed to send it to {}", card_id, chat_id)
+        result = shared_create_bridge_stream_card_with_client(
+            self._client,
+            chat_id,
+            receive_id_type=receive_id_type,
+            placeholder_text=placeholder,
+        )
+        if not result.get("ok"):
+            logger.warning(
+                "Failed to create streaming card for {}: reason={}, code={}, msg={}, detail={}",
+                chat_id,
+                result.get("fallback_reason"),
+                result.get("code"),
+                result.get("msg"),
+                result.get("detail"),
+            )
             return None
-        except Exception as e:
-            logger.warning("Error creating streaming card: {}", e)
-            return None
+        return str(result.get("card_id") or "") or None
 
     def _stream_update_text_sync(self, card_id: str, content: str, sequence: int) -> bool:
         """Stream-update the markdown element on a CardKit card (typewriter effect)."""
-        from lark_oapi.api.cardkit.v1 import (
-            ContentCardElementRequest,
-            ContentCardElementRequestBody,
+        result = shared_update_bridge_stream_card_with_client(
+            self._client,
+            card_id,
+            content,
+            sequence,
         )
-        try:
-            request = ContentCardElementRequest.builder() \
-                .card_id(card_id) \
-                .element_id(_STREAM_ELEMENT_ID) \
-                .request_body(
-                    ContentCardElementRequestBody.builder()
-                    .content(content).sequence(sequence).build()
-                ).build()
-            response = self._client.cardkit.v1.card_element.content(request)
-            if not response.success():
-                logger.warning("Failed to stream-update card {}: code={}, msg={}", card_id, response.code, response.msg)
-                return False
-            return True
-        except Exception as e:
-            logger.warning("Error stream-updating card {}: {}", card_id, e)
+        if not result.get("ok"):
+            logger.warning(
+                "Failed to stream-update card {}: code={}, msg={}, detail={}",
+                card_id,
+                result.get("code"),
+                result.get("msg") or result.get("error"),
+                result.get("detail"),
+            )
             return False
+        return True
 
     def _close_streaming_mode_sync(self, card_id: str, sequence: int) -> bool:
         """Turn off CardKit streaming_mode so the chat list preview exits the streaming placeholder.
@@ -864,29 +852,22 @@ class FeishuChannel(BaseChannel):
         streaming_mode is set to false via card settings (after final content update).
         Sequence must strictly exceed the previous card OpenAPI operation on this entity.
         """
-        from lark_oapi.api.cardkit.v1 import SettingsCardRequest, SettingsCardRequestBody
-        settings_payload = json.dumps({"config": {"streaming_mode": False}}, ensure_ascii=False)
-        try:
-            request = SettingsCardRequest.builder() \
-                .card_id(card_id) \
-                .request_body(
-                    SettingsCardRequestBody.builder()
-                    .settings(settings_payload)
-                    .sequence(sequence)
-                    .uuid(str(uuid.uuid4()))
-                    .build()
-                ).build()
-            response = self._client.cardkit.v1.card.settings(request)
-            if not response.success():
-                logger.warning(
-                    "Failed to close streaming on card {}: code={}, msg={}",
-                    card_id, response.code, response.msg,
-                )
-                return False
-            return True
-        except Exception as e:
-            logger.warning("Error closing streaming on card {}: {}", card_id, e)
+        result = shared_close_bridge_stream_card_with_client(
+            self._client,
+            card_id,
+            sequence,
+            close_uuid=f"feishu-channel-close-{sequence}",
+        )
+        if not result.get("ok"):
+            logger.warning(
+                "Failed to close streaming on card {}: code={}, msg={}, detail={}",
+                card_id,
+                result.get("code"),
+                result.get("msg") or result.get("error"),
+                result.get("detail"),
+            )
             return False
+        return True
 
     @staticmethod
     def _trim_terminal_key_principle(text: str, terminal_key_principle: str | None) -> str:
