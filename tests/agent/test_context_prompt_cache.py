@@ -159,9 +159,9 @@ def test_semantic_routing_hint_stays_in_system_prompt_not_user_message(tmp_path)
                 "mode": "direct_route",
                 "matches": [
                     {
-                        "skill": "self-improving-lite",
-                        "path": "skills/self-improving-lite/SKILL.md",
-                        "description": "Structured diagnosis and self-reflection workflow.",
+                        "skill": "analyze",
+                        "path": "skills/analyze/SKILL.md",
+                        "description": "Structured diagnosis and investigation workflow.",
                         "matched_terms": ["diagnose"],
                     }
                 ],
@@ -173,8 +173,8 @@ def test_semantic_routing_hint_stays_in_system_prompt_not_user_message(tmp_path)
     user_content = messages[-1]["content"]
 
     assert "## Semantic Routing Hint" in system_prompt
-    assert "self-improving-lite" in system_prompt
-    assert "skills/self-improving-lite/SKILL.md" in system_prompt
+    assert "analyze" in system_prompt
+    assert "skills/analyze/SKILL.md" in system_prompt
     assert "matched `diagnose`" in system_prompt
     assert isinstance(user_content, str)
     assert user_content == "please diagnose this failure"

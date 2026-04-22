@@ -404,6 +404,7 @@ class AgentLoop:
         if isinstance(semantic, dict):
             matches = semantic.get("matches")
             rendered_skills: list[str] = []
+            matched_terms: list[str] = []
             if isinstance(matches, list):
                 for item in matches[:3]:
                     if not isinstance(item, dict):
@@ -411,8 +412,20 @@ class AgentLoop:
                     skill = str(item.get("skill") or "").strip()
                     if skill:
                         rendered_skills.append(f"`{skill}`")
+                    raw_terms = item.get("matched_terms")
+                    if isinstance(raw_terms, list):
+                        for raw_term in raw_terms:
+                            term = str(raw_term or "").strip()
+                            if term:
+                                matched_terms.append(f"`{term}`")
             if rendered_skills:
-                sources.append("语义 hook")
+                if matched_terms:
+                    rendered_terms = ", ".join(
+                        self._dedupe_preserve_order(matched_terms)[:4]
+                    )
+                    sources.append(f"语义 hook（命中 {rendered_terms}）")
+                else:
+                    sources.append("语义 hook")
                 assist_context.append(f"skill route → {', '.join(rendered_skills)}")
 
         if retrieval_context and retrieval_context.strip():

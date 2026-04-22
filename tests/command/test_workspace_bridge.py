@@ -89,10 +89,10 @@ def test_workspace_bridge_injects_advisory_semantic_skill_routing_for_plain_mess
     (tmp_path / "skills").mkdir(parents=True, exist_ok=True)
     (tmp_path / "skills" / "skill-map.json").write_text(
         """{
-  "self-improving-lite": {
-    "path": "skills/self-improving-lite/SKILL.md",
-    "keywords": ["reflect", "improve"],
-    "description": "Structured diagnosis and self-reflection workflow."
+  "analyze": {
+    "path": "skills/analyze/SKILL.md",
+    "keywords": ["analyze", "diagnose", "debug", "root cause", "诊断", "排查"],
+    "description": "Structured diagnosis and investigation workflow."
   }
 }""",
         encoding="utf-8",
@@ -120,7 +120,7 @@ def test_workspace_bridge_injects_advisory_semantic_skill_routing_for_plain_mess
     semantic = ctx.msg.metadata["workspace_runtime"]["semantic_routing"]
     assert semantic["mode"] == "direct_route"
     assert semantic["preserve_explicit_commands"] is True
-    assert semantic["matches"][0]["skill"] == "self-improving-lite"
+    assert semantic["matches"][0]["skill"] == "analyze"
     completed = MagicMock(stdout="Autopilot: idle\n", stderr="", returncode=0)
     ctx = CommandContext(
         msg=InboundMessage(

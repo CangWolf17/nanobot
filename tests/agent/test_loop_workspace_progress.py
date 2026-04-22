@@ -192,7 +192,13 @@ def test_stream_requested_feishu_emits_hook_context_card_before_stream_start(tmp
                 "workspace_work_mode": "build",
                 "workspace_runtime": {
                     "semantic_routing": {
-                        "matches": [{"skill": "analyze", "path": "skills/analyze/SKILL.md"}]
+                        "matches": [
+                            {
+                                "skill": "analyze",
+                                "path": "skills/analyze/SKILL.md",
+                                "matched_terms": ["分析", "失败"],
+                            }
+                        ]
                     }
                 },
             },
@@ -206,6 +212,7 @@ def test_stream_requested_feishu_emits_hook_context_card_before_stream_start(tmp
         outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
 
         assert hook_card.metadata["_hook_context_card"] is True
+        assert "语义 hook（命中 `分析`, `失败`）" in hook_card.content
         assert "硬约束已生效" in hook_card.content
         assert "`work_mode=build`" in hook_card.content
         assert "辅助上下文已附加" in hook_card.content

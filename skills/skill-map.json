@@ -1,0 +1,488 @@
+{
+  "小结": {
+    "path": "/home/admin/.nanobot/workspace/skills/session-workflows/SKILL.md",
+    "keywords": [
+      "summary",
+      "小结"
+    ],
+    "description": "Session-aware daily summary workflow. Command surface: /summary -> /小结."
+  },
+  "感悟": {
+    "path": "/home/admin/.nanobot/workspace/skills/session-workflows/SKILL.md",
+    "keywords": [
+      "insight",
+      "感悟"
+    ],
+    "description": "Session-aware insight capture workflow that appends dated reflections to the vault."
+  },
+  "笔记": {
+    "path": "/home/admin/.nanobot/workspace/skills/obsidian-notes/SKILL.md",
+    "keywords": [
+      "notes",
+      "笔记"
+    ],
+    "description": "Session-aware note authoring workflow for /笔记 with confirm-before-write behavior."
+  },
+  "breadcrumb": {
+    "path": "/home/admin/.nanobot/workspace/skills/breadcrumb/SKILL.md",
+    "keywords": [
+      "breadcrumb",
+      "checkpoint",
+      "context-note",
+      "备忘",
+      "记录要点",
+      "留个痕",
+      "记个点"
+    ],
+    "description": "Capture durable breadcrumbs for compaction resilience, handoff, and resume without implying full /笔记 authoring."
+  },
+  "analyze": {
+    "path": "/home/admin/.codex/skills/analyze/SKILL.md",
+    "keywords": [
+      "analyze",
+      "investigate",
+      "diagnose",
+      "debug",
+      "root cause",
+      "问题原因",
+      "原因分析",
+      "诊断",
+      "排查"
+    ],
+    "description": "Read-only deep analysis for failures, root-cause investigation, and grounded explanations."
+  },
+  "plan": {
+    "path": "/home/admin/.codex/skills/plan/SKILL.md",
+    "keywords": [
+      "planning",
+      "roadmap",
+      "规划",
+      "实施方案",
+      "拆解方案",
+      "执行计划"
+    ],
+    "description": "Strategic planning, task decomposition, and next-step sequencing."
+  },
+  "summarize": {
+    "path": "/home/admin/nanobot-fork-live/nanobot/skills/summarize/SKILL.md",
+    "keywords": [
+      "summarize.sh",
+      "summarize url",
+      "summarize this url",
+      "总结这个链接",
+      "总结这个视频",
+      "transcribe this video",
+      "视频转写",
+      "提取 transcript"
+    ],
+    "description": "Summarize URLs, local files, podcasts, and videos, including transcript extraction workflows."
+  },
+  "trace": {
+    "path": "/home/admin/.nanobot/workspace/skills/trace/SKILL.md",
+    "keywords": [
+      "trace",
+      "timeline",
+      "发生了什么",
+      "刚刚走了哪条路由",
+      "命中了什么状态",
+      "路由链路"
+    ],
+    "description": "Reconstruct router, harness, command, and session breadcrumbs into a concise timeline."
+  },
+  "code-review": {
+    "path": "/home/admin/.nanobot/workspace/skills/code-review/SKILL.md",
+    "keywords": [
+      "code review",
+      "review this code",
+      "review this pr",
+      "merge review",
+      "审代码",
+      "代码审查",
+      "代码评审"
+    ],
+    "description": "Structured code review with severity-rated findings, file evidence, and a clear merge recommendation."
+  },
+  "security-review": {
+    "path": "/home/admin/.nanobot/workspace/skills/security-review/SKILL.md",
+    "keywords": [
+      "security review",
+      "security audit",
+      "audit for vulnerabilities",
+      "owasp scan",
+      "安全审查",
+      "安全审计",
+      "漏洞审计"
+    ],
+    "description": "Structured security audit focused on auth, injection, secrets, dependency, and trust-boundary risks."
+  },
+  "deep-interview": {
+    "path": "/home/admin/.nanobot/workspace/skills/deep-interview/SKILL.md",
+    "keywords": [
+      "deep interview",
+      "interview me",
+      "ask me everything",
+      "don't assume",
+      "clarify requirements",
+      "别假设",
+      "先别执行",
+      "先理需求",
+      "ouroboros"
+    ],
+    "description": "Ask one focused question at a time to reduce ambiguity before planning or execution."
+  },
+  "openai-docs": {
+    "path": "/home/admin/.codex/skills/.system/openai-docs/SKILL.md",
+    "keywords": [
+      "openai docs",
+      "openai api docs",
+      "latest openai model",
+      "which openai model should i use",
+      "gpt-5.4 upgrade",
+      "prompt upgrade for gpt-5.4",
+      "responses api",
+      "apps sdk",
+      "realtime api"
+    ],
+    "description": "Use current official OpenAI documentation for API guidance, model selection, and upgrade questions."
+  },
+  "imagegen": {
+    "path": "/home/admin/.codex/skills/.system/imagegen/SKILL.md",
+    "keywords": [
+      "generate an image",
+      "edit this image",
+      "create a mockup",
+      "make an illustration",
+      "remove background",
+      "transparent cutout",
+      "create sprite",
+      "hero image",
+      "生成图片",
+      "改图",
+      "抠图"
+    ],
+    "description": "Generate or edit raster images when the user explicitly wants image creation or bitmap asset editing."
+  },
+  "skill": {
+    "path": "/home/admin/.codex/skills/skill/SKILL.md",
+    "keywords": [
+      "skill list",
+      "skill add",
+      "skill remove",
+      "skill edit",
+      "skill search",
+      "skill info",
+      "manage local skills"
+    ],
+    "description": "Manage local skills, including listing, adding, removing, searching, and editing skills."
+  },
+  "skill-creator": {
+    "path": "/home/admin/.codex/skills/.system/skill-creator/SKILL.md",
+    "keywords": [
+      "create a skill",
+      "make a new codex skill",
+      "update this skill",
+      "design a skill",
+      "scaffold skill content"
+    ],
+    "description": "Create or update skill contents and structure for Codex skills."
+  },
+  "skill-installer": {
+    "path": "/home/admin/.codex/skills/.system/skill-installer/SKILL.md",
+    "keywords": [
+      "list installable skills",
+      "install a skill",
+      "install curated skill",
+      "install from github",
+      "install experimental skills"
+    ],
+    "description": "List and install curated or GitHub-hosted skills into the local Codex skills directory."
+  },
+  "plugin-creator": {
+    "path": "/home/admin/.codex/skills/.system/plugin-creator/SKILL.md",
+    "keywords": [
+      "create plugin",
+      "new plugin",
+      "插件脚手架",
+      "新建插件"
+    ],
+    "description": "Create and scaffold Codex plugins and optional marketplace entries."
+  },
+  "lark-calendar": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-calendar/SKILL.md",
+    "keywords": [
+      "lark calendar",
+      "飞书日历",
+      "日程安排",
+      "会议室",
+      "忙闲",
+      "freebusy",
+      "agenda"
+    ],
+    "description": "Feishu calendar, scheduling, attendees, free/busy, and meeting rooms."
+  },
+  "lark-contact": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-contact/SKILL.md",
+    "keywords": [
+      "lark contact",
+      "飞书通讯录",
+      "找同事",
+      "查人",
+      "组织架构"
+    ],
+    "description": "Search users, look up profiles, and inspect organization structure in Feishu."
+  },
+  "lark-doc": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-doc/SKILL.md",
+    "keywords": [
+      "lark doc",
+      "飞书文档",
+      "云文档",
+      "文档搜索"
+    ],
+    "description": "Create, search, read, and edit Feishu docs."
+  },
+  "lark-drive": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-drive/SKILL.md",
+    "keywords": [
+      "lark drive",
+      "飞书云盘",
+      "云空间",
+      "上传文件",
+      "下载文件",
+      "文件权限"
+    ],
+    "description": "Manage Feishu cloud files, folders, permissions, imports, and downloads."
+  },
+  "lark-im": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-im/SKILL.md",
+    "keywords": [
+      "lark im",
+      "飞书消息",
+      "发消息",
+      "群聊",
+      "聊天记录"
+    ],
+    "description": "Send messages, search chat history, and manage group chats in Feishu."
+  },
+  "lark-approval": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-approval/SKILL.md",
+    "keywords": [
+      "approval",
+      "审批",
+      "审批任务",
+      "审批实例"
+    ],
+    "description": "Manage Feishu approval instances and approval tasks."
+  },
+  "lark-attendance": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-attendance/SKILL.md",
+    "keywords": [
+      "attendance",
+      "考勤",
+      "打卡",
+      "考勤记录"
+    ],
+    "description": "Query personal attendance and punch records in Feishu."
+  },
+  "lark-task": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-task/SKILL.md",
+    "keywords": [
+      "lark task",
+      "飞书任务",
+      "待办",
+      "任务清单",
+      "todo"
+    ],
+    "description": "Create and manage Feishu tasks and task lists."
+  },
+  "lark-base": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-base/SKILL.md",
+    "keywords": [
+      "lark base",
+      "飞书多维表格",
+      "多维表格",
+      "bitable"
+    ],
+    "description": "Operate Feishu Base / Bitable with schema, records, and workflow support."
+  },
+  "lark-sheets": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-sheets/SKILL.md",
+    "keywords": [
+      "lark sheets",
+      "飞书电子表格",
+      "电子表格",
+      "sheet 单元格",
+      "sheets 单元格"
+    ],
+    "description": "Read and write Feishu spreadsheets and cell data."
+  },
+  "lark-mail": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-mail/SKILL.md",
+    "keywords": [
+      "lark mail",
+      "飞书邮箱",
+      "收件箱",
+      "邮件草稿",
+      "回复邮件"
+    ],
+    "description": "Draft, search, read, and send mail through Feishu Mail."
+  },
+  "lark-minutes": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-minutes/SKILL.md",
+    "keywords": [
+      "minutes",
+      "妙记",
+      "妙记列表",
+      "妙记详情"
+    ],
+    "description": "Search Feishu minutes, inspect minute metadata, and download associated audio/video files."
+  },
+  "lark-vc": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-vc/SKILL.md",
+    "keywords": [
+      "video meeting",
+      "会议记录",
+      "会议纪要",
+      "逐字稿",
+      "视频会议"
+    ],
+    "description": "Search completed video meeting records and fetch meeting-note, summary, todo, chapter, and transcript outputs."
+  },
+  "lark-okr": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-okr/SKILL.md",
+    "keywords": [
+      "okr",
+      "目标与关键结果",
+      "关键结果"
+    ],
+    "description": "View and manage Feishu OKR cycles, objectives, key results, and alignments."
+  },
+  "lark-slides": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-slides/SKILL.md",
+    "keywords": [
+      "lark slides",
+      "飞书幻灯片",
+      "演示文稿",
+      "ppt",
+      "slides"
+    ],
+    "description": "Create, read, and manage Feishu slides and presentation content."
+  },
+  "lark-whiteboard": {
+    "path": "/home/admin/.nanobot/.agents/skills/lark-whiteboard/SKILL.md",
+    "keywords": [
+      "lark whiteboard",
+      "飞书画板",
+      "画板",
+      "mermaid",
+      "plantuml"
+    ],
+    "description": "Read and edit Feishu whiteboards, including Mermaid and PlantUML flows."
+  },
+  "lark-wiki": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-wiki/SKILL.md",
+    "keywords": [
+      "lark wiki",
+      "飞书知识库",
+      "知识空间",
+      "wiki 节点"
+    ],
+    "description": "Manage Feishu knowledge spaces, members, and wiki nodes."
+  },
+  "github": {
+    "path": "/home/admin/nanobot-fork-live/nanobot/skills/github/SKILL.md",
+    "keywords": [
+      "github"
+    ],
+    "description": "Interact with GitHub using the gh CLI for issues, pull requests, workflow runs, and API queries."
+  },
+  "weather": {
+    "path": "/home/admin/nanobot-fork-live/nanobot/skills/weather/SKILL.md",
+    "keywords": [
+      "weather"
+    ],
+    "description": "Get current weather and forecasts with lightweight no-key weather services."
+  },
+  "cron": {
+    "path": "/home/admin/nanobot-fork-live/nanobot/skills/cron/SKILL.md",
+    "keywords": [
+      "cron"
+    ],
+    "description": "Schedule reminders and recurring tasks with interval, one-shot, or cron-style timing."
+  },
+  "memory": {
+    "path": "/home/admin/nanobot-fork-live/nanobot/skills/memory/SKILL.md",
+    "keywords": [
+      "memory"
+    ],
+    "description": "Explain the two-layer memory surfaces and how to search past remembered events safely."
+  },
+  "tmux": {
+    "path": "/home/admin/nanobot-fork-live/nanobot/skills/tmux/SKILL.md",
+    "keywords": [
+      "tmux"
+    ],
+    "description": "Remote-control tmux sessions when an interactive TTY or pane scraping workflow is needed."
+  },
+  "clawhub": {
+    "path": "/home/admin/nanobot-fork-live/nanobot/skills/clawhub/SKILL.md",
+    "keywords": [
+      "clawhub"
+    ],
+    "description": "Search and install public agent skills from the ClawHub registry."
+  },
+  "lark-event": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-event/SKILL.md",
+    "keywords": [
+      "监听飞书事件",
+      "订阅飞书事件",
+      "event subscribe",
+      "消息事件监听",
+      "websocket 事件"
+    ],
+    "description": "Subscribe to Feishu events and consume WebSocket event streams with agent-friendly routing."
+  },
+  "lark-openapi-explorer": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-openapi-explorer/SKILL.md",
+    "keywords": [
+      "openapi explorer",
+      "lark openapi explorer",
+      "飞书 openapi explorer",
+      "原生飞书 openapi"
+    ],
+    "description": "Explore official Lark OpenAPI surfaces when existing lark-cli skills do not cover a capability."
+  },
+  "lark-skill-maker": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-skill-maker/SKILL.md",
+    "keywords": [
+      "skill maker",
+      "lark skill maker",
+      "飞书 skill maker",
+      "创建 lark skill"
+    ],
+    "description": "Guide creation and maintenance of custom Lark skills and adapter skill surfaces."
+  },
+  "lark-workflow-meeting-summary": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-workflow-meeting-summary/SKILL.md",
+    "keywords": [
+      "整理会议纪要",
+      "汇总会议纪要",
+      "会议周报",
+      "最近会议总结",
+      "meeting summary report"
+    ],
+    "description": "Aggregate meeting notes across a time range and generate a structured summary report."
+  },
+  "lark-workflow-standup-report": {
+    "path": "/home/admin/.nanobot/workspace/skills/lark-workflow-standup-report/SKILL.md",
+    "keywords": [
+      "今天有什么安排",
+      "明天有什么安排",
+      "这周还有哪些安排",
+      "开工摘要",
+      "standup report",
+      "日程待办摘要"
+    ],
+    "description": "Combine calendar agenda and task context into standup-style schedule and todo summaries."
+  }
+}

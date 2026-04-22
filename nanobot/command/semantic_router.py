@@ -2,7 +2,8 @@
 
 This is intentionally advisory-only: it never auto-executes workflows or
 rewrites the user's message. It only suggests relevant skills/context when the
-match is high-confidence enough.
+match is high-confidence enough, and it is fully driven by the curated
+``skills/skill-map.json`` registry.
 """
 
 from __future__ import annotations
@@ -11,20 +12,6 @@ import json
 import re
 from pathlib import Path
 from typing import Any
-
-SPECIAL_ALIAS_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "session-workflows": ("notes", "note", "summary", "insight", "笔记", "小结", "感悟"),
-    "self-improving-lite": (
-        "diagnose",
-        "diagnosis",
-        "debug",
-        "root cause",
-        "问题原因",
-        "原因分析",
-        "诊断",
-        "排查",
-    ),
-}
 
 ASCII_STOPWORDS = {"skill", "skills", "tool", "tools"}
 
@@ -111,19 +98,13 @@ class SemanticSkillRouter:
                 matched_terms.append(variant)
                 break
 
-        for alias in SPECIAL_ALIAS_KEYWORDS.get(name, ()):
-            normalized = _normalize_keyword(alias)
-            if normalized and _text_match(text, normalized):
-                score += 2
-                matched_terms.append(alias)
-
         keywords = payload.get("keywords") if isinstance(payload.get("keywords"), list) else []
         for raw_keyword in keywords:
             keyword = _normalize_keyword(raw_keyword)
             if not keyword or keyword in ASCII_STOPWORDS:
                 continue
             if _text_match(text, keyword):
-                score += 2 if _contains_cjk(keyword) else 1
+                score += 2
                 matched_terms.append(str(raw_keyword))
 
         unique_terms: list[str] = []
@@ -165,7 +146,12 @@ class SemanticSkillRouter:
             return None
 
         matches.sort(
-            key=lambda item: (-int(item.get("score") or 0), -len(item.get("matched_terms") or []), str(item.get("skill") or "")),
+            key=lambda item: (
+                -int(item.get("score") or 0),
+                -len(item.get("matched_terms") or []),
+                -max((len(str(term)) for term in (item.get("matched_terms") or [])), default=0),
+                str(item.get("skill") or ""),
+            ),
         )
         top = matches[:limit]
         return {
@@ -174,4 +160,3 @@ class SemanticSkillRouter:
             "advisory_only": True,
             "matches": [{k: v for k, v in item.items() if k != "score"} for item in top],
         }
-
