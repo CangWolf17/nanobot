@@ -19,6 +19,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.feishu_render import (
+    STREAM_ELEMENT_ID as SHARED_STREAM_ELEMENT_ID,
     build_card_elements as shared_build_card_elements,
     build_streaming_placeholder_card_json,
     detect_msg_format as shared_detect_msg_format,
@@ -269,7 +270,7 @@ class FeishuConfig(Base):
     streaming_completion_notice_mention_fallback_name: str = ""
 
 
-_STREAM_ELEMENT_ID = "streaming_md"
+_STREAM_ELEMENT_ID = SHARED_STREAM_ELEMENT_ID
 
 
 @dataclass

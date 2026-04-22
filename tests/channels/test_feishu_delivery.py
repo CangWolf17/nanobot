@@ -1,7 +1,10 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from nanobot.channels import feishu as feishu_channel
 from nanobot.channels.feishu_delivery import (
+    STREAM_ELEMENT_ID,
     build_interactive_card_payload,
     close_bridge_stream_card,
     create_bridge_stream_card,
@@ -9,6 +12,7 @@ from nanobot.channels.feishu_delivery import (
     send_text_message,
     update_bridge_stream_card,
 )
+from nanobot.channels.feishu_render import build_streaming_placeholder_card_json
 
 
 def _mock_success_response(**data):
@@ -76,3 +80,11 @@ def test_update_and_close_bridge_stream_card_use_runtime_client() -> None:
     with patch("nanobot.channels.feishu_delivery._get_client", return_value=client):
         assert update_bridge_stream_card("card_1", "hello", 1)["ok"] is True
         assert close_bridge_stream_card("card_1", 2)["ok"] is True
+
+
+def test_streaming_placeholder_and_runtime_updates_share_element_id() -> None:
+    placeholder = json.loads(build_streaming_placeholder_card_json("正在生成…"))
+    element = placeholder["body"]["elements"][0]
+
+    assert element["element_id"] == STREAM_ELEMENT_ID
+    assert feishu_channel._STREAM_ELEMENT_ID == STREAM_ELEMENT_ID

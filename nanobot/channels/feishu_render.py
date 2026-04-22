@@ -36,6 +36,7 @@ _OLIST_RE = re.compile(r"^[\s]*\d+\.\s+", re.MULTILINE)
 
 _TEXT_MAX_LEN = 200
 _POST_MAX_LEN = 2000
+STREAM_ELEMENT_ID = "stream_content"
 
 
 def strip_md_formatting(text: str) -> str:
@@ -254,6 +255,6 @@ def build_streaming_placeholder_card_json(placeholder_text: str) -> str:
     card_json = {
         "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True, "streaming_mode": True},
-        "body": {"elements": [{"tag": "markdown", "content": placeholder_text, "element_id": "stream_content"}]},
+        "body": {"elements": [{"tag": "markdown", "content": placeholder_text, "element_id": STREAM_ELEMENT_ID}]},
     }
     return json.dumps(card_json, ensure_ascii=False)

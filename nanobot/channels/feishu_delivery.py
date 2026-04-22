@@ -9,13 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.channels.feishu_render import (
+    STREAM_ELEMENT_ID,
     build_interactive_card_payload,
     build_streaming_placeholder_card_json,
 )
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 CONFIG_PATH = Path.home() / ".nanobot" / "config.json"
-STREAM_ELEMENT_ID = "stream_content"
 STREAM_LAG_THRESHOLD_SECONDS = 0.60
 
 
