@@ -39,6 +39,12 @@ _POST_MAX_LEN = 2000
 STREAM_ELEMENT_ID = "stream_content"
 
 
+def normalize_visible_newlines(text: str) -> str:
+    """Treat escaped newline sequences as visible line breaks for user-facing content."""
+    normalized = str(text or "")
+    return normalized.replace("\\r\\n", "\n").replace("\\n", "\n")
+
+
 def strip_md_formatting(text: str) -> str:
     """Strip markdown markers for plain-display Feishu cells."""
     text = _MD_BOLD_RE.sub(r"\1", text)
@@ -199,7 +205,7 @@ def build_interactive_card_content(
     mention_all: bool = False,
 ) -> str:
     """Build interactive-card JSON content from shared rendering helpers."""
-    stripped = (content or "").strip()
+    stripped = normalize_visible_newlines(content).strip()
     mention_prefix = ""
     if mention_all:
         mention_prefix = "<at id=all></at> "
@@ -252,9 +258,10 @@ def build_interactive_card_payload(
 
 def build_streaming_placeholder_card_json(placeholder_text: str) -> str:
     """Build the initial CardKit streaming placeholder payload."""
+    normalized_placeholder = normalize_visible_newlines(placeholder_text)
     card_json = {
         "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True, "streaming_mode": True},
-        "body": {"elements": [{"tag": "markdown", "content": placeholder_text, "element_id": STREAM_ELEMENT_ID}]},
+        "body": {"elements": [{"tag": "markdown", "content": normalized_placeholder, "element_id": STREAM_ELEMENT_ID}]},
     }
     return json.dumps(card_json, ensure_ascii=False)

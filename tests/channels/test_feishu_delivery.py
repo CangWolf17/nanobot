@@ -52,6 +52,17 @@ def test_send_text_message_delegates_to_runtime_delivery() -> None:
     assert result == {"ok": True, "message_id": "om_text"}
 
 
+def test_send_text_message_normalizes_escaped_newlines() -> None:
+    client = MagicMock()
+    client.im.v1.message.create.return_value = _mock_success_response(message_id="om_text")
+    with patch("nanobot.channels.feishu_delivery._get_client", return_value=client):
+        result = send_text_message("oc_test", "hello\\nworld", receive_id_type="chat_id")
+
+    assert result == {"ok": True, "message_id": "om_text"}
+    request = client.im.v1.message.create.call_args[0][0]
+    assert json.loads(request.request_body.content)["text"] == "hello\nworld"
+
+
 def test_create_bridge_stream_card_returns_handle() -> None:
     client = MagicMock()
     client.cardkit.v1.card.create.return_value = _mock_success_response(card_id="card_1")
@@ -82,9 +93,32 @@ def test_update_and_close_bridge_stream_card_use_runtime_client() -> None:
         assert close_bridge_stream_card("card_1", 2)["ok"] is True
 
 
+def test_update_bridge_stream_card_normalizes_escaped_newlines() -> None:
+    client = MagicMock()
+    client.cardkit.v1.card_element.content.return_value = _mock_success_response()
+    with patch("nanobot.channels.feishu_delivery._get_client", return_value=client):
+        result = update_bridge_stream_card("card_1", "hello\\nworld", 1)
+
+    assert result["ok"] is True
+    request = client.cardkit.v1.card_element.content.call_args[0][0]
+    assert request.request_body.content == "hello\nworld"
+
+
 def test_streaming_placeholder_and_runtime_updates_share_element_id() -> None:
     placeholder = json.loads(build_streaming_placeholder_card_json("正在生成…"))
     element = placeholder["body"]["elements"][0]
 
     assert element["element_id"] == STREAM_ELEMENT_ID
     assert feishu_channel._STREAM_ELEMENT_ID == STREAM_ELEMENT_ID
+
+
+def test_interactive_payload_normalizes_escaped_newlines() -> None:
+    payload = build_interactive_card_payload("第一行\\n第二行", title="标题")
+    content = json.loads(payload["content"])
+    assert content["elements"][0]["content"] == "第一行\n第二行"
+
+
+def test_streaming_placeholder_normalizes_escaped_newlines() -> None:
+    placeholder = json.loads(build_streaming_placeholder_card_json("正在生成\\n请稍候"))
+    element = placeholder["body"]["elements"][0]
+    assert element["content"] == "正在生成\n请稍候"

@@ -13,6 +13,7 @@ from nanobot.channels.feishu_render import (
     STREAM_ELEMENT_ID,
     build_interactive_card_payload,
     build_streaming_placeholder_card_json,
+    normalize_visible_newlines,
 )
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
@@ -120,7 +121,7 @@ def send_interactive_card(
 
 
 def send_text_message(receive_id: str, text: str, *, receive_id_type: str = "open_id") -> dict[str, Any]:
-    content = json.dumps({"text": text}, ensure_ascii=False)
+    content = json.dumps({"text": normalize_visible_newlines(text)}, ensure_ascii=False)
     return _send_message_sync(receive_id_type, receive_id, "text", content)
 
 
@@ -201,7 +202,12 @@ def _update_bridge_stream_card_with_client(
             ContentCardElementRequest.builder()
             .card_id(card_id)
             .element_id(STREAM_ELEMENT_ID)
-            .request_body(ContentCardElementRequestBody.builder().content(content).sequence(sequence).build())
+            .request_body(
+                ContentCardElementRequestBody.builder()
+                .content(normalize_visible_newlines(content))
+                .sequence(sequence)
+                .build()
+            )
             .build()
         )
         response = client.cardkit.v1.card_element.content(request)
