@@ -93,6 +93,7 @@ def test_idle_tq_immediate_dispatch():
     result = asyncio.run(cmd_tq(ctx))
 
     assert result.content == "Queued for immediate turn."
+    assert result.metadata == {"render_as": "interactive"}
     loop._dispatch.assert_awaited_once()
     call_msg = loop._dispatch.call_args[0][0]
     assert call_msg.content == "hello world"
@@ -108,6 +109,7 @@ def test_idle_tq_no_args_returns_usage():
 
     assert "Usage:" in result.content
     assert "/turnqueue is an alias" in result.content
+    assert result.metadata == {"render_as": "text"}
     loop._dispatch.assert_not_called()
 
 
@@ -119,6 +121,7 @@ def test_idle_turnqueue_alias():
     result = asyncio.run(cmd_tq(ctx))
 
     assert result.content == "Queued for immediate turn."
+    assert result.metadata == {"render_as": "interactive"}
     loop._dispatch.assert_awaited_once()
     call_msg = loop._dispatch.call_args[0][0]
     assert call_msg.content == "hello from alias"
@@ -139,6 +142,7 @@ def test_active_tq_reserves_slot():
     result = asyncio.run(cmd_tq(ctx))
 
     assert result.content == "Queued for the next turn."
+    assert result.metadata == {"render_as": "interactive"}
     coordinator.reserve_turn_slot.assert_called_once()
     call_kwargs = coordinator.reserve_turn_slot.call_args[1]
     assert call_kwargs["content"] == "queued message"
@@ -157,6 +161,7 @@ def test_active_tq_slot_already_occupied():
     result = asyncio.run(cmd_tq(ctx))
 
     assert "already queued" in result.content.lower()
+    assert result.metadata == {"render_as": "interactive"}
 
 
 def test_active_turnqueue_alias_reserves_slot():
@@ -170,6 +175,7 @@ def test_active_turnqueue_alias_reserves_slot():
     result = asyncio.run(cmd_tq(ctx))
 
     assert result.content == "Queued for the next turn."
+    assert result.metadata == {"render_as": "interactive"}
     coordinator.reserve_turn_slot.assert_called_once()
 
 
@@ -183,6 +189,7 @@ def test_active_tq_with_no_args_returns_usage():
     result = asyncio.run(cmd_tq(ctx))
 
     assert "Usage:" in result.content
+    assert result.metadata == {"render_as": "text"}
     coordinator.reserve_turn_slot.assert_not_called()
 
 
@@ -234,6 +241,7 @@ def test_idle_tq_tracks_and_prunes_dispatch_task():
         result = await cmd_tq(ctx)
 
         assert result.content == "Queued for immediate turn."
+        assert result.metadata == {"render_as": "interactive"}
         await asyncio.wait_for(started.wait(), timeout=1)
         assert any(not task.done() for task in loop._active_tasks["cli:direct"])
         release.set()

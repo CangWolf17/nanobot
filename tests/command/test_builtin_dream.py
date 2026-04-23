@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
+from nanobot.bus.queue import MessageBus
 from nanobot.bus.events import InboundMessage
-from nanobot.command.builtin import cmd_dream_log, cmd_dream_restore
+from nanobot.command.builtin import cmd_dream, cmd_dream_log, cmd_dream_restore
 from nanobot.command.router import CommandContext
 from nanobot.utils.gitstore import CommitInfo
 
@@ -51,6 +53,27 @@ def _make_ctx(raw: str, git: _FakeGit, *, args: str = "", last_dream_cursor: int
     store = _FakeStore(git, last_dream_cursor=last_dream_cursor)
     loop = SimpleNamespace(consolidator=SimpleNamespace(store=store))
     return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop)
+
+
+@pytest.mark.asyncio
+async def test_dream_prefers_interactive_cards_for_ack_and_async_result() -> None:
+    msg = InboundMessage(channel="cli", sender_id="u1", chat_id="direct", content="/dream")
+    bus = MessageBus()
+
+    async def _run() -> bool:
+        return True
+
+    loop = SimpleNamespace(dream=SimpleNamespace(run=_run), bus=bus)
+    ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream", loop=loop)
+
+    out = await cmd_dream(ctx)
+
+    assert out.content == "Dreaming..."
+    assert out.metadata == {"render_as": "interactive"}
+
+    published = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    assert "Dream completed in" in published.content
+    assert published.metadata == {"render_as": "interactive"}
 
 
 @pytest.mark.asyncio

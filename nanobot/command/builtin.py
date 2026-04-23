@@ -31,7 +31,7 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     content = f"Stopped {total} task(s)." if total else "No active task to stop."
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content=content,
-        metadata=dict(msg.metadata or {})
+        metadata={**dict(msg.metadata or {}), "render_as": "interactive"}
     )
 
 
@@ -47,7 +47,7 @@ async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
     asyncio.create_task(_do_restart())
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content="Restarting...",
-        metadata=dict(msg.metadata or {})
+        metadata={**dict(msg.metadata or {}), "render_as": "interactive"}
     )
 
 
@@ -116,7 +116,7 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id,
         content="New session started.",
-        metadata=dict(msg.metadata or {})
+        metadata={**dict(msg.metadata or {}), "render_as": "interactive"}
     )
 
 
@@ -141,11 +141,13 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
             content = f"Dream failed after {elapsed:.1f}s: {e}"
         await loop.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
+            metadata={**dict(msg.metadata or {}), "render_as": "interactive"},
         ))
 
     asyncio.create_task(_run_dream())
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content="Dreaming...",
+        metadata={**dict(msg.metadata or {}), "render_as": "interactive"},
     )
 
 

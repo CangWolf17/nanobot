@@ -219,7 +219,7 @@ async def cmd_interrupt(ctx: CommandContext) -> OutboundMessage:
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=content,
-            metadata={**dict(msg.metadata or {})},
+            metadata={**dict(msg.metadata or {}), "render_as": "interactive"},
         )
 
     # Queue has work — assemble and auto-dispatch in spec order:
@@ -276,7 +276,7 @@ async def cmd_interrupt(ctx: CommandContext) -> OutboundMessage:
         channel=msg.channel,
         chat_id=msg.chat_id,
         content=content,
-        metadata={**dict(msg.metadata or {})},
+        metadata={**dict(msg.metadata or {}), "render_as": "interactive"},
     )
 
 
@@ -332,7 +332,7 @@ async def cmd_tq(ctx: CommandContext) -> OutboundMessage:
             channel=msg.channel,
             chat_id=msg.chat_id,
             content="Queued for immediate turn.",
-            metadata={**dict(msg.metadata or {})},
+            metadata={**dict(msg.metadata or {}), "render_as": "interactive"},
         )
 
     # Active: reserve turn slot
@@ -350,14 +350,14 @@ async def cmd_tq(ctx: CommandContext) -> OutboundMessage:
             channel=msg.channel,
             chat_id=msg.chat_id,
             content="Queued for the next turn.",
-            metadata={**dict(msg.metadata or {})},
+            metadata={**dict(msg.metadata or {}), "render_as": "interactive"},
         )
     else:
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content="A turn is already queued. Wait for it to complete.",
-            metadata={**dict(msg.metadata or {})},
+            metadata={**dict(msg.metadata or {}), "render_as": "interactive"},
         )
 
 

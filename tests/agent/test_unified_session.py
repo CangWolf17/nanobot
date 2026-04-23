@@ -253,6 +253,7 @@ class TestCmdNewUnifiedSession:
         result = await cmd_new(ctx)
 
         assert "New session started" in result.content
+        assert result.metadata == {"render_as": "interactive"}
         # Invalidate cache and reload from disk to confirm persistence
         sessions.invalidate("unified:default")
         reloaded = sessions.get_or_create("unified:default")
@@ -471,6 +472,7 @@ class TestStopCommandWithUnifiedSession:
         # Verify task was cancelled
         assert task.cancelled() or task.done()
         assert "Stopped 1 task" in result.content
+        assert result.metadata == {"render_as": "interactive"}
 
     @pytest.mark.asyncio
     async def test_stop_command_cross_channel_in_unified_mode(self, tmp_path: Path):
@@ -503,3 +505,4 @@ class TestStopCommandWithUnifiedSession:
 
         # Both tasks should be cancelled
         assert "Stopped 2 task" in result.content
+        assert result.metadata == {"render_as": "interactive"}

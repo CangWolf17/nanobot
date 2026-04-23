@@ -49,6 +49,7 @@ class TestHandleStop:
         )
         out = await cmd_interrupt(ctx)
         assert "No active task" in out.content
+        assert out.metadata == {"render_as": "interactive"}
 
     @pytest.mark.asyncio
     async def test_interrupt_cancels_active_task(self):
@@ -283,6 +284,7 @@ class TestHandleStop:
 
         assert cancelled.is_set()
         assert "queued next message" in out.content.lower()
+        assert out.metadata == {"render_as": "interactive"}
         await asyncio.wait_for(dispatch_started.wait(), timeout=1)
         dispatched = captured["msg"]
         assert dispatched.content == "late normal\n---\nreserved turn"
@@ -484,6 +486,7 @@ class TestHandleStop:
 
         assert "interrupt_state" not in session.metadata
         assert "new session started" in out.content.lower()
+        assert out.metadata == {"render_as": "interactive"}
         snapshot = service.store.load()
         record = next(iter(snapshot.records.values()))
         assert record.status == "interrupted"
@@ -520,6 +523,7 @@ class TestHandleStop:
         ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/stop", loop=loop)
         out = await cmd_stop(ctx)
         assert "No active task" in out.content
+        assert out.metadata == {"render_as": "interactive"}
 
     @pytest.mark.asyncio
     async def test_stop_cancels_active_task(self):
@@ -547,6 +551,7 @@ class TestHandleStop:
 
         assert cancelled.is_set()
         assert "stopped" in out.content.lower()
+        assert out.metadata == {"render_as": "interactive"}
 
     @pytest.mark.asyncio
     async def test_stop_cancels_multiple_tasks(self):

@@ -77,6 +77,7 @@ class TestRestartCommand:
              patch("nanobot.command.builtin.os.execv") as mock_execv:
             out = await cmd_restart(ctx)
             assert "Restarting" in out.content
+            assert out.metadata == {"render_as": "interactive"}
             assert os.environ.get(RESTART_NOTIFY_CHANNEL_ENV) == "cli"
             assert os.environ.get(RESTART_NOTIFY_CHAT_ID_ENV) == "direct"
             assert os.environ.get(RESTART_STARTED_AT_ENV)
