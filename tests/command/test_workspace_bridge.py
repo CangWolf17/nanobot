@@ -286,6 +286,41 @@ def test_workspace_bridge_marks_plan_exec_as_build_mode(tmp_path: Path) -> None:
     assert ctx.msg.metadata["workspace_work_mode"] == "build"
 
 
+def test_workspace_bridge_prepares_nohook_agent_input(tmp_path: Path) -> None:
+    completed = MagicMock(stdout="[AGENT]nohook\n", stderr="", returncode=0)
+    prepared = MagicMock(stdout="请直接处理这句话\n", stderr="", returncode=0)
+    ctx = CommandContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="ou_test",
+            content="/nohook 请直接处理这句话",
+            metadata={},
+        ),
+        session=None,
+        key="feishu:ou_test",
+        raw="/nohook 请直接处理这句话",
+        args="请直接处理这句话",
+        loop=None,
+    )
+
+    with (
+        patch("nanobot.command.workspace_bridge.WORKSPACE_ROUTER", tmp_path / "router.py"),
+        patch("nanobot.command.workspace_bridge.try_workspace_fastlane", return_value=None),
+        patch(
+            "nanobot.command.workspace_bridge.subprocess.run",
+            side_effect=[completed, prepared],
+        ) as mock_run,
+    ):
+        (tmp_path / "router.py").write_text("#!/bin/sh\n", encoding="utf-8")
+        result = asyncio.run(cmd_workspace_bridge(ctx))
+
+    assert result is None
+    assert ctx.msg.metadata["workspace_agent_cmd"] == "nohook"
+    assert ctx.msg.metadata["workspace_agent_input"] == "请直接处理这句话"
+    assert mock_run.call_args_list[1].args[0][-2:] == ["--prepare-agent-input", "nohook"]
+
+
 def test_workspace_bridge_prepares_summary_agent_input(tmp_path: Path) -> None:
     completed = MagicMock(stdout="[AGENT]小结\n", stderr="", returncode=0)
     prepared = MagicMock(stdout="prepared summary input\n", stderr="", returncode=0)
