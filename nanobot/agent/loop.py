@@ -2120,6 +2120,8 @@ class AgentLoop:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
+            if msg.channel == "feishu":
+                meta.setdefault("render_as", "interactive")
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel=msg.channel,

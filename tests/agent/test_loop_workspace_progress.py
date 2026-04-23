@@ -1,9 +1,8 @@
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import asyncio
 import pytest
-import subprocess
 
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -119,6 +118,46 @@ def test_workspace_agent_notes_emits_progress_before_agent_run(tmp_path: Path) -
         assert progress.metadata["_progress"] is True
         assert result is not None
         assert result.content == "done"
+
+    asyncio.run(run())
+
+
+def test_feishu_retry_progress_prefers_interactive_cards(tmp_path: Path) -> None:
+    async def run() -> None:
+        loop, bus = _make_loop(tmp_path)
+
+        async def chat_with_retry(*, on_retry=None, **_kwargs):
+            if on_retry:
+                await on_retry(
+                    attempt=1,
+                    max_retries=5,
+                    delay=1,
+                    error="Error calling LLM: Request timed out.",
+                )
+            return LLMResponse(
+                content="Error calling LLM: Request timed out.",
+                tool_calls=[],
+                finish_reason="error",
+            )
+
+        loop.provider.chat_with_retry = chat_with_retry
+        msg = InboundMessage(
+            channel="feishu",
+            sender_id="user1",
+            chat_id="chat1",
+            content="你好",
+            metadata={},
+        )
+
+        result = await loop._process_message(msg)
+        progress = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+        assert progress.content == "模型响应超时，正在自动重试（1/5）…"
+        assert progress.metadata["_progress"] is True
+        assert progress.metadata["_tool_hint"] is False
+        assert progress.metadata["render_as"] == "interactive"
+        assert result is not None
+        assert result.content == "模型响应超时，已自动重试 1 次仍失败。请稍后重试，或切换模型。"
 
     asyncio.run(run())
 
