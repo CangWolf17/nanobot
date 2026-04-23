@@ -6,6 +6,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
+from loguru import logger
+
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import EMPTY_MODEL_RESPONSE_ERROR, LLMProvider, ToolCallRequest
@@ -148,7 +150,7 @@ class AgentRunner:
             context.usage = usage
             context.tool_calls = list(response.tool_calls)
 
-            if response.has_tool_calls:
+            if response.should_execute_tools:
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
 
@@ -188,6 +190,13 @@ class AgentRunner:
                     )
                 await hook.after_iteration(context)
                 continue
+
+            elif response.has_tool_calls:
+                logger.warning(
+                    "Ignoring tool calls under finish_reason='{}' for {}",
+                    response.finish_reason,
+                    spec.session_key or "default",
+                )
 
             if hook.wants_streaming():
                 await hook.on_stream_end(context, resuming=False)

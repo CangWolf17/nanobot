@@ -12,6 +12,16 @@ from nanobot.cron.types import CronJobState, CronSchedule
 class CronTool(Tool):
     """Tool to schedule reminders and recurring tasks."""
 
+    _PROTECTED_SYSTEM_JOB_NOTICES: dict[str, dict[str, str]] = {
+        "dream": {
+            "list": "Dream memory consolidation for long-term memory. This protected system job cannot be removed.",
+            "remove": (
+                "Cannot remove job `dream`. "
+                "Dream memory consolidation job for long-term memory is a protected system job and cannot be removed."
+            ),
+        }
+    }
+
     def __init__(self, cron_service: CronService, default_timezone: str = "UTC"):
         self._cron = cron_service
         self._default_timezone = default_timezone
@@ -78,7 +88,10 @@ class CronTool(Tool):
                 },
                 "message": {
                     "type": "string",
-                    "description": "Reminder message. REQUIRED when action='add'.",
+                    "description": (
+                        "Reminder message. REQUIRED when action='add'. "
+                        "Use a non-empty instruction for the scheduled run."
+                    ),
                 },
                 "every_seconds": {
                     "type": "integer",
@@ -106,6 +119,11 @@ class CronTool(Tool):
                     "type": "string",
                     "description": "Job ID to remove. REQUIRED when action='remove'.",
                 },
+                "deliver": {
+                    "type": "boolean",
+                    "description": "Whether to deliver the execution result back to the user channel. Defaults to true.",
+                    "default": True,
+                },
             },
             "required": ["action"],
         }
@@ -119,12 +137,13 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
+        deliver: bool = True,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(message, every_seconds, cron_expr, tz, at)
+            return self._add_job(self._sender_id, message, every_seconds, cron_expr, tz, at, deliver=deliver)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -133,14 +152,19 @@ class CronTool(Tool):
 
     def _add_job(
         self,
+        creator_sender_id: str | None,
         message: str,
         every_seconds: int | None,
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
+        deliver: bool = True,
     ) -> str:
         if not message:
-            return "Error: message is required for add. Retry with action='add' plus a message."
+            return (
+                "Error: action='add' requires a non-empty 'message'. "
+                "Retry including message= with the instruction to run."
+            )
         if not self._channel or not self._chat_id:
             return "Error: no session context (channel/chat_id)"
         if tz and not cron_expr:
@@ -180,13 +204,22 @@ class CronTool(Tool):
             schedule=schedule,
             message=message,
             completion_notice_text=message,
-            creator_sender_id=self._sender_id,
-            deliver=True,
+            creator_sender_id=creator_sender_id or self._sender_id,
+            deliver=deliver,
             channel=self._channel,
             to=self._chat_id,
             delete_after_run=delete_after,
         )
         return f"Created job '{job.name}' (id: {job.id})"
+
+    def validate_params(self, params: dict[str, Any]) -> list[str]:
+        errors = super().validate_params(params)
+        action = params.get("action")
+        if action == "add" and not str(params.get("message", "")).strip():
+            errors.append("message is required when action='add'")
+        if action == "remove" and not str(params.get("job_id", "")).strip():
+            errors.append("job_id is required when action='remove'")
+        return errors
 
     def _format_timing(self, schedule: CronSchedule) -> str:
         """Format schedule as a human-readable timing string."""
@@ -230,6 +263,8 @@ class CronTool(Tool):
         for j in jobs:
             timing = self._format_timing(j.schedule)
             parts = [f"- {j.name} (id: {j.id}, {timing})"]
+            if notice := self._protected_system_job_notice(j.id, j.payload.kind, action="list"):
+                parts.append(f"  {notice}")
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)
@@ -237,6 +272,26 @@ class CronTool(Tool):
     def _remove_job(self, job_id: str | None) -> str:
         if not job_id:
             return "Error: job_id is required for remove"
-        if self._cron.remove_job(job_id):
+        result = self._cron.remove_job(job_id)
+        if result == "removed":
             return f"Removed job {job_id}"
+        if result == "protected":
+            if protected_message := self._protected_system_job_notice(
+                job_id,
+                payload_kind="system_event",
+                action="remove",
+            ):
+                return protected_message
+            return f"Cannot remove job `{job_id}` because it is a protected system job."
         return f"Job {job_id} not found"
+
+    def _protected_system_job_notice(
+        self,
+        job_id: str,
+        payload_kind: str,
+        *,
+        action: str,
+    ) -> str | None:
+        if payload_kind != "system_event":
+            return None
+        return self._PROTECTED_SYSTEM_JOB_NOTICES.get(job_id, {}).get(action)

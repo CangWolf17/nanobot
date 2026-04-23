@@ -10,7 +10,6 @@ from loguru import logger
 
 from nanobot.agent.memory import _is_tool_choice_unsupported
 
-
 _SAVE_COMPACT_STATE_TOOL = [
     {
         "type": "function",
@@ -136,7 +135,7 @@ At the very end of the compact_state, append: `Note: runtime context is auxiliar
                 tool_choice="auto",
             )
 
-        if not response.has_tool_calls:
+        if not response.should_execute_tools:
             logger.warning(
                 "Compact state sync: LLM did not call save_compact_state "
                 "(finish_reason={}, content_len={}, content_preview={})",

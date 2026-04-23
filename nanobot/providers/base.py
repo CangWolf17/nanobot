@@ -69,6 +69,13 @@ class LLMResponse:
         """Check if response contains tool calls."""
         return len(self.tool_calls) > 0
 
+    @property
+    def should_execute_tools(self) -> bool:
+        """Check if tool calls should execute instead of being treated as gateway noise."""
+        if not self.has_tool_calls:
+            return False
+        return self.finish_reason in ("tool_calls", "stop")
+
 
 @dataclass(frozen=True)
 class GenerationSettings:
@@ -292,7 +299,7 @@ class LLMProvider(ABC):
     def _classify_response_error(response: LLMResponse) -> str | None:
         if response.finish_reason == "error":
             return response.content or "Error calling LLM"
-        if response.has_tool_calls:
+        if response.should_execute_tools:
             return None
         if isinstance(response.content, str) and response.content.strip():
             return None

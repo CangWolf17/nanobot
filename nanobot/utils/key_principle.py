@@ -14,6 +14,11 @@ _TERMINAL_KEY_PRINCIPLE_PATTERNS = (
         r"(?P<kp>Key Principle\s*[:：]\s*.+?)\s*$"
     ),
 )
+_NOTICE_KEY_PRINCIPLE_PREFIX_RE = re.compile(
+    r"^\s*(?:\*\*\s*)?(?:key\s*principle|kp)(?:\s*\*\*)?\s*[:：]?\s*",
+    re.IGNORECASE,
+)
+_NOTICE_SURROUNDING_BOLD_RE = re.compile(r"^\*\*(?P<body>.*?)\*\*$", re.DOTALL)
 
 
 def extract_terminal_key_principle(text: str) -> tuple[str, str | None]:
@@ -42,3 +47,18 @@ def trim_terminal_key_principle(text: str, terminal_key_principle: str | None = 
     if stripped.endswith(kp):
         return stripped[: -len(kp)].rstrip()
     return source
+
+
+def normalize_key_principle_notice_text(text: str) -> str:
+    source = str(text or "").strip()
+    if not source:
+        return ""
+
+    unwrapped = source
+    wrapped_match = _NOTICE_SURROUNDING_BOLD_RE.match(source)
+    if wrapped_match:
+        unwrapped = str(wrapped_match.group("body") or "").strip()
+
+    normalized = _NOTICE_KEY_PRINCIPLE_PREFIX_RE.sub("", unwrapped, count=1).strip()
+    normalized = normalized.strip("*").strip()
+    return normalized or source

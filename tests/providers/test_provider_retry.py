@@ -3,7 +3,7 @@ import copy
 
 import pytest
 
-from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse
+from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest
 
 
 class ScriptedProvider(LLMProvider):
@@ -127,6 +127,33 @@ async def test_chat_with_retry_retries_empty_success_then_succeeds(monkeypatch) 
     assert provider.calls == 2
     assert delays == [1]
     assert retries == [(1, 5, 1, "empty model response")]
+
+
+@pytest.mark.asyncio
+async def test_chat_with_retry_retries_anomalous_tool_calls_then_succeeds(monkeypatch) -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                finish_reason="refusal",
+                tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
+            ),
+            LLMResponse(content="ok"),
+        ]
+    )
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.finish_reason == "stop"
+    assert response.content == "ok"
+    assert provider.calls == 2
+    assert delays == [1]
 
 
 @pytest.mark.asyncio

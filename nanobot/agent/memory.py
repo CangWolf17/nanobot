@@ -258,7 +258,7 @@ At the end of both `history_entry` and `memory_update`, include the note: `Runti
                     tool_choice="auto",
                 )
 
-            if not response.has_tool_calls:
+            if not response.should_execute_tools:
                 logger.warning(
                     "Memory consolidation: LLM did not call save_memory "
                     "(finish_reason={}, content_len={}, content_preview={})",

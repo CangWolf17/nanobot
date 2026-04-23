@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import asyncio
+import hashlib
 import os
 import secrets
 import string
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
@@ -32,6 +33,8 @@ _DEFAULT_OPENROUTER_HEADERS = {
     "X-OpenRouter-Title": "nanobot",
     "X-OpenRouter-Categories": "cli-agent,personal-agent",
 }
+_RESPONSES_FAILURE_THRESHOLD = 3
+_RESPONSES_PROBE_INTERVAL_S = 300  # 5 minutes
 
 
 async def _next_with_timeout(stream_iter: Any, timeout_s: float) -> Any:
@@ -116,6 +119,14 @@ def _uses_openrouter_attribution(spec: "ProviderSpec | None", api_base: str | No
     return bool(api_base and "openrouter" in api_base.lower())
 
 
+def _is_direct_openai_base(api_base: str | None) -> bool:
+    """Return True for direct OpenAI endpoints, not generic OpenAI-compatible gateways."""
+    if not api_base:
+        return True
+    normalized = api_base.strip().lower().rstrip("/")
+    return "api.openai.com" in normalized and "openrouter" not in normalized
+
+
 class OpenAICompatProvider(LLMProvider):
     """Unified provider for all OpenAI-compatible APIs.
 
@@ -140,6 +151,7 @@ class OpenAICompatProvider(LLMProvider):
             self._setup_env(api_key, api_base)
 
         effective_base = api_base or (spec.default_api_base if spec else None) or None
+        self._effective_base = effective_base
         default_headers = {"x-session-affinity": uuid.uuid4().hex}
         if _uses_openrouter_attribution(spec, effective_base):
             default_headers.update(_DEFAULT_OPENROUTER_HEADERS)
@@ -153,6 +165,8 @@ class OpenAICompatProvider(LLMProvider):
             timeout=60.0,
             max_retries=0,
         )
+        self._responses_failures: dict[str, int] = {}
+        self._responses_tripped_at: dict[str, float] = {}
 
     def _setup_env(self, api_key: str, api_base: str | None) -> None:
         """Set environment variables based on provider spec."""
@@ -168,8 +182,9 @@ class OpenAICompatProvider(LLMProvider):
             resolved = env_val.replace("{api_key}", api_key).replace("{api_base}", effective_base)
             os.environ.setdefault(env_name, resolved)
 
-    @staticmethod
+    @classmethod
     def _apply_cache_control(
+        cls,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
@@ -197,7 +212,8 @@ class OpenAICompatProvider(LLMProvider):
         new_tools = tools
         if tools:
             new_tools = list(tools)
-            new_tools[-1] = {**new_tools[-1], "cache_control": cache_marker}
+            for idx in cls._tool_cache_marker_indices(new_tools):
+                new_tools[idx] = {**new_tools[idx], "cache_control": cache_marker}
         return new_messages, new_tools
 
     @staticmethod
@@ -310,10 +326,94 @@ class OpenAICompatProvider(LLMProvider):
     ) -> bool:
         if getattr(self._spec, "name", None) != "openai":
             return False
+        if not _is_direct_openai_base(getattr(self, "_effective_base", None)):
+            return False
         model_lower = model_name.lower()
-        return bool(reasoning_effort) or any(
+        normalized_reasoning = str(reasoning_effort or "").strip().lower()
+        wants_responses = bool(normalized_reasoning) or any(
             token in model_lower for token in ("gpt-5", "o1", "o3", "o4")
         )
+        if not wants_responses:
+            return False
+        key = self._responses_circuit_key(model_name, reasoning_effort)
+        failures = self._responses_failures.get(key, 0)
+        if failures < _RESPONSES_FAILURE_THRESHOLD:
+            return True
+        tripped_at = self._responses_tripped_at.get(key, 0.0)
+        return (time.monotonic() - tripped_at) >= _RESPONSES_PROBE_INTERVAL_S
+
+    @staticmethod
+    def _responses_circuit_key(model_name: str | None, reasoning_effort: str | None) -> str:
+        normalized_model = str(model_name or "").strip().lower()
+        normalized_reasoning = str(reasoning_effort or "").strip().lower()
+        return f"{normalized_model}:{normalized_reasoning}"
+
+    def _record_responses_failure(self, model_name: str | None, reasoning_effort: str | None) -> None:
+        key = self._responses_circuit_key(model_name or self.default_model, reasoning_effort)
+        failures = self._responses_failures.get(key, 0) + 1
+        self._responses_failures[key] = failures
+        if failures >= _RESPONSES_FAILURE_THRESHOLD:
+            self._responses_tripped_at[key] = time.monotonic()
+
+    def _record_responses_success(self, model_name: str | None, reasoning_effort: str | None) -> None:
+        key = self._responses_circuit_key(model_name or self.default_model, reasoning_effort)
+        self._responses_failures.pop(key, None)
+        self._responses_tripped_at.pop(key, None)
+
+    @classmethod
+    def _extract_content_and_reasoning(cls, payload: Any) -> tuple[str | None, str | None]:
+        """Extract visible content and hidden reasoning with StepFun-style fallback."""
+        reasoning_fallback = cls._extract_text_content(_get(payload, "reasoning"))
+        content = cls._extract_text_content(_get(payload, "content")) or reasoning_fallback
+        reasoning = cls._extract_text_content(_get(payload, "reasoning_content")) or reasoning_fallback
+        return content, reasoning
+
+    @classmethod
+    def _extract_reasoning_delta(cls, payload: Any) -> str | None:
+        """Extract only reasoning text from streaming delta payloads."""
+        return (
+            cls._extract_text_content(_get(payload, "reasoning_content"))
+            or cls._extract_text_content(_get(payload, "reasoning"))
+        )
+
+    @classmethod
+    def _extract_error_metadata(
+        cls,
+        e: Exception,
+        *,
+        payload: Any,
+        headers: Any,
+        response: Any,
+    ) -> dict[str, Any]:
+        status_code = getattr(e, "status_code", None)
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+
+        should_retry: bool | None = None
+        if headers is not None:
+            raw = headers.get("x-should-retry")
+            if isinstance(raw, str):
+                lowered = raw.strip().lower()
+                if lowered == "true":
+                    should_retry = True
+                elif lowered == "false":
+                    should_retry = False
+
+        error_kind: str | None = None
+        error_name = e.__class__.__name__.lower()
+        if "timeout" in error_name:
+            error_kind = "timeout"
+        elif "connection" in error_name:
+            error_kind = "connection"
+
+        error_type, error_code = LLMProvider._extract_error_type_code(payload)
+        return {
+            "error_status_code": int(status_code) if status_code is not None else None,
+            "error_kind": error_kind,
+            "error_type": error_type,
+            "error_code": error_code,
+            "error_should_retry": should_retry,
+        }
 
     @staticmethod
     def _should_fallback_from_responses(exc: Exception) -> bool:
@@ -545,11 +645,10 @@ class OpenAICompatProvider(LLMProvider):
 
             choice0 = self._maybe_mapping(choices[0]) or {}
             msg0 = self._maybe_mapping(choice0.get("message")) or {}
-            content = self._extract_text_content(msg0.get("content"))
+            content, reasoning_content = self._extract_content_and_reasoning(msg0)
             finish_reason = str(choice0.get("finish_reason") or "stop")
 
             raw_tool_calls: list[Any] = []
-            reasoning_content = msg0.get("reasoning_content")
             for ch in choices:
                 ch_map = self._maybe_mapping(ch) or {}
                 m = self._maybe_mapping(ch_map.get("message")) or {}
@@ -558,10 +657,11 @@ class OpenAICompatProvider(LLMProvider):
                     raw_tool_calls.extend(tool_calls)
                     if ch_map.get("finish_reason") in ("tool_calls", "stop"):
                         finish_reason = str(ch_map["finish_reason"])
+                candidate_content, candidate_reasoning = self._extract_content_and_reasoning(m)
                 if not content:
-                    content = self._extract_text_content(m.get("content"))
+                    content = candidate_content
                 if not reasoning_content:
-                    reasoning_content = m.get("reasoning_content")
+                    reasoning_content = candidate_reasoning
 
             parsed_tool_calls = []
             for tc in raw_tool_calls:
@@ -593,7 +693,7 @@ class OpenAICompatProvider(LLMProvider):
 
         choice = response.choices[0]
         msg = choice.message
-        content = msg.content
+        content, reasoning_content = self._extract_content_and_reasoning(msg)
         finish_reason = choice.finish_reason
 
         raw_tool_calls: list[Any] = []
@@ -603,8 +703,9 @@ class OpenAICompatProvider(LLMProvider):
                 raw_tool_calls.extend(m.tool_calls)
                 if ch.finish_reason in ("tool_calls", "stop"):
                     finish_reason = ch.finish_reason
-            if not content and m.content:
-                content = m.content
+            candidate_content, _ = self._extract_content_and_reasoning(m)
+            if not content:
+                content = candidate_content
 
         tool_calls = []
         for tc in raw_tool_calls:
@@ -626,12 +727,13 @@ class OpenAICompatProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason or "stop",
             usage=self._extract_usage(response),
-            reasoning_content=getattr(msg, "reasoning_content", None) or None,
+            reasoning_content=reasoning_content,
         )
 
     @classmethod
     def _parse_chunks(cls, chunks: list[Any]) -> LLMResponse:
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tc_bufs: dict[int, dict[str, Any]] = {}
         finish_reason = "stop"
         usage: dict[str, int] = {}
@@ -685,6 +787,8 @@ class OpenAICompatProvider(LLMProvider):
                 text = cls._extract_text_content(delta.get("content"))
                 if text:
                     content_parts.append(text)
+                if reasoning := cls._extract_reasoning_delta(delta):
+                    reasoning_parts.append(reasoning)
                 for idx, tc in enumerate(delta.get("tool_calls") or []):
                     _accum_tc(tc, idx)
                 usage = cls._extract_usage(chunk_map) or usage
@@ -699,6 +803,8 @@ class OpenAICompatProvider(LLMProvider):
             delta = choice.delta
             if delta and delta.content:
                 content_parts.append(delta.content)
+            if delta and (reasoning := cls._extract_reasoning_delta(delta)):
+                reasoning_parts.append(reasoning)
             for tc in (delta.tool_calls or []) if delta else []:
                 _accum_tc(tc, getattr(tc, "index", 0))
 
@@ -717,22 +823,42 @@ class OpenAICompatProvider(LLMProvider):
             ],
             finish_reason=finish_reason,
             usage=usage,
+            reasoning_content="".join(reasoning_parts) or None,
         )
 
-    @staticmethod
-    def _handle_error(e: Exception) -> LLMResponse:
+    @classmethod
+    def _handle_error(cls, e: Exception) -> LLMResponse:
         response = getattr(e, "response", None)
         headers = getattr(response, "headers", None)
-        body = getattr(e, "doc", None) or getattr(response, "text", None)
-        msg = f"Error: {body.strip()[:500]}" if body and body.strip() else f"Error calling LLM: {e}"
-        retry_after = LLMProvider._extract_retry_after_from_headers(headers)
+        payload = (
+            getattr(e, "body", None)
+            or getattr(e, "doc", None)
+            or getattr(response, "text", None)
+        )
+        if payload is None and response is not None:
+            response_json = getattr(response, "json", None)
+            if callable(response_json):
+                try:
+                    payload = response_json()
+                except Exception:
+                    payload = None
+        payload_text = payload if isinstance(payload, str) else str(payload) if payload is not None else ""
+        msg = f"Error: {payload_text.strip()[:500]}" if payload_text.strip() else f"Error calling LLM: {e}"
+        retry_after = cls._extract_retry_after_from_headers(headers)
         if retry_after is None:
             retry_after = LLMProvider._extract_retry_after(msg)
+
         return LLMResponse(
             content=msg,
             finish_reason="error",
             retry_after=retry_after,
             error_retry_after_s=retry_after,
+            **cls._extract_error_metadata(
+                e,
+                payload=payload,
+                headers=headers,
+                response=response,
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -750,7 +876,6 @@ class OpenAICompatProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         model_name = model or self.default_model
-        idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
         if self._should_use_responses_api(model_name, reasoning_effort):
             responses_kwargs = self._build_responses_kwargs(
                 messages,
@@ -761,10 +886,13 @@ class OpenAICompatProvider(LLMProvider):
                 tool_choice,
             )
             try:
-                return self._parse_responses_api(
+                response = self._parse_responses_api(
                     await self._client.responses.create(**responses_kwargs)
                 )
+                self._record_responses_success(model_name, reasoning_effort)
+                return response
             except Exception as e:
+                self._record_responses_failure(model_name, reasoning_effort)
                 if not self._should_fallback_from_responses(e):
                     return self._handle_error(e)
         kwargs = self._build_kwargs(
@@ -801,12 +929,15 @@ class OpenAICompatProvider(LLMProvider):
             )
             try:
                 stream = await self._client.responses.create(**responses_kwargs)
-                return await self._parse_responses_stream(
+                response = await self._parse_responses_stream(
                     stream,
                     on_content_delta,
                     idle_timeout_s=idle_timeout_s,
                 )
+                self._record_responses_success(model_name, reasoning_effort)
+                return response
             except asyncio.TimeoutError:
+                self._record_responses_failure(model_name, reasoning_effort)
                 return LLMResponse(
                     content=(
                         f"Error calling LLM: stream stalled for more than "
@@ -816,6 +947,7 @@ class OpenAICompatProvider(LLMProvider):
                     error_kind="timeout",
                 )
             except Exception as e:
+                self._record_responses_failure(model_name, reasoning_effort)
                 if not self._should_fallback_from_responses(e):
                     return self._handle_error(e)
         kwargs = self._build_kwargs(
