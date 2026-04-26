@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import sys
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -558,13 +559,27 @@ def _build_weather_brief_prompt(task_message: str) -> str:
         "1. 只关注重庆南岸区天气。\n"
         "2. 必须使用表格 + 分段标题，结构固定。\n"
         "3. 必须包含 `### 📍 重庆南岸区天气`、`### 📅 今日日程`、`### 📌 提醒` 三段。\n"
-        "4. 今日日程段先不要调用飞书日历；直接写 `📭 **飞书日历暂未接入**`。\n"
-        "5. 不要调用飞书日历、不要搜索 workspace 里的日历脚本、不要解释限制来源。\n"
+        "4. 今日日程必须通过 `lark-cli calendar +agenda` 获取，不要写 `飞书日历暂未接入`。\n"
+        "5. 先执行 `export PATH=\"$HOME/.nvm/versions/node/v24.14.0/bin:$PATH\"`，再执行 `lark-cli calendar +agenda 2>&1`；如果结果里 `data` 为空，就写 `今天日程为空。`。\n"
         "6. 天气数据必须优先使用本地脚本 `/home/admin/.nanobot/workspace/scripts/weather.py`，不要自己写 curl，也不要搜索别的天气工具。\n"
         "7. 先执行 `/home/admin/.nanobot/workspace/venv/bin/python /home/admin/.nanobot/workspace/scripts/weather.py 重庆南岸区 forecast`。如果 `重庆南岸区` 获取失败，立即改用固定坐标 29.5,106.5 对应的南岸区天气结果，不要把失败过程写给用户。\n"
         "8. 必须保留 `###` 标题、Markdown 表格和 `---` 分隔线，不要把表格改写成自然语言段落。\n"
-        "9. 输出末尾不要追加多余总结，只输出固定版早报正文。\n\n"
+        "9. 首行必须以 `🌤️ 早安` 开头；默认写 `🌤️ 早安。`。若要加短句，只能写成 `🌤️ 早安，xxx。`，其中 `xxx` 必须十五字以内。\n"
+        "10. 开头短句只能基于明确可确认的信息，优先周末这类简单信息；不要猜法定节假日、五一、假期第几天之类的文案。\n"
+        "11. 天气表格第一列统一写 `MM-DD`，例如 `04-26`，不要写 `2026-04-26`，也不要写今天/明天/后天。\n"
+        "12. 天气表格第二列必须写成 `emoji + 两字以内中文描述`，例如 `🌧️ 雨`、`☁️ 阴`、`⛅ 多云`、`🌦️ 阵雨`，不要只写 emoji。\n"
+        "13. 如果某一天天气源没有返回温度，就写 `—`；不要自己补全。\n"
+        "14. 不要调用 `message` tool，直接返回最终早报正文给上层发送。\n"
+        "15. 输出末尾不要追加多余总结，只输出固定版早报正文。\n\n"
         f"原始任务：{normalized}"
+    )
+
+
+def _is_weather_brief_job(job_name: str, task_message: str) -> bool:
+    combined = f"{job_name}\n{task_message}".strip()
+    return (
+        ("重庆南岸区" in combined and "天气预报" in combined)
+        or ("早安天气" in combined and "飞书日程" in combined)
     )
 
 
@@ -765,12 +780,13 @@ def _run_gateway(
         }
         if str(job.payload.completion_notice_text or "").strip():
             metadata["_completion_notice_text"] = str(job.payload.completion_notice_text).strip()
-        weather_task = "重庆南岸区" in (job.payload.message or "") and "天气预报" in (job.payload.message or "")
+        weather_task = _is_weather_brief_job(job.name or "", job.payload.message or "")
         if weather_task:
             metadata = {
                 **(metadata or {}),
                 "workspace_agent_cmd": "weather_brief",
                 "workspace_agent_input": _build_weather_brief_prompt(job.payload.message),
+                "disable_message_tool_same_target": True,
             }
 
         cron_tool = agent.tools.get("cron")
@@ -784,7 +800,11 @@ def _run_gateway(
         try:
             resp = await agent.process_direct(
                 job.payload.message if weather_task else reminder_note,
-                session_key=f"cron:{job.id}",
+                session_key=(
+                    f"cron:{job.id}:{int(time.time() * 1000)}"
+                    if weather_task
+                    else f"cron:{job.id}"
+                ),
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
                 on_progress=_silent,
@@ -805,9 +825,15 @@ def _run_gateway(
             response_metadata.get("_completion_notice_mention_user_id")
             or response_metadata.get("_origin_sender_id")
             or job.payload.creator_sender_id
+            or (
+                job.payload.to
+                if (job.payload.channel or "") == "feishu" and str(job.payload.to or "").startswith("ou_")
+                else ""
+            )
             or ""
         ).strip()
         if weather_task and (job.payload.channel or "") == "feishu" and completion_notice_user_id:
+            response_metadata.setdefault("workspace_agent_cmd", "weather_brief")
             response_metadata.setdefault("_mention_user_id", completion_notice_user_id)
 
         message_tool = agent.tools.get("message")

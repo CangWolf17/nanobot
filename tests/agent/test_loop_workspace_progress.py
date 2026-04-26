@@ -194,6 +194,45 @@ def test_workspace_agent_weather_brief_hides_tool_hints_from_user(tmp_path: Path
     asyncio.run(run())
 
 
+def test_weather_brief_postprocess_normalizes_header_and_relative_dates(tmp_path: Path) -> None:
+    loop, _ = _make_loop(tmp_path)
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="user1",
+        chat_id="chat1",
+        content="天气",
+        metadata={"workspace_agent_cmd": "weather_brief"},
+    )
+    final_content = (
+        "🌤️ 早安，五一假期第二天。\n\n"
+        "## 重庆南岸区天气\n"
+        "| 日期 | 天气 | 最高温 | 最低温 |\n"
+        "|---|---|---|---|\n"
+        "| 今天 04-30 | ☁️ | — | — |\n"
+        "| 明天 05-01 | ☀️ | — | — |\n"
+        "| 后天 05-02 | ☀️ | — | — |\n"
+    )
+    all_msgs = [
+        {
+            "role": "tool",
+            "content": (
+                "📍 重庆南岸区, 中国\n"
+                "2026-04-26: 🌧️ 24.3° / 18.9°\n"
+                "2026-04-27: ☁️ 23.1° / 18.4°\n"
+                "2026-04-28: ☀️ 20.3° / 14.9°\n"
+            ),
+        }
+    ]
+
+    result = loop._postprocess_workspace_agent_output(msg, final_content, all_msgs=all_msgs)
+
+    assert result.startswith("🌤️ 早安。")
+    assert "| 04-26 | 🌧️ 雨 | — | — |" in result
+    assert "| 04-27 | ☁️ 阴 | — | — |" in result
+    assert "| 04-28 | ☀️ 晴 | — | — |" in result
+    assert "五一假期第二天" not in result
+
+
 def test_stream_requested_without_deltas_keeps_final_reply_sendable(tmp_path: Path) -> None:
     async def run() -> None:
         loop, bus = _make_loop(tmp_path)

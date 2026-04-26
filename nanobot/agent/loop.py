@@ -2066,7 +2066,7 @@ class AgentLoop:
                 session=session,
             )
             final_content, _, all_msgs = self._coerce_run_loop_result(run_result)
-            final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
+            final_content = self._postprocess_workspace_agent_output(msg, final_content or "", all_msgs=all_msgs)
             self._save_turn(session, all_msgs, (2 if inserted_subagent_followup else 1) + len(history))
             self._clear_pending_user_turn(session)
             self._clear_runtime_checkpoint(session)
@@ -2255,7 +2255,7 @@ class AgentLoop:
         await self._maybe_consume_normal_queue(effective_key)
         self.coordinator.set_dispatch_state(effective_key, DispatchState.IDLE, self._unified_session)
 
-        final_content = self._postprocess_workspace_agent_output(msg, final_content or "")
+        final_content = self._postprocess_workspace_agent_output(msg, final_content or "", all_msgs=all_msgs)
         final_content, key_principle_notice = self._extract_terminal_key_principle(final_content)
 
         if final_content is None:
@@ -2306,11 +2306,124 @@ class AgentLoop:
             metadata=meta,
         )
 
-    def _postprocess_workspace_agent_output(self, msg: InboundMessage, final_content: str) -> str:
+    @staticmethod
+    def _extract_weather_forecast_dates(all_msgs: list[dict[str, Any]] | None) -> list[str]:
+        if not all_msgs:
+            return []
+        for entry in reversed(all_msgs):
+            if not isinstance(entry, dict) or entry.get("role") != "tool":
+                continue
+            content = str(entry.get("content") or "")
+            if "重庆南岸区" not in content:
+                continue
+            dates = re.findall(r"(?m)^(20\d{2}-\d{2}-\d{2}):", content)
+            if dates:
+                return dates[:3]
+        return []
+
+    @staticmethod
+    def _extract_weather_forecast_icons(all_msgs: list[dict[str, Any]] | None) -> list[str]:
+        if not all_msgs:
+            return []
+        for entry in reversed(all_msgs):
+            if not isinstance(entry, dict) or entry.get("role") != "tool":
+                continue
+            content = str(entry.get("content") or "")
+            if "重庆南岸区" not in content:
+                continue
+            icons = re.findall(r"(?m)^20\d{2}-\d{2}-\d{2}:\s*([^\s]+)", content)
+            if icons:
+                return icons[:3]
+        return []
+
+    @staticmethod
+    def _weather_icon_label(icon: str) -> str:
+        mapping = {
+            "☀️": "晴",
+            "🌤️": "晴",
+            "⛅": "多云",
+            "☁️": "阴",
+            "🌥️": "阴",
+            "🌦️": "阵雨",
+            "🌧️": "雨",
+            "⛈️": "雷雨",
+            "🌩️": "雷雨",
+            "🌨️": "雪",
+            "❄️": "雪",
+            "🌫️": "雾",
+            "🌁": "雾",
+        }
+        return mapping.get(icon.strip(), "阴")
+
+    def _normalize_weather_brief_output(
+        self,
+        final_content: str,
+        *,
+        all_msgs: list[dict[str, Any]] | None = None,
+    ) -> str:
+        content = final_content.strip()
+        if not content:
+            return final_content
+
+        first_line_match = re.match(r"^(🌤️\s*早安(?:，[^\n。]{1,15})?[。]?)", content)
+        if first_line_match:
+            first_line = first_line_match.group(1)
+            if "节假日" in first_line or "五一" in first_line or "假期第" in first_line:
+                content = re.sub(r"^🌤️[^\n]*", "🌤️ 早安。", content, count=1, flags=re.MULTILINE)
+        else:
+            content = re.sub(r"^🌤️[^\n]*", "🌤️ 早安。", content, count=1, flags=re.MULTILINE)
+
+        forecast_dates = self._extract_weather_forecast_dates(all_msgs)
+        forecast_icons = self._extract_weather_forecast_icons(all_msgs)
+
+        lines = content.splitlines()
+        normalized_lines: list[str] = []
+        row_index = 0
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("|") and not re.match(r"^\|\s*[-:| ]+\|?$", stripped):
+                cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+                if len(cells) >= 4 and cells[0] != "日期":
+                    raw_date = cells[0]
+                    if re.match(r"^(今天|明天|后天)(?:\s+.*)?$", raw_date) and len(forecast_dates) > row_index:
+                        raw_date = forecast_dates[row_index]
+                    date_match = re.match(r"^(?:今天|明天|后天)?\s*(20\d{2}-(\d{2}-\d{2})|\d{2}-\d{2})$", raw_date)
+                    if date_match:
+                        raw_date = date_match.group(2) or date_match.group(1)
+                    elif len(forecast_dates) > row_index:
+                        raw_date = forecast_dates[row_index][5:]
+                    cells[0] = raw_date
+
+                    weather_cell = cells[1]
+                    icon_match = re.match(r"^([^\s]+)", weather_cell)
+                    icon = icon_match.group(1) if icon_match else ""
+                    if len(forecast_icons) > row_index:
+                        icon = forecast_icons[row_index]
+                    label = self._weather_icon_label(icon) if icon else ""
+                    if icon:
+                        cells[1] = f"{icon} {label}".strip()
+
+                    normalized_lines.append("| " + " | ".join(cells) + " |")
+                    row_index += 1
+                    continue
+            normalized_lines.append(line)
+
+        return "\n".join(normalized_lines)
+
+    def _postprocess_workspace_agent_output(
+        self,
+        msg: InboundMessage,
+        final_content: str,
+        *,
+        all_msgs: list[dict[str, Any]] | None = None,
+    ) -> str:
         """Run workspace router postprocess hook for agent-routed slash commands."""
         cmd = (msg.metadata or {}).get("workspace_agent_cmd")
         if not cmd:
             return final_content
+
+        if cmd == "weather_brief":
+            final_content = self._normalize_weather_brief_output(final_content, all_msgs=all_msgs)
 
         if cmd == "harness":
             result = HarnessService.for_workspace(self.workspace).apply_agent_update(

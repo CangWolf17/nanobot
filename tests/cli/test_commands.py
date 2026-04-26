@@ -1259,6 +1259,7 @@ def test_gateway_cron_weather_task_uses_weather_brief_workspace_route(
         async def process_direct(self, content, *_args, **kwargs):
             seen["content"] = content
             seen["metadata"] = kwargs.get("metadata")
+            seen["session_key"] = kwargs.get("session_key")
             return OutboundMessage(
                 channel="feishu",
                 chat_id="ou_user",
@@ -1298,7 +1299,7 @@ def test_gateway_cron_weather_task_uses_weather_brief_workspace_route(
         id="cron-weather",
         name="weather brief",
         payload=CronPayload(
-            message="请给我重庆南岸区天气预报",
+            message="🌤️ 早安天气 + 飞书日程（用 weather.py + lark-calendar 脚本，不要自己写 curl）",
             deliver=True,
             channel="feishu",
             to="ou_user",
@@ -1308,10 +1309,14 @@ def test_gateway_cron_weather_task_uses_weather_brief_workspace_route(
     response = asyncio.run(cron.on_job(job))
 
     assert response == "天气正文"
-    assert seen["content"] == "请给我重庆南岸区天气预报"
+    assert seen["content"] == "🌤️ 早安天气 + 飞书日程（用 weather.py + lark-calendar 脚本，不要自己写 curl）"
     metadata = seen["metadata"]
     assert metadata["workspace_agent_cmd"] == "weather_brief"
     assert "重庆南岸区天气" in metadata["workspace_agent_input"]
+    assert "lark-cli calendar +agenda" in metadata["workspace_agent_input"]
+    assert "今天日程为空。" in metadata["workspace_agent_input"]
+    assert metadata["disable_message_tool_same_target"] is True
+    assert seen["session_key"].startswith("cron:cron-weather:")
 
 
 def test_gateway_cron_weather_task_mentions_creator_in_feishu_delivery(
@@ -1385,11 +1390,10 @@ def test_gateway_cron_weather_task_mentions_creator_in_feishu_delivery(
         id="cron-weather",
         name="weather brief",
         payload=CronPayload(
-            message="请给我重庆南岸区天气预报",
+            message="🌤️ 早安天气 + 飞书日程（用 weather.py + lark-calendar 脚本，不要自己写 curl）",
             deliver=True,
             channel="feishu",
             to="ou_user",
-            creator_sender_id="ou_creator",
         ),
     )
 
@@ -1402,7 +1406,7 @@ def test_gateway_cron_weather_task_mentions_creator_in_feishu_delivery(
     assert outbound.content == "天气正文"
     assert outbound.metadata == {
         "workspace_agent_cmd": "weather_brief",
-        "_mention_user_id": "ou_creator",
+        "_mention_user_id": "ou_user",
     }
 
 

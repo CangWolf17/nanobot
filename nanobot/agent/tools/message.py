@@ -90,6 +90,13 @@ class MessageTool(Tool):
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
 
+        if (
+            self._default_metadata.get("disable_message_tool_same_target")
+            and channel == self._default_channel
+            and chat_id == self._default_chat_id
+        ):
+            return "Error: Direct delivery is disabled for this workflow; return the final content normally."
+
         if not self._send_callback:
             return "Error: Message sending not configured"
 
