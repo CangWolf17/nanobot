@@ -2307,7 +2307,7 @@ class AgentLoop:
         )
 
     @staticmethod
-    def _extract_weather_forecast_dates(all_msgs: list[dict[str, Any]] | None) -> list[str]:
+    def _extract_weather_forecasts(all_msgs: list[dict[str, Any]] | None) -> list[tuple[str, str]]:
         if not all_msgs:
             return []
         for entry in reversed(all_msgs):
@@ -2316,24 +2316,9 @@ class AgentLoop:
             content = str(entry.get("content") or "")
             if "重庆南岸区" not in content:
                 continue
-            dates = re.findall(r"(?m)^(20\d{2}-\d{2}-\d{2}):", content)
-            if dates:
-                return dates[:3]
-        return []
-
-    @staticmethod
-    def _extract_weather_forecast_icons(all_msgs: list[dict[str, Any]] | None) -> list[str]:
-        if not all_msgs:
-            return []
-        for entry in reversed(all_msgs):
-            if not isinstance(entry, dict) or entry.get("role") != "tool":
-                continue
-            content = str(entry.get("content") or "")
-            if "重庆南岸区" not in content:
-                continue
-            icons = re.findall(r"(?m)^20\d{2}-\d{2}-\d{2}:\s*([^\s]+)", content)
-            if icons:
-                return icons[:3]
+            forecasts = re.findall(r"(?m)^(20\d{2}-\d{2}-\d{2}):\s*([^\s]+)", content)
+            if forecasts:
+                return forecasts[:3]
         return []
 
     @staticmethod
@@ -2355,6 +2340,12 @@ class AgentLoop:
         }
         return mapping.get(icon.strip(), "阴")
 
+    @staticmethod
+    def _is_weather_brief_header_row(cells: list[str]) -> bool:
+        if len(cells) < 4:
+            return False
+        return cells[0] in {"日期", "MM-DD"} and cells[1] == "天气"
+
     def _normalize_weather_brief_output(
         self,
         final_content: str,
@@ -2373,8 +2364,7 @@ class AgentLoop:
         else:
             content = re.sub(r"^🌤️[^\n]*", "🌤️ 早安。", content, count=1, flags=re.MULTILINE)
 
-        forecast_dates = self._extract_weather_forecast_dates(all_msgs)
-        forecast_icons = self._extract_weather_forecast_icons(all_msgs)
+        forecasts = self._extract_weather_forecasts(all_msgs)
 
         lines = content.splitlines()
         normalized_lines: list[str] = []
@@ -2383,26 +2373,28 @@ class AgentLoop:
             stripped = line.strip()
             if stripped.startswith("|") and not re.match(r"^\|\s*[-:| ]+\|?$", stripped):
                 cells = [cell.strip() for cell in stripped.strip("|").split("|")]
-                if len(cells) >= 4 and cells[0] == "MM-DD":
+                if self._is_weather_brief_header_row(cells):
                     cells[0] = "日期"
                     normalized_lines.append("| " + " | ".join(cells) + " |")
                     continue
                 if len(cells) >= 4 and cells[0] != "日期":
+                    forecast_date = forecasts[row_index][0] if len(forecasts) > row_index else ""
+                    forecast_icon = forecasts[row_index][1] if len(forecasts) > row_index else ""
                     raw_date = cells[0]
-                    if re.match(r"^(今天|明天|后天)(?:\s+.*)?$", raw_date) and len(forecast_dates) > row_index:
-                        raw_date = forecast_dates[row_index]
+                    if re.match(r"^(今天|明天|后天)(?:\s+.*)?$", raw_date) and forecast_date:
+                        raw_date = forecast_date
                     date_match = re.match(r"^(?:今天|明天|后天)?\s*(20\d{2}-(\d{2}-\d{2})|\d{2}-\d{2})$", raw_date)
                     if date_match:
                         raw_date = date_match.group(2) or date_match.group(1)
-                    elif len(forecast_dates) > row_index:
-                        raw_date = forecast_dates[row_index][5:]
+                    elif forecast_date:
+                        raw_date = forecast_date[5:]
                     cells[0] = raw_date
 
                     weather_cell = cells[1]
                     icon_match = re.match(r"^([^\s]+)", weather_cell)
                     icon = icon_match.group(1) if icon_match else ""
-                    if len(forecast_icons) > row_index:
-                        icon = forecast_icons[row_index]
+                    if forecast_icon:
+                        icon = forecast_icon
                     label = self._weather_icon_label(icon) if icon else ""
                     if icon:
                         cells[1] = f"{icon} {label}".strip()
