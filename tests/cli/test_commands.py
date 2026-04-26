@@ -1314,6 +1314,98 @@ def test_gateway_cron_weather_task_uses_weather_brief_workspace_route(
     assert "重庆南岸区天气" in metadata["workspace_agent_input"]
 
 
+def test_gateway_cron_weather_task_mentions_creator_in_feishu_delivery(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "config-workspace")
+    bus = MagicMock()
+    bus.publish_outbound = AsyncMock()
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
+    monkeypatch.setattr("nanobot.session.manager.SessionManager", lambda _workspace: object())
+
+    class _FakeCron:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+            seen["cron"] = self
+
+    class _FakeAgentLoop:
+        def __init__(self, *args, **kwargs) -> None:
+            self.model = "test-model"
+            self.tools = {}
+
+        async def process_direct(self, *_args, **kwargs):
+            seen["process_direct_metadata"] = kwargs.get("metadata")
+            return OutboundMessage(
+                channel="feishu",
+                chat_id="ou_user",
+                content="天气正文",
+                metadata={"workspace_agent_cmd": "weather_brief"},
+            )
+
+        async def close_mcp(self) -> None:
+            return None
+
+        async def run(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _StopAfterCronSetup:
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise _StopGatewayError("stop")
+
+    async def _always_true(*_args, **_kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _StopAfterCronSetup)
+    monkeypatch.setattr(
+        "nanobot.utils.evaluator.evaluate_response",
+        _always_true,
+    )
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+    assert isinstance(result.exception, _StopGatewayError)
+
+    cron = seen["cron"]
+    job = CronJob(
+        id="cron-weather",
+        name="weather brief",
+        payload=CronPayload(
+            message="请给我重庆南岸区天气预报",
+            deliver=True,
+            channel="feishu",
+            to="ou_user",
+            creator_sender_id="ou_creator",
+        ),
+    )
+
+    response = asyncio.run(cron.on_job(job))
+
+    assert response == "天气正文"
+    assert seen["process_direct_metadata"]["workspace_agent_cmd"] == "weather_brief"
+    assert bus.publish_outbound.await_count == 1
+    outbound = bus.publish_outbound.await_args_list[0].args[0]
+    assert outbound.content == "天气正文"
+    assert outbound.metadata == {
+        "workspace_agent_cmd": "weather_brief",
+        "_mention_user_id": "ou_creator",
+    }
+
+
 def test_gateway_workspace_override_does_not_migrate_legacy_cron(
     monkeypatch, tmp_path: Path
 ) -> None:

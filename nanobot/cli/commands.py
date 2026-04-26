@@ -807,6 +807,8 @@ def _run_gateway(
             or job.payload.creator_sender_id
             or ""
         ).strip()
+        if weather_task and (job.payload.channel or "") == "feishu" and completion_notice_user_id:
+            response_metadata.setdefault("_mention_user_id", completion_notice_user_id)
 
         message_tool = agent.tools.get("message")
         if job.payload.deliver and isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:

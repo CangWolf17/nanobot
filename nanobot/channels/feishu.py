@@ -1196,10 +1196,17 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
+                metadata = msg.metadata or {}
                 forced_interactive = (
-                    (msg.metadata or {}).get("render_as") == "interactive"
-                    or (msg.metadata or {}).get("workspace_agent_cmd") == "weather_brief"
+                    metadata.get("render_as") == "interactive"
+                    or metadata.get("workspace_agent_cmd") == "weather_brief"
                 )
+                mention_user_id = str(
+                    metadata.get("_mention_user_id")
+                    or metadata.get("mention_user_id")
+                    or ""
+                ).strip()
+                mention_all = bool(metadata.get("_mention_all") or metadata.get("mention_all"))
                 fmt = "interactive" if forced_interactive else self._detect_msg_format(msg.content)
 
                 if fmt == "text":
@@ -1214,7 +1221,12 @@ class FeishuChannel(BaseChannel):
 
                 else:
                     # Complex / long content – send as interactive card
-                    elements = self._build_card_elements(msg.content)
+                    interactive_content = msg.content.strip()
+                    if mention_all:
+                        interactive_content = f"<at id=all></at> {interactive_content}"
+                    elif mention_user_id:
+                        interactive_content = f"<at id={mention_user_id}></at> {interactive_content}"
+                    elements = self._build_card_elements(interactive_content)
                     for chunk in self._split_elements_by_table_limit(elements):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
                         await loop.run_in_executor(

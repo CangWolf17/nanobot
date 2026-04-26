@@ -1,4 +1,5 @@
 """Tests for Feishu streaming (send_delta) via CardKit streaming API."""
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -629,6 +630,30 @@ class TestSendDelta:
         assert args[1] == "oc_chat1"
         assert args[2] == "interactive"
         assert '"elements"' in args[3]
+
+    @pytest.mark.asyncio
+    async def test_send_weather_brief_mentions_requested_user_in_card(self):
+        ch = _make_channel()
+
+        from unittest.mock import patch
+
+        from nanobot.bus.events import OutboundMessage
+        with patch.object(ch, "_send_message_sync", return_value="om_done") as mock_send:
+            await ch.send(OutboundMessage(
+                channel="feishu",
+                chat_id="oc_chat1",
+                content="天气成品",
+                metadata={
+                    "workspace_agent_cmd": "weather_brief",
+                    "_mention_user_id": "ou_creator",
+                },
+            ))
+
+        args = mock_send.call_args[0]
+        assert args[2] == "interactive"
+        card = json.loads(args[3])
+        assert card["elements"][0]["tag"] == "markdown"
+        assert card["elements"][0]["content"] == "<at id=ou_creator></at> 天气成品"
 
     @pytest.mark.asyncio
     async def test_send_render_as_interactive_forces_interactive_card(self):
