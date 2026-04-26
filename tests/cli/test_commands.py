@@ -1315,6 +1315,8 @@ def test_gateway_cron_weather_task_uses_weather_brief_workspace_route(
     assert "重庆南岸区天气" in metadata["workspace_agent_input"]
     assert "lark-cli calendar +agenda" in metadata["workspace_agent_input"]
     assert "今天日程为空。" in metadata["workspace_agent_input"]
+    assert "表头固定写 `日期`" in metadata["workspace_agent_input"]
+    assert "日期值统一写 `MM-DD`" in metadata["workspace_agent_input"]
     assert metadata["disable_message_tool_same_target"] is True
     assert seen["session_key"].startswith("cron:cron-weather:")
 

@@ -2383,6 +2383,10 @@ class AgentLoop:
             stripped = line.strip()
             if stripped.startswith("|") and not re.match(r"^\|\s*[-:| ]+\|?$", stripped):
                 cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+                if len(cells) >= 4 and cells[0] == "MM-DD":
+                    cells[0] = "日期"
+                    normalized_lines.append("| " + " | ".join(cells) + " |")
+                    continue
                 if len(cells) >= 4 and cells[0] != "日期":
                     raw_date = cells[0]
                     if re.match(r"^(今天|明天|后天)(?:\s+.*)?$", raw_date) and len(forecast_dates) > row_index:

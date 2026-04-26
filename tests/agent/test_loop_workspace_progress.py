@@ -206,7 +206,7 @@ def test_weather_brief_postprocess_normalizes_header_and_relative_dates(tmp_path
     final_content = (
         "🌤️ 早安，五一假期第二天。\n\n"
         "## 重庆南岸区天气\n"
-        "| 日期 | 天气 | 最高温 | 最低温 |\n"
+        "| MM-DD | 天气 | 最高温 | 最低温 |\n"
         "|---|---|---|---|\n"
         "| 今天 04-30 | ☁️ | — | — |\n"
         "| 明天 05-01 | ☀️ | — | — |\n"
@@ -227,6 +227,7 @@ def test_weather_brief_postprocess_normalizes_header_and_relative_dates(tmp_path
     result = loop._postprocess_workspace_agent_output(msg, final_content, all_msgs=all_msgs)
 
     assert result.startswith("🌤️ 早安。")
+    assert "| 日期 | 天气 | 最高温 | 最低温 |" in result
     assert "| 04-26 | 🌧️ 雨 | — | — |" in result
     assert "| 04-27 | ☁️ 阴 | — | — |" in result
     assert "| 04-28 | ☀️ 晴 | — | — |" in result
